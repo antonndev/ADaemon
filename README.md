@@ -10,16 +10,17 @@
   [![License](https://img.shields.io/badge/license-MIT-black?style=flat-square)](./LICENSE)
   [![Docs](https://img.shields.io/badge/docs-ADPanel-blue?style=flat-square)](https://ad-panel.com/adocs)
   [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=flat-square&logo=discord&logoColor=white)](https://ad-panel.com/discord)
-<br />
+
+  <br />
   <br />
 
   ### ⚡ Quick Deployment
-
 </div>
-**ADaemon**
+
+### ADaemon
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git && sudo mkdir -p /var/lib && sudo git clone --depth=1 https://github.com/antonndev/ADaemon.git /var/lib/node && cd /var/lib/node && sudo bash ./install.sh --yes
+curl -fsSL https://raw.githubusercontent.com/antonndev/ADPanel-Daemon/main/install-daemon.sh | tr -d '\r' | sudo bash -s -- --yes
 ```
 
 ---
