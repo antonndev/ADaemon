@@ -17,7 +17,9 @@
 
 </div>
 **ADaemon**
-```sudo apt-get update && sudo apt-get install -y git && sudo mkdir -p /var/lib && sudo git clone --depth=1 https://github.com/antonndev/ADaemon.git /var/lib/node && cd /var/lib/node && sudo bash ./install.sh --yes
+
+```bash
+sudo apt-get update && sudo apt-get install -y git && sudo mkdir -p /var/lib && sudo git clone --depth=1 https://github.com/antonndev/ADaemon.git /var/lib/node && cd /var/lib/node && sudo bash ./install.sh --yes
 ```
 
 ---
