@@ -4006,7 +4006,7 @@ func (lm *logManager) followLoop(t *logTail) {
 		lastExists = true
 		backoff = 1 * time.Second
 
-		cmd := exec.Command("docker", "logs", "--tail", "0", "-f", t.name)
+		cmd := exec.Command("docker", "logs", "--tail", "200", "-f", t.name)
 		stdout, _ := cmd.StdoutPipe()
 		stderr, _ := cmd.StderrPipe()
 		if err := cmd.Start(); err != nil {
