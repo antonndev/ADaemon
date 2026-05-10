@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
+# ADaemon Installer (enterprise-style)
+# NOTE: docker group ~= root-equivalent host control.
 
+# --- CRLF self-heal (local file only) ---
+# For curl|bash still use: tr -d '\r'
 if [[ -r "${0:-}" ]] && grep -q $'\r' "$0" 2>/dev/null; then
   tmp="$(mktemp)"
   tr -d '\r' < "$0" > "$tmp"
@@ -30,6 +34,9 @@ GOFMT_BIN_LINK="/usr/local/bin/gofmt"
 SERVICE_NAME="ADaemon"
 UNIT_NAME="${SERVICE_NAME}.service"
 UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
+ALIAS_SERVICE_NAME="adaemon"
+ALIAS_UNIT_NAME="${ALIAS_SERVICE_NAME}.service"
+ALIAS_UNIT_PATH="/etc/systemd/system/${ALIAS_UNIT_NAME}"
 LEGACY_SERVICE_NAME="adpanel-daemon"
 LEGACY_UNIT_NAME="${LEGACY_SERVICE_NAME}.service"
 LEGACY_UNIT_PATH="/etc/systemd/system/${LEGACY_UNIT_NAME}"
@@ -45,16 +52,19 @@ for arg in "$@"; do
   esac
 done
 
+# --- TTY handling (works with curl | bash) ---
 TTY_OK=0
 if [[ -r /dev/tty ]]; then
   exec 3</dev/tty
   TTY_OK=1
 fi
 
+# If script comes from a pipe, prevent tools from reading stdin and "eating" the remaining script.
 if [[ ! -t 0 ]]; then
   exec </dev/null
 fi
 
+# ---------------- UI ----------------
 UI=0
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then UI=1; fi
 
@@ -87,6 +97,7 @@ ROW_STATUS=14
 ROW_PROMPT=16
 ROW_INPUT=17
 
+# Thin vertical bar on the RIGHT
 BAR_HEIGHT=12
 BAR_ROW=4
 BAR_COL=78
@@ -237,10 +248,12 @@ fail() {
   exit "$rc"
 }
 
+# Harder to stop (can’t beat kill -9 / root)
 trap 'status_set "Installer is running… please wait."; ' INT
 trap 'status_set "Stop requested — ignored. Installer continues…"; ' TERM QUIT HUP
 trap '' TSTP
 
+# --------------- Core helpers ---------------
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "${C_RED}${C_BOLD}This script must be run as root.${C_RESET}"
@@ -282,6 +295,7 @@ ask_yes_no_tty() {
   done
 }
 
+# ---------------- Progress engine (output-driven, apt-like) ----------------
 CURRENT_PCT=0
 
 anim_start() {
@@ -380,7 +394,7 @@ monitor_apt_update() {
 }
 
 apt_sim_count_install() {
-  apt-get -s -o Dpkg::Use-Pty=0 -o Acquire::Retries=3 install --no-install-recommends "$@" 2>/dev/null \
+  apt-get -s -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 install --no-install-recommends "$@" 2>/dev/null \
     | awk '/^Inst[[:space:]]/ {c++} END{print c+0}'
 }
 
@@ -426,7 +440,7 @@ monitor_apt_install() {
 }
 
 apt_sim_count_purge() {
-  apt-get -s -o Dpkg::Use-Pty=0 -o Acquire::Retries=3 purge "$@" 2>/dev/null \
+  apt-get -s -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 purge "$@" 2>/dev/null \
     | awk '/^Remv[[:space:]]/ {c++} END{print c+0}'
 }
 
@@ -444,6 +458,7 @@ monitor_apt_purge() {
 
     local m=0
     if (( total > 0 )); then
+      # removing+purging are the main work; triggers are the tail
       local done=$((removing + purging))
       local denom=$((2 * total))
       m=$(( done * 900 / denom ))
@@ -535,9 +550,11 @@ apt_update_progress() {
   export DEBIAN_FRONTEND=noninteractive
   export NEEDRESTART_MODE=a
   export APT_LISTCHANGES_FRONTEND=none
+  dpkg --configure -a >> "${LOG_FILE}" 2>&1 || true
+  apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 -f install >> "${LOG_FILE}" 2>&1 || true
   echo "---- apt-get update ----" >> "${LOG_FILE}"
   run_stream_step 8 14 "Updating package lists…" monitor_apt_update \
-    apt-get -y -o Dpkg::Use-Pty=0 -o Acquire::Retries=3 update
+    apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 update
   APT_UPDATED=1
 }
 
@@ -552,6 +569,7 @@ apt_install_progress() {
   echo "---- apt-get install: $* (plan=${APT_TOTAL}) ----" >> "${LOG_FILE}"
   run_stream_step "$from" "$to" "$msg" monitor_apt_install \
     apt-get -y -o Dpkg::Use-Pty=0 \
+      -o DPkg::Lock::Timeout=300 \
       -o Dpkg::Options::=--force-confdef \
       -o Dpkg::Options::=--force-confold \
       -o Acquire::Retries=3 \
@@ -569,7 +587,7 @@ apt_purge_progress() {
   APT_TOTAL="$(apt_sim_count_purge "$@")"
   echo "---- apt-get purge: $* (plan=${APT_TOTAL}) ----" >> "${LOG_FILE}"
   run_stream_step "$from" "$to" "$msg" monitor_apt_purge \
-    apt-get -y -o Dpkg::Use-Pty=0 -o Acquire::Retries=3 purge "$@"
+    apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 purge "$@"
   unset APT_TOTAL
 }
 
@@ -594,6 +612,7 @@ load_state() {
   done < "${STATE_FILE}"
 }
 
+# --------------- Install/Uninstall actions ---------------
 ensure_dirs() {
   mkdir -p "${NODE_DIR}" "${GO_DIR}"
   chmod 0750 "${NODE_DIR}" "${GO_DIR}"
@@ -628,7 +647,10 @@ git_clone_or_update() {
 ensure_user() {
   if ! id adaemon >/dev/null 2>&1; then
     echo "---- useradd adaemon ----" >> "${LOG_FILE}"
-    useradd --system --home-dir "${NODE_DIR}" --shell /usr/sbin/nologin --comment "ADPanel Daemon" adaemon >> "${LOG_FILE}" 2>&1
+    local nologin_shell="/usr/sbin/nologin"
+    [[ -x "${nologin_shell}" ]] || nologin_shell="/sbin/nologin"
+    [[ -x "${nologin_shell}" ]] || nologin_shell="/bin/false"
+    useradd --system --home-dir "${NODE_DIR}" --shell "${nologin_shell}" --comment "ADPanel Daemon" adaemon >> "${LOG_FILE}" 2>&1
   fi
   echo "---- perms ----" >> "${LOG_FILE}"
   chown -R adaemon:adaemon "${NODE_DIR}" "${GO_DIR}" >> "${LOG_FILE}" 2>&1
@@ -749,6 +771,7 @@ WantedBy=multi-user.target
 UNIT
 
   echo "---- systemctl daemon-reload/enable ----" >> "${LOG_FILE}"
+  ln -sf "${UNIT_NAME}" "${ALIAS_UNIT_PATH}" >> "${LOG_FILE}" 2>&1
   systemctl daemon-reload >> "${LOG_FILE}" 2>&1
   systemctl enable "${UNIT_NAME}" >> "${LOG_FILE}" 2>&1
 }
@@ -767,6 +790,7 @@ start_and_verify() {
   echo "---- journalctl ----" >> "${LOG_FILE}"
   journalctl -u "${UNIT_NAME}" -n 200 --no-pager >> "${LOG_FILE}" 2>&1 || true
 
+  # If user asked to NOT auto-create config.yml, don’t hard-fail the installer on missing config.
   if [[ ! -f "${NODE_DIR}/config.yml" ]]; then
     START_WARN=1
     return 0
@@ -777,7 +801,9 @@ start_and_verify() {
 stop_disable_service() {
   echo "---- stop/disable service ----" >> "${LOG_FILE}"
   systemctl stop "${UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
+  systemctl stop "${ALIAS_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
   systemctl disable "${UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
+  systemctl disable "${ALIAS_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
   systemctl stop "${LEGACY_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
   systemctl disable "${LEGACY_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
   systemctl daemon-reload >> "${LOG_FILE}" 2>&1 || true
@@ -786,6 +812,7 @@ stop_disable_service() {
 remove_files_users() {
   echo "---- remove unit/binary/dirs/user ----" >> "${LOG_FILE}"
   rm -f "${UNIT_PATH}" >> "${LOG_FILE}" 2>&1 || true
+  rm -f "${ALIAS_UNIT_PATH}" >> "${LOG_FILE}" 2>&1 || true
   rm -f "${LEGACY_UNIT_PATH}" >> "${LOG_FILE}" 2>&1 || true
   rm -f "${BIN_DST}" >> "${LOG_FILE}" 2>&1 || true
   rm -rf "${NODE_DIR}" "${GO_DIR}" >> "${LOG_FILE}" 2>&1 || true
@@ -794,6 +821,7 @@ remove_files_users() {
   systemctl daemon-reload >> "${LOG_FILE}" 2>&1 || true
 }
 
+# ---------------- Main ----------------
 require_root
 require_systemd
 mkdir -p "$(dirname "${LOG_FILE}")"
@@ -819,12 +847,14 @@ else
     exit 1
   fi
 
+  # Q1 (always continue to Q2 no matter what)
   if ask_yes_no_tty "1) Do you want to install the daemon?"; then
     INSTALL_CHOSEN=1
   else
     INSTALL_CHOSEN=0
   fi
 
+  # Q2
   if ask_yes_no_tty "2) Do you want to uninstall the panel?"; then
     UNINSTALL_CHOSEN=1
   else
@@ -837,6 +867,7 @@ status_set "Booting…"
 CURRENT_PCT=2
 bar_render 2 0
 
+# If both selected => refuse
 if (( INSTALL_CHOSEN == 1 && UNINSTALL_CHOSEN == 1 )); then
   prompt_clear
   status_set "Only one option can be selected at a time (install OR uninstall)."
@@ -844,6 +875,7 @@ if (( INSTALL_CHOSEN == 1 && UNINSTALL_CHOSEN == 1 )); then
   exit 1
 fi
 
+# If none selected => exit
 if (( INSTALL_CHOSEN == 0 && UNINSTALL_CHOSEN == 0 )); then
   ui_bye
   exit 0
@@ -854,12 +886,14 @@ if ! command -v apt-get >/dev/null 2>&1; then
   exit 1
 fi
 
+# ---------------- UNINSTALL ----------------
 if (( UNINSTALL_CHOSEN == 1 )); then
   load_state
 
   run_stream_step 5  15 "Stopping daemon…"                   monitor_none stop_disable_service
   run_stream_step 15 35 "Removing files and user…"           monitor_none remove_files_users
 
+  # Remove packages ONLY if installer marked them as installed by it.
   if (( INST_GO == 1 )); then
     run_stream_step 35 45 "Removing Go toolchain files…"        monitor_none remove_go_toolchain
     apt_purge_progress 45 55 "Removing Go toolchain package…" golang-go
@@ -871,7 +905,7 @@ if (( UNINSTALL_CHOSEN == 1 )); then
     apt_purge_progress 78 90 "Removing Git (git)…" git
   fi
 
-  run_stream_step 90 96 "Cleaning up (autoremove)…"          monitor_none apt-get -y -o Dpkg::Use-Pty=0 autoremove
+  run_stream_step 90 96 "Cleaning up (autoremove)…"          monitor_none apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 autoremove
   run_stream_step 96 100 "Finishing…"                         monitor_none true
 
   prompt_clear
@@ -891,6 +925,8 @@ if (( UNINSTALL_CHOSEN == 1 )); then
   exit 0
 fi
 
+# ---------------- INSTALL ----------------
+# Track what THIS install actually installs (for future uninstall).
 INST_GIT=0
 INST_DOCKER=0
 INST_GO=0
@@ -904,6 +940,8 @@ apt_update_progress
 
 run_stream_step 14 18 "Preparing directories…"              monitor_none ensure_dirs
 
+# Core deps (don’t purge these on uninstall)
+# Install only if missing: ca-certificates curl sed grep util-linux
 missing_core=()
 for p in ca-certificates curl sed grep util-linux; do
   pkg_installed "$p" || missing_core+=("$p")
@@ -914,6 +952,7 @@ else
   run_stream_step 18 30 "Core dependencies already present…" monitor_none true
 fi
 
+# Git
 if ! command -v git >/dev/null 2>&1; then
   pkg_installed git || INST_GIT=1
   apt_install_progress 30 38 "Installing Git…" git
@@ -921,10 +960,13 @@ else
   run_stream_step 30 38 "Git already installed…" monitor_none true
 fi
 
+# Source
 run_stream_step 38 50 "Deploying daemon source…"            monitor_none git_clone_or_update
 
+# User must exist before docker group ops
 run_stream_step 50 56 "Creating restricted user (adaemon)…" monitor_none ensure_user
 
+# Docker
 if ! command -v docker >/dev/null 2>&1; then
   pkg_installed docker.io || INST_DOCKER=1
   apt_install_progress 56 72 "Installing Docker (docker.io)…" docker.io
@@ -933,6 +975,7 @@ else
 fi
 run_stream_step 72 78 "Enabling Docker service…"            monitor_none docker_enable
 
+# Go
 if ! go_version_satisfies; then
   INST_GO=1
   run_stream_step 78 88 "Installing Go toolchain (Go ${GO_VERSION})…" monitor_none install_go_toolchain
@@ -940,6 +983,7 @@ else
   run_stream_step 78 88 "Go already installed…" monitor_none true
 fi
 
+# Build + service
 run_stream_step 88 95 "Building & installing daemon…"       monitor_none build_binary_as_adaemon
 run_stream_step 95 98 "Creating systemd service…"           monitor_none write_systemd_unit
 run_stream_step 98 100 "Starting daemon (best-effort)…"     monitor_none start_and_verify
@@ -979,6 +1023,7 @@ else
   echo "  Start: systemctl start ADaemon"
   echo "  Stop: systemctl stop ADaemon"
   echo "  Restart: systemctl restart ADaemon"
+  echo "  Alias: systemctl restart adaemon"
   echo "  Status: systemctl status ADaemon"
   echo
   echo "Config: /var/lib/node/config.yml"
