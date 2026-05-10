@@ -1280,8 +1280,6 @@ type stdinConn struct {
 	name     string
 	stdin    io.WriteCloser
 	cmd      *exec.Cmd
-	cmdCh    chan string
-	closeCh  chan struct{}
 	lastUsed time.Time
 	mu       sync.Mutex
 	closed   bool
@@ -1511,7 +1509,7 @@ func (sm *stdinManager) getOrCreate(ctx context.Context, containerName string) (
 }
 
 func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdinConn, error) {
-	cmd := exec.Command("script", "-qfc", fmt.Sprintf("docker attach --sig-proxy=false %s", name), "/dev/null")
+	cmd := exec.Command("docker", "attach", "--sig-proxy=false", name)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -1530,19 +1528,14 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 		name:     name,
 		stdin:    stdin,
 		cmd:      cmd,
-		cmdCh:    make(chan string, stdinBufferSize),
-		closeCh:  make(chan struct{}),
 		lastUsed: time.Now(),
 	}
-
-	go conn.writerLoop(sm.debug)
 
 	go func() {
 		_ = cmd.Wait()
 		conn.mu.Lock()
 		conn.closed = true
 		conn.mu.Unlock()
-		close(conn.closeCh)
 	}()
 
 	if sm.debug {
@@ -1550,32 +1543,6 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 	}
 
 	return conn, nil
-}
-
-func (c *stdinConn) writerLoop(debug bool) {
-	for {
-		select {
-		case <-c.closeCh:
-			return
-		case cmd := <-c.cmdCh:
-			c.mu.Lock()
-			if c.closed {
-				c.mu.Unlock()
-				return
-			}
-			c.lastUsed = time.Now()
-			c.mu.Unlock()
-
-			_, err := fmt.Fprintln(c.stdin, cmd)
-			if err != nil {
-				if debug {
-					fmt.Printf("[stdin-conn] write error for %s: %v\n", c.name, err)
-				}
-				c.close()
-				return
-			}
-		}
-	}
 }
 
 func (c *stdinConn) close() {
@@ -1595,18 +1562,23 @@ func (c *stdinConn) close() {
 
 func (c *stdinConn) sendCommand(cmd string) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.closed {
-		c.mu.Unlock()
 		return fmt.Errorf("connection closed")
 	}
-	c.mu.Unlock()
-
-	select {
-	case c.cmdCh <- cmd:
-		return nil
-	default:
-		return fmt.Errorf("command queue full")
+	c.lastUsed = time.Now()
+	line := strings.TrimRight(cmd, "\r\n") + "\n"
+	if _, err := io.WriteString(c.stdin, line); err != nil {
+		c.closed = true
+		if c.stdin != nil {
+			_ = c.stdin.Close()
+		}
+		if c.cmd != nil && c.cmd.Process != nil {
+			_ = c.cmd.Process.Kill()
+		}
+		return fmt.Errorf("stdin write failed: %w", err)
 	}
+	return nil
 }
 
 func (sm *stdinManager) remove(name string) {
@@ -1691,7 +1663,107 @@ func (d Docker) writeToMinecraftProcessStdin(ctx context.Context, containerName,
 	return fmt.Errorf("minecraft stdin write failed: no supported shell found in container")
 }
 
-func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, containerName, command string, isMinecraft bool) error {
+func (d Docker) writeToTargetProcessStdin(ctx context.Context, containerName, command string, targets []string) error {
+	name := dockerContainerName(containerName)
+	cmd := strings.TrimSpace(command)
+	targets = sanitizeConsoleProcessTargets(targets)
+	if name == "" || cmd == "" {
+		return fmt.Errorf("missing-params")
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("no console target processes configured")
+	}
+
+	script := strings.Join([]string{
+		"pid=''",
+		"self=$$",
+		"for pattern in \"$@\"; do",
+		"  [ -n \"$pattern\" ] || continue",
+		"  pid=$(pgrep -n -x -- \"$pattern\" 2>/dev/null || true)",
+		"  if [ -z \"$pid\" ]; then",
+		"    for candidate in $(pgrep -f -- \"$pattern\" 2>/dev/null || true); do",
+		"      [ \"$candidate\" = \"$self\" ] && continue",
+		"      cmdline=$(tr '\\000' ' ' < \"/proc/$candidate/cmdline\" 2>/dev/null || true)",
+		"      case \"$cmdline\" in *adpanel-console*) continue ;; esac",
+		"      pid=$candidate",
+		"    done",
+		"  fi",
+		"  [ -n \"$pid\" ] && break",
+		"done",
+		"[ -n \"$pid\" ] || exit 44",
+		"cat > \"/proc/$pid/fd/0\"",
+	}, "\n")
+
+	shells := []string{"sh", "/bin/sh", "bash", "/bin/bash"}
+	for idx, shellPath := range shells {
+		args := []string{"exec", "-i", name, shellPath, "-c", script, "adpanel-console"}
+		args = append(args, targets...)
+		pipeCmd := exec.CommandContext(ctx, "docker", args...)
+		pipeCmd.Stdin = strings.NewReader(cmd + "\n")
+		pipeCmd.Stdout = io.Discard
+		var stderr bytes.Buffer
+		pipeCmd.Stderr = &stderr
+		if err := pipeCmd.Run(); err == nil {
+			if d.debug {
+				fmt.Printf("[docker] command sent to target process stdin: %s\n", strings.Join(targets, ","))
+			}
+			return nil
+		} else {
+			exitCode := exitCodeFromErr(err)
+			if exitCode == 44 {
+				return fmt.Errorf("target process not found: %s", strings.Join(targets, ", "))
+			}
+			if isMissingExecShell(stderr.String(), shellPath, exitCode) && idx < len(shells)-1 {
+				continue
+			}
+			detail := strings.TrimSpace(stderr.String())
+			if detail == "" {
+				detail = err.Error()
+			}
+			return fmt.Errorf("target process stdin write failed: %s", detail)
+		}
+	}
+	return fmt.Errorf("target process stdin write failed: no supported shell found in container")
+}
+
+func (d Docker) sendViaAttachedStdin(ctx context.Context, stdinMgr *stdinManager, containerName, command string) error {
+	name := dockerContainerName(containerName)
+	cmd := strings.TrimSpace(command)
+	if name == "" || cmd == "" {
+		return fmt.Errorf("missing-params")
+	}
+	if stdinMgr == nil {
+		return fmt.Errorf("stdin manager unavailable")
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		conn, err := stdinMgr.getOrCreate(ctx, name)
+		if err == nil {
+			if err := conn.sendCommand(cmd); err == nil {
+				if d.debug {
+					fmt.Printf("[docker] command sent via attached container stdin\n")
+				}
+				return nil
+			} else {
+				lastErr = err
+				stdinMgr.remove(name)
+				continue
+			}
+		}
+		lastErr = err
+		stdinMgr.remove(name)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("stdin channel unavailable")
+	}
+	return lastErr
+}
+
+func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, containerName, command string, isMinecraft bool, targetProcesses []string) error {
 	name := dockerContainerName(containerName)
 	cmd := strings.TrimSpace(command)
 	if name == "" || cmd == "" {
@@ -1706,7 +1778,7 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 		return err
 	}
 
-	if !d.containerExists(ctx, name) {
+	if state := d.containerState(ctx, name); state != "running" {
 		return fmt.Errorf("container-not-running")
 	}
 
@@ -1738,22 +1810,11 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 			return nil
 		}
 		if stdinMgr != nil {
-			for attempt := 0; attempt < 2; attempt++ {
-				conn, err := stdinMgr.getOrCreate(ctx, name)
-				if err == nil {
-					if err := conn.sendCommand(cmd); err == nil {
-						if d.debug {
-							fmt.Printf("[docker] minecraft command sent via stdin manager\n")
-						}
-						return nil
-					}
-					stdinMgr.remove(name)
-					continue
+			if err := d.sendViaAttachedStdin(ctx, stdinMgr, name, cmd); err == nil {
+				if d.debug {
+					fmt.Printf("[docker] minecraft command sent via attached stdin\n")
 				}
-				if attempt == 0 {
-					stdinMgr.remove(name)
-					continue
-				}
+				return nil
 			}
 		}
 		if err := d.writeToMinecraftProcessStdin(ctx, name, cmd); err == nil {
@@ -1764,15 +1825,45 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 		}
 	}
 
+	var targetErr error
+	if len(targetProcesses) > 0 {
+		if err := d.writeToTargetProcessStdin(ctx, name, cmd, targetProcesses); err == nil {
+			return nil
+		} else {
+			targetErr = err
+			if d.debug {
+				fmt.Printf("[docker] target process stdin failed for %s: %v\n", name, err)
+			}
+		}
+	}
+
+	var attachedErr error
+	if stdinMgr != nil {
+		if err := d.sendViaAttachedStdin(ctx, stdinMgr, name, cmd); err == nil {
+			return nil
+		} else {
+			attachedErr = err
+			if d.debug {
+				fmt.Printf("[docker] attached stdin failed for %s: %v\n", name, err)
+			}
+		}
+	}
+
 	if err := d.writeToContainerProcessStdin(ctx, name, cmd); err == nil {
 		if d.debug {
 			fmt.Printf("[docker] command sent via /proc/1/fd/0\n")
 		}
 		return nil
-	} else if stdinMgr != nil && d.debug {
-		fmt.Printf("[docker] stdin manager bypassed after /proc/1/fd/0 failure for %s: %v\n", name, err)
-		return fmt.Errorf("failed-to-send: %w", err)
 	} else if err != nil {
+		if attachedErr != nil {
+			if targetErr != nil {
+				return fmt.Errorf("failed-to-send: target process stdin failed: %v; attached stdin failed: %v; process stdin fallback failed: %w", targetErr, attachedErr, err)
+			}
+			return fmt.Errorf("failed-to-send: attached stdin failed: %v; process stdin fallback failed: %w", attachedErr, err)
+		}
+		if targetErr != nil {
+			return fmt.Errorf("failed-to-send: target process stdin failed: %v; process stdin fallback failed: %w", targetErr, err)
+		}
 		return fmt.Errorf("failed-to-send: %w", err)
 	}
 	return fmt.Errorf("failed-to-send: stdin channel unavailable")
@@ -2900,6 +2991,217 @@ func normalizeConsoleMode(raw any) string {
 		}
 		if mode := normalizeConsoleMode(v["type"]); mode != "" {
 			return mode
+		}
+	}
+	return ""
+}
+
+func consoleProcessTargetsFromRaw(raw any) []string {
+	switch v := raw.(type) {
+	case string:
+		return sanitizeConsoleProcessTargets([]string{v})
+	case []string:
+		return sanitizeConsoleProcessTargets(v)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			out = append(out, fmt.Sprint(item))
+		}
+		return sanitizeConsoleProcessTargets(out)
+	case map[string]any:
+		for _, key := range []string{"targetProcesses", "target_processes", "processes", "processNames", "process_names"} {
+			if targets := consoleProcessTargetsFromRaw(v[key]); len(targets) > 0 {
+				return targets
+			}
+		}
+		for _, key := range []string{"targetProcess", "target_process", "process", "target"} {
+			if targets := consoleProcessTargetsFromRaw(v[key]); len(targets) > 0 {
+				return targets
+			}
+		}
+	}
+	return nil
+}
+
+func sanitizeConsoleProcessTargets(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		target := strings.TrimSpace(value)
+		target = strings.Trim(target, "'\"")
+		if target == "" || target == "<nil>" || strings.ContainsAny(target, "\x00\r\n") {
+			continue
+		}
+		if len(target) > 120 {
+			target = target[:120]
+		}
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		seen[target] = struct{}{}
+		out = append(out, target)
+		if len(out) >= 12 {
+			break
+		}
+	}
+	return out
+}
+
+func normalizeTemplateID(raw any) string {
+	id := strings.ToLower(strings.TrimSpace(fmt.Sprint(raw)))
+	id = strings.ReplaceAll(id, "_", "-")
+	id = strings.ReplaceAll(id, " ", "-")
+	for strings.Contains(id, "--") {
+		id = strings.ReplaceAll(id, "--", "-")
+	}
+	id = strings.Trim(id, "-")
+	if id == "<nil>" {
+		return ""
+	}
+	return id
+}
+
+func isKnownStdinConsoleTemplate(id string) bool {
+	switch normalizeTemplateID(id) {
+	case "7-days-to-die", "7dtd", "sdtd",
+		"ark", "ark-survival-evolved",
+		"assetto-corsa",
+		"csgo", "cs2", "counter-strike-2",
+		"dayz",
+		"fivem", "five-m",
+		"hytale",
+		"minecraft",
+		"palworld",
+		"project-zomboid", "zomboid",
+		"ragemp", "rage-mp",
+		"redm",
+		"rust",
+		"valheim":
+		return true
+	default:
+		return false
+	}
+}
+
+func defaultConsoleProcessTargetsForTemplate(id string) []string {
+	switch normalizeTemplateID(id) {
+	case "7-days-to-die", "7dtd", "sdtd":
+		return []string{"7DaysToDieServer", "7DaysToDieServer.x86_64"}
+	case "ark", "ark-survival-evolved":
+		return []string{"ShooterGameServer"}
+	case "assetto-corsa":
+		return []string{"server-manager", "acServer"}
+	case "csgo", "cs2", "counter-strike-2":
+		return []string{"cs2", "srcds_linux"}
+	case "dayz":
+		return []string{"DayZServer", "DayZServer_x64", "dayzserver"}
+	case "fivem", "five-m":
+		return []string{"FXServer", "fxserver"}
+	case "hytale":
+		return []string{"hytale-server", "java"}
+	case "minecraft":
+		return []string{"java", "bedrock_server"}
+	case "palworld":
+		return []string{"PalServer-Linux-Test", "PalServer"}
+	case "project-zomboid", "zomboid":
+		return []string{"ProjectZomboid64", "ProjectZomboid32", "java"}
+	case "ragemp", "rage-mp":
+		return []string{"ragemp-server", "ragemp"}
+	case "redm":
+		return []string{"FXServer", "fxserver"}
+	case "rust":
+		return []string{"RustDedicated"}
+	case "valheim":
+		return []string{"valheim_server", "valheim_server.x86_64"}
+	default:
+		return nil
+	}
+}
+
+func defaultConsoleProcessTargetsForImage(image string) []string {
+	imageLower := strings.ToLower(strings.TrimSpace(image))
+	switch {
+	case strings.Contains(imageLower, "hytale"):
+		return defaultConsoleProcessTargetsForTemplate("hytale")
+	case strings.Contains(imageLower, "redm"):
+		return defaultConsoleProcessTargetsForTemplate("redm")
+	case strings.Contains(imageLower, "fivem"):
+		return defaultConsoleProcessTargetsForTemplate("fivem")
+	case strings.Contains(imageLower, "dayz") || strings.Contains(imageLower, "day-z"):
+		return defaultConsoleProcessTargetsForTemplate("dayz")
+	case strings.Contains(imageLower, "zomboid"):
+		return defaultConsoleProcessTargetsForTemplate("project-zomboid")
+	case strings.Contains(imageLower, "palworld"):
+		return defaultConsoleProcessTargetsForTemplate("palworld")
+	case strings.Contains(imageLower, "valheim"):
+		return defaultConsoleProcessTargetsForTemplate("valheim")
+	case strings.Contains(imageLower, "rust"):
+		return defaultConsoleProcessTargetsForTemplate("rust")
+	case strings.Contains(imageLower, "ragemp"):
+		return defaultConsoleProcessTargetsForTemplate("ragemp")
+	case strings.Contains(imageLower, "ark"):
+		return defaultConsoleProcessTargetsForTemplate("ark-survival-evolved")
+	case strings.Contains(imageLower, "7dtd") || strings.Contains(imageLower, "7daystodie") || strings.Contains(imageLower, "7-days-to-die") || strings.Contains(imageLower, "sdtd"):
+		return defaultConsoleProcessTargetsForTemplate("7-days-to-die")
+	case strings.Contains(imageLower, "assetto"):
+		return defaultConsoleProcessTargetsForTemplate("assetto-corsa")
+	case strings.Contains(imageLower, "cs2") || strings.Contains(imageLower, "csgo"):
+		return defaultConsoleProcessTargetsForTemplate("cs2")
+	default:
+		return nil
+	}
+}
+
+func consoleProcessTargetsForServer(meta map[string]any) []string {
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	if runtimeObj != nil {
+		if targets := consoleProcessTargetsFromRaw(runtimeObj["console"]); len(targets) > 0 {
+			return targets
+		}
+	}
+	for _, key := range []string{"template", "type"} {
+		if targets := defaultConsoleProcessTargetsForTemplate(fmt.Sprint(meta[key])); len(targets) > 0 {
+			return targets
+		}
+	}
+	if runtimeObj != nil {
+		if targets := defaultConsoleProcessTargetsForTemplate(fmt.Sprint(runtimeObj["providerId"])); len(targets) > 0 {
+			return targets
+		}
+		if targets := defaultConsoleProcessTargetsForImage(fmt.Sprint(runtimeObj["image"])); len(targets) > 0 {
+			return targets
+		}
+	}
+	return nil
+}
+
+func inferredConsoleModeForServer(meta map[string]any) string {
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	if runtimeObj != nil {
+		if mode := normalizeConsoleMode(runtimeObj["console"]); mode != "" {
+			return mode
+		}
+		if len(consoleProcessTargetsFromRaw(runtimeObj["console"])) > 0 {
+			return "stdin"
+		}
+	}
+
+	for _, key := range []string{"template", "type"} {
+		if isKnownStdinConsoleTemplate(fmt.Sprint(meta[key])) {
+			return "stdin"
+		}
+	}
+	if runtimeObj != nil {
+		if isKnownStdinConsoleTemplate(fmt.Sprint(runtimeObj["providerId"])) {
+			return "stdin"
+		}
+		image := strings.TrimSpace(fmt.Sprint(runtimeObj["image"]))
+		if image != "" && image != "<nil>" && isGameServerDockerImage(image) {
+			return "stdin"
+		}
+		startupDisplay := strings.TrimSpace(fmt.Sprint(runtimeObj["startupDisplay"]))
+		if startupDisplay != "" && startupDisplay != "<nil>" {
+			return "stdin"
 		}
 	}
 	return ""
@@ -7968,8 +8270,10 @@ func isGameServerDockerImage(image string) bool {
 	gameServerPatterns := []string{
 		"csgo", "cs2", "counterstrike",
 		"minecraft", "paper", "spigot", "bukkit", "forge", "fabric",
+		"hytale", "hytale-docker", "rxmarin/hytale",
 		"valheim", "rust", "ark", "terraria",
-		"fivem", "ragemp", "gtav", "gta5",
+		"assetto", "dayz", "zomboid",
+		"fivem", "redm", "ragemp", "gtav", "gta5",
 		"factorio", "satisfactory",
 		"teamspeak", "ts3", "mumble",
 		"starbound", "unturned", "7daystodie", "7dtd",
@@ -7978,6 +8282,7 @@ func isGameServerDockerImage(image string) bool {
 		"garrysmod", "gmod", "srcds",
 		"avorion", "astroneer", "barotrauma",
 		"palworld", "enshrouded", "soulmask",
+		"ptero-eggs",
 		"cm2network", "gameservermanagers", "linuxgsm",
 		"steamcmd", "itzg/minecraft", "ich777",
 	}
@@ -9006,7 +9311,7 @@ func (a *Agent) stopServerForPolicy(name, reason string) error {
 
 	if isMinecraft {
 		commandCtx, commandCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = a.docker.sendCommand(commandCtx, a.stdinMgr, name, "stop", true)
+		_ = a.docker.sendCommand(commandCtx, a.stdinMgr, name, "stop", true, nil)
 		commandCancel()
 	}
 
@@ -10734,6 +11039,18 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 				runtimeObj["startupDisplay"] = startupDisplay
 			}
 		}
+		if req.Docker != nil {
+			if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
+				if restart := strings.TrimSpace(req.Docker.Restart); restart != "" {
+					runtimeObj["restart"] = restart
+				} else if restartPolicy := strings.TrimSpace(req.Docker.RestartPolicy); restartPolicy != "" {
+					runtimeObj["restart"] = restartPolicy
+				}
+				if req.Docker.Console != nil {
+					runtimeObj["console"] = req.Docker.Console
+				}
+			}
+		}
 		if req.AsyncSetup {
 			meta["setupStatus"] = "queued"
 			meta["setupMessage"] = "Server setup queued"
@@ -10847,6 +11164,14 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				runtimeConfig["workdir"] = cleanWorkdir
+			}
+			if restart := strings.TrimSpace(req.Docker.Restart); restart != "" {
+				runtimeConfig["restart"] = restart
+			} else if restartPolicy := strings.TrimSpace(req.Docker.RestartPolicy); restartPolicy != "" {
+				runtimeConfig["restart"] = restartPolicy
+			}
+			if req.Docker.Console != nil {
+				runtimeConfig["console"] = req.Docker.Console
 			}
 			runtimeConfig["providerId"] = "custom"
 		}
@@ -13424,7 +13749,7 @@ func (a *Agent) handleStop(w http.ResponseWriter, r *http.Request, name string) 
 	isMinecraft := serverType == "" || serverType == "minecraft"
 
 	if isMinecraft {
-		_ = a.docker.sendCommand(ctx, a.stdinMgr, name, "stop", true)
+		_ = a.docker.sendCommand(ctx, a.stdinMgr, name, "stop", true, nil)
 	}
 
 	if waitMode {
@@ -13687,10 +14012,7 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 	meta := a.loadMeta(serverDir)
 	serverType := strings.ToLower(fmt.Sprint(meta["type"]))
 	isMinecraft := serverType == "" || serverType == "minecraft"
-	consoleMode := ""
-	if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
-		consoleMode = normalizeConsoleMode(runtimeObj["console"])
-	}
+	consoleMode := inferredConsoleModeForServer(meta)
 	useExecShell := !isMinecraft
 	if consoleMode == "stdin" {
 		useExecShell = false
@@ -13718,7 +14040,8 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 		return
 	}
 
-	if err := a.docker.sendCommand(ctx, a.stdinMgr, name, cmd, isMinecraft); err != nil {
+	targetProcesses := consoleProcessTargetsForServer(meta)
+	if err := a.docker.sendCommand(ctx, a.stdinMgr, name, cmd, isMinecraft, targetProcesses); err != nil {
 		jsonWrite(w, 200, map[string]any{
 			"ok":     false,
 			"error":  "failed-to-send",
