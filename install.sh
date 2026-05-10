@@ -1,506 +1,264 @@
+#!/bin/sh
+set -eu
+
+installer_source_dir="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P || pwd)"
+export ADPANEL_INSTALLER_SOURCE_DIR="${ADPANEL_INSTALLER_SOURCE_DIR:-$installer_source_dir}"
+
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "This installer needs root. Re-run it as root or install sudo." >&2
+    exit 1
+  fi
+}
+
+install_bash() {
+  if command -v bash >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Installing bash for the ADaemon installer..."
+  if command -v apt-get >/dev/null 2>&1; then
+    as_root apt-get update
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y bash
+  elif command -v dnf >/dev/null 2>&1; then
+    as_root dnf install -y bash
+  elif command -v yum >/dev/null 2>&1; then
+    as_root yum install -y bash
+  elif command -v apk >/dev/null 2>&1; then
+    as_root apk add --no-cache bash
+  elif command -v pacman >/dev/null 2>&1; then
+    as_root pacman -Sy --noconfirm --needed bash
+  elif command -v zypper >/dev/null 2>&1; then
+    as_root zypper --non-interactive install -y bash
+  else
+    echo "Unsupported package manager: cannot install bash." >&2
+    exit 1
+  fi
+}
+
+install_bash
+
+tmp_script="${TMPDIR:-/tmp}/adpanel-node-install-$$.bash"
+cat > "$tmp_script" <<'ADPANEL_NODE_INSTALLER'
 #!/usr/bin/env bash
-# ADaemon Installer (enterprise-style)
-# NOTE: docker group ~= root-equivalent host control.
+set -Eeuo pipefail
 
-# --- CRLF self-heal (local file only) ---
-# For curl|bash still use: tr -d '\r'
-if [[ -r "${0:-}" ]] && grep -q $'\r' "$0" 2>/dev/null; then
-  tmp="$(mktemp)"
-  tr -d '\r' < "$0" > "$tmp"
-  chmod +x "$tmp"
-  exec /usr/bin/env bash "$tmp" "$@"
-fi
+CONFIG_B64="${ADPANEL_NODE_CONFIG_B64:-}"
+CONFIG_URL="${ADPANEL_NODE_CONFIG_URL:-}"
+CONFIG_HEADER="${ADPANEL_NODE_CONFIG_HEADER:-}"
+NODE_API_PORT="${ADPANEL_NODE_API_PORT:-8080}"
+NODE_SFTP_PORT="${ADPANEL_NODE_SFTP_PORT:-2022}"
 
-if [[ -z "${BASH_VERSION:-}" ]]; then
-  echo "Please run with bash."
-  echo "Example:"
-  echo "  curl -fsSL 'https://bash.ad-panel.com/install.sh?nocache=$(date +%s)' | tr -d '\r' | sudo bash -s -- --yes"
-  exit 1
-fi
-
-set -eEu
-IFS=$'\n\t'
-set -o pipefail
-
-REPO_URL="https://github.com/antonndev/ADPanel-Daemon.git"
+REPO_URL="https://github.com/antonndev/ADaemon.git"
 NODE_DIR="/var/lib/node"
 GO_DIR="/var/lib/gonode"
-BIN_DST="/usr/local/bin/adnode"
 GO_VERSION="1.24.11"
 GO_INSTALL_ROOT="/usr/local/go"
-GO_BIN_LINK="/usr/local/bin/go"
-GOFMT_BIN_LINK="/usr/local/bin/gofmt"
-
+BIN_DST="/usr/local/bin/adnode"
 SERVICE_NAME="ADaemon"
-UNIT_NAME="${SERVICE_NAME}.service"
-UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
 ALIAS_SERVICE_NAME="adaemon"
-ALIAS_UNIT_NAME="${ALIAS_SERVICE_NAME}.service"
-ALIAS_UNIT_PATH="/etc/systemd/system/${ALIAS_UNIT_NAME}"
-LEGACY_SERVICE_NAME="adpanel-daemon"
-LEGACY_UNIT_NAME="${LEGACY_SERVICE_NAME}.service"
-LEGACY_UNIT_PATH="/etc/systemd/system/${LEGACY_UNIT_NAME}"
 LOG_FILE="/var/log/adpanel-daemon-install.log"
+PM=""
+OS_ID=""
+OS_LIKE=""
+OS_VERSION_ID=""
+OS_MAJOR=""
 
-STATE_DIR="/var/lib/adpanel-installer"
-STATE_FILE="${STATE_DIR}/state.env"
+log() { printf '\n==> %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+systemd_running() { have systemctl && [ -d /run/systemd/system ]; }
 
-ASSUME_YES=0
-for arg in "$@"; do
-  case "$arg" in
-    --yes|-y) ASSUME_YES=1 ;;
-  esac
-done
-
-# --- TTY handling (works with curl | bash) ---
-TTY_OK=0
-if [[ -r /dev/tty ]]; then
-  exec 3</dev/tty
-  TTY_OK=1
-fi
-
-# If script comes from a pipe, prevent tools from reading stdin and "eating" the remaining script.
-if [[ ! -t 0 ]]; then
-  exec </dev/null
-fi
-
-# ---------------- UI ----------------
-UI=0
-if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then UI=1; fi
-
-if (( UI )); then
-  C_RESET=$'\033[0m'
-  C_BOLD=$'\033[1m'
-  C_DIM=$'\033[2m'
-  C_WHITE=$'\033[97m'
-  C_CYAN=$'\033[96m'
-  C_GREEN=$'\033[92m'
-  C_YELLOW=$'\033[93m'
-  C_RED=$'\033[91m'
-else
-  C_RESET=""; C_BOLD=""; C_DIM=""; C_WHITE=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_RED=""
-fi
-
-t_cols() { (( UI )) && tput cols || echo 80; }
-cup() { (( UI )) && printf '\033[%s;%sH' "$1" "$2"; }
-clr() { (( UI )) && printf '\033[2J\033[H'; }
-clreol() { (( UI )) && printf '\033[2K'; }
-hide_cursor() { (( UI )) && printf '\033[?25l'; }
-show_cursor() { (( UI )) && printf '\033[?25h'; }
-
-W=80
-ROW_TITLE=2
-ROW_RULE=3
-ROW_ASCII=5
-ROW_DOMAIN=12
-ROW_STATUS=14
-ROW_PROMPT=16
-ROW_INPUT=17
-
-# Thin vertical bar on the RIGHT
-BAR_HEIGHT=12
-BAR_ROW=4
-BAR_COL=78
-BAR_PCT_COL=72
-
-center_at_plain() {
-  local row="$1"; local plain="$2"; local pre="${3:-}"; local suf="${4:-}"
-  local w="$W"
-  local len="${#plain}"
-  local col=$(( (w - len) / 2 + 1 ))
-  (( col < 1 )) && col=1
-  cup "$row" "$col"
-  printf "%s%s%s" "$pre" "$plain" "$suf"
-}
-
-line_rule() {
-  local row="$1"
-  local s="────────────────────────────────────────────────────────"
-  center_at_plain "$row" "$s" "${C_DIM}" "${C_RESET}"
-}
-
-draw_ascii_adaemon() {
-  local row="$ROW_ASCII"
-  local line
-  while IFS= read -r line; do
-    center_at_plain "$row" "$line" "${C_CYAN}${C_BOLD}" "${C_RESET}"
-    row=$((row+1))
-  done <<'ASCII'
-    _    ____                                 
-   / \  |  _ \  __ _  ___ _ __ ___   ___  _ __ 
-  / _ \ | | | |/ _` |/ _ \ '_ ` _ \ / _ \| '_ \
- / ___ \| |_| | (_| |  __/ | | | | | (_) | | | |
-/_/   \_\____/ \__,_|\___|_| |_| |_|\___/|_| |_|
-ASCII
-}
-
-status_set() {
-  local msg_plain="$1"
-  if (( UI )); then
-    cup "$ROW_STATUS" 1; clreol
-    center_at_plain "$ROW_STATUS" "$msg_plain" "${C_WHITE}${C_BOLD}" "${C_RESET}"
-  else
-    echo "==> ${msg_plain}"
-  fi
-}
-
-prompt_clear() {
-  (( UI )) || return 0
-  cup "$ROW_PROMPT" 1; clreol
-  cup "$ROW_INPUT" 1; clreol
-}
-
-prompt_set() {
-  local p_plain="$1"
-  if (( UI )); then
-    prompt_clear
-    center_at_plain "$ROW_PROMPT" "$p_plain" "${C_WHITE}${C_BOLD}" "${C_RESET}"
-    center_at_plain "$ROW_INPUT" "› " "${C_CYAN}${C_BOLD}" "${C_RESET}"
-    local col=$(( (W - 2) / 2 + 3 ))
-    cup "$ROW_INPUT" "$col"
-  else
-    echo
-    echo "${p_plain} [yes/no]"
-    printf "> "
-  fi
-}
-
-ui_splash() {
-  W="$(t_cols)"
-  BAR_COL=$(( W - 2 ))
-  (( BAR_COL < 10 )) && BAR_COL=10
-  BAR_PCT_COL=$(( BAR_COL - 7 ))
-  (( BAR_PCT_COL < 1 )) && BAR_PCT_COL=1
-
-  clr
-  hide_cursor
-
-  center_at_plain "$ROW_TITLE" "ADPanel Daemon Installation" "${C_WHITE}${C_BOLD}" "${C_RESET}"
-  line_rule "$ROW_RULE"
-  draw_ascii_adaemon
-  center_at_plain "$ROW_DOMAIN" "ad-panel.com" "${C_DIM}" "${C_RESET}"
-
-  if (( UI )); then
-    for ((i=0;i<BAR_HEIGHT;i++)); do
-      cup "$((BAR_ROW+i))" "$BAR_PCT_COL"; printf "%s" "       "
-      cup "$((BAR_ROW+i))" "$BAR_COL"; printf "%s" " "
-    done
-  fi
-}
-
-bar_render() {
-  local percent="$1"
-  local tick="$2"
-  (( UI )) || return 0
-
-  (( percent < 0 )) && percent=0
-  (( percent > 100 )) && percent=100
-
-  local filled=$(( percent * BAR_HEIGHT / 100 ))
-  local pulse_on=$(( tick % 2 ))
-
-  local mid=$(( BAR_ROW + BAR_HEIGHT / 2 ))
-  cup "$mid" "$BAR_PCT_COL"
-  printf "%5s " "${percent}%"
-
-  for ((i=0;i<BAR_HEIGHT;i++)); do
-    local level_from_bottom=$(( BAR_HEIGHT - i ))
-    local ch="░"
-    if (( level_from_bottom <= filled )); then
-      ch="█"
-    else
-      if (( percent < 100 )) && (( level_from_bottom == filled + 1 )); then
-        if (( pulse_on )); then ch="▓"; else ch="▒"; fi
-      fi
-    fi
-    cup "$((BAR_ROW+i))" "$BAR_COL"
-    printf "%s" "${C_WHITE}${ch}${C_RESET}"
-  done
-}
-
-ui_bye() {
-  if (( UI )); then
-    clr
-    center_at_plain 4 "Opsss, we have to go... bye bye....!" "${C_YELLOW}${C_BOLD}" "${C_RESET}"
-    cup 6 1
-  else
-    echo "Opsss, we have to go... bye bye....!"
-  fi
-}
-
-cleanup() {
-  show_cursor
-  if (( UI )); then
-    cup "$((BAR_ROW+BAR_HEIGHT+3))" 1
-    printf "\n"
-  fi
-}
-trap cleanup EXIT
-
-fail() {
-  local rc="${1:-1}"
-  show_cursor
-  echo
-  echo "${C_RED}${C_BOLD}✗ Operation failed.${C_RESET}"
-  echo "${C_DIM}See: ${LOG_FILE}${C_RESET}"
-  echo
-  tail -n 220 "${LOG_FILE}" 2>/dev/null || true
-  exit "$rc"
-}
-
-# Harder to stop (can’t beat kill -9 / root)
-trap 'status_set "Installer is running… please wait."; ' INT
-trap 'status_set "Stop requested — ignored. Installer continues…"; ' TERM QUIT HUP
-trap '' TSTP
-
-# --------------- Core helpers ---------------
 require_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "${C_RED}${C_BOLD}This script must be run as root.${C_RESET}"
-    echo "Run: sudo bash install.sh"
-    exit 1
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    die "Run this installer as root, for example: sudo sh install-daemon.sh"
   fi
 }
 
-require_systemd() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "${C_RED}${C_BOLD}systemctl not found.${C_RESET}"
-    echo "This script requires systemd."
-    exit 1
+detect_platform() {
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-}"
+    OS_LIKE="${ID_LIKE:-}"
+    OS_VERSION_ID="${VERSION_ID:-}"
   fi
-  if [[ ! -d /run/systemd/system ]]; then
-    echo "${C_RED}${C_BOLD}systemd is not running (PID 1 is not systemd).${C_RESET}"
-    echo "Run this on a normal systemd host (not a minimal container)."
-    exit 1
+  OS_MAJOR="${OS_VERSION_ID%%.*}"
+  if have apt-get; then PM="apt"
+  elif have dnf; then PM="dnf"
+  elif have yum; then PM="yum"
+  elif have apk; then PM="apk"
+  elif have pacman; then PM="pacman"
+  elif have zypper; then PM="zypper"
+  else die "Unsupported Linux package manager. Need apt, dnf, yum, apk, pacman, or zypper."
+  fi
+  log "Detected package manager: $PM"
+}
+
+pkg_update() {
+  case "$PM" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 update
+      ;;
+    dnf) dnf -y makecache --refresh || dnf -y makecache || true ;;
+    yum) yum -y makecache || true ;;
+    apk) apk update ;;
+    pacman) pacman -Sy --noconfirm ;;
+    zypper) zypper --non-interactive refresh || true ;;
+  esac
+}
+
+pkg_install() {
+  case "$PM" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 install --no-install-recommends "$@"
+      ;;
+    dnf) dnf install -y "$@" ;;
+    yum) yum install -y "$@" ;;
+    apk) apk add --no-cache "$@" ;;
+    pacman) pacman -S --noconfirm --needed "$@" ;;
+    zypper) zypper --non-interactive install -y "$@" ;;
+  esac
+}
+
+install_base_packages() {
+  log "Installing base dependencies..."
+  pkg_update
+  case "$PM" in
+    apt)
+      pkg_install ca-certificates curl git tar gzip sed grep coreutils util-linux passwd procps
+      ;;
+    dnf|yum)
+      pkg_install ca-certificates curl git tar gzip sed grep coreutils util-linux shadow-utils procps-ng findutils
+      ;;
+    apk)
+      pkg_install ca-certificates curl git tar gzip sed grep coreutils util-linux
+      pkg_install shadow >/dev/null 2>&1 || true
+      ;;
+    pacman)
+      pkg_install ca-certificates curl git tar gzip sed grep coreutils util-linux shadow procps-ng
+      ;;
+    zypper)
+      pkg_install ca-certificates curl git tar gzip sed grep coreutils util-linux shadow procps
+      ;;
+  esac
+  update-ca-certificates >/dev/null 2>&1 || true
+}
+
+install_docker_convenience() {
+  log "Trying Docker official convenience installer..."
+  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+  sh /tmp/get-docker.sh
+}
+
+enable_rhel_docker_repo() {
+  pkg_install dnf-plugins-core >/dev/null 2>&1 || true
+  pkg_install yum-utils >/dev/null 2>&1 || true
+  pkg_install epel-release >/dev/null 2>&1 || true
+  if have crb; then
+    crb enable >/dev/null 2>&1 || true
+  fi
+  if have dnf; then
+    dnf config-manager --set-enabled crb >/dev/null 2>&1 || true
+    dnf config-manager --set-enabled powertools >/dev/null 2>&1 || true
+    dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null 2>&1 || true
+  fi
+  if have yum-config-manager; then
+    yum-config-manager --enable crb >/dev/null 2>&1 || true
+    yum-config-manager --enable powertools >/dev/null 2>&1 || true
+    yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null 2>&1 || true
   fi
 }
 
-ask_yes_no_tty() {
-  local prompt="$1"
-  local ans=""
-  while true; do
-    prompt_set "$prompt"
-    if (( TTY_OK )); then
-      IFS= read -r -u 3 ans || ans=""
-    else
-      IFS= read -r ans || ans=""
+install_docker() {
+  if have docker; then
+    log "Docker already installed."
+    return 0
+  fi
+
+  log "Installing Docker..."
+  case "$PM" in
+    apt)
+      pkg_install docker.io || install_docker_convenience
+      ;;
+    dnf|yum)
+      enable_rhel_docker_repo
+      pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+        || pkg_install moby-engine docker-cli containerd \
+        || pkg_install docker \
+        || install_docker_convenience
+      ;;
+    apk)
+      pkg_install docker docker-cli || pkg_install docker
+      ;;
+    pacman)
+      pkg_install docker
+      ;;
+    zypper)
+      pkg_install docker
+      ;;
+  esac
+
+  have docker || die "Docker installation finished but docker command was not found."
+}
+
+ensure_docker_group() {
+  if ! getent group docker >/dev/null 2>&1; then
+    if have groupadd; then groupadd docker >/dev/null 2>&1 || true
+    elif have addgroup; then addgroup -S docker >/dev/null 2>&1 || addgroup docker >/dev/null 2>&1 || true
     fi
-    ans="$(printf "%s" "${ans}" | tr -d '\r' | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-    [[ -z "${ans}" ]] && continue
-    case "${ans}" in
-      y*|yes*) return 0 ;;
-      n*|no*)  return 1 ;;
-      *)       continue ;;
-    esac
-  done
+  fi
+  if id adaemon >/dev/null 2>&1; then
+    if have usermod; then usermod -aG docker adaemon >/dev/null 2>&1 || true
+    elif have addgroup; then addgroup adaemon docker >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
-# ---------------- Progress engine (output-driven, apt-like) ----------------
-CURRENT_PCT=0
-
-anim_start() {
-  local -n _pid=$1
-  local tick=0
-  (
-    while :; do
-      bar_render "${CURRENT_PCT}" "${tick}"
-      tick=$((tick+1))
-      sleep 0.08
-    done
-  ) &
-  _pid=$!
-}
-
-anim_stop() {
-  local pid="$1"
-  kill "$pid" >/dev/null 2>&1 || true
-  wait "$pid" >/dev/null 2>&1 || true
-}
-
-monitor_none() { while IFS= read -r _; do :; done; }
-
-run_stream_step() {
-  local from="$1"; shift
-  local to="$1"; shift
-  local msg="$1"; shift
-  local monitor_fn="$1"; shift
-
-  local range=$((to - from)); (( range < 0 )) && range=0
-
-  prompt_clear
-  status_set "${msg}"
-  CURRENT_PCT="${from}"
-
-  local tmpdir fifo
-  tmpdir="$(mktemp -d)"
-  fifo="${tmpdir}/out.fifo"
-  mkfifo "$fifo"
-
-  local anim_pid=0 mon_pid=0 cmd_pid=0 rc=0
-  anim_start anim_pid
-
-  (
-    "$monitor_fn" "$from" "$to" "$range" < "$fifo"
-  ) &
-  mon_pid=$!
-
-  local -a cmd
-  cmd=("$@")
-  local first="${cmd[0]}"
-  local kind
-  kind="$(type -t "$first" 2>/dev/null || true)"
-  if command -v stdbuf >/dev/null 2>&1 && [[ "$kind" == "file" ]]; then
-    cmd=(stdbuf -oL -eL "${cmd[@]}")
+start_docker() {
+  if docker info >/dev/null 2>&1; then
+    log "Docker is already running."
+    return 0
   fi
 
-  (
-    "${cmd[@]}" 2>&1 | tr '\r' '\n' | tee -a "$LOG_FILE" > "$fifo"
-  ) &
-  cmd_pid=$!
-
-  set +e
-  wait "$cmd_pid"
-  rc=$?
-  set -e
-
-  rm -f "$fifo" >/dev/null 2>&1 || true
-  kill "$mon_pid" >/dev/null 2>&1 || true
-  wait "$mon_pid" >/dev/null 2>&1 || true
-  anim_stop "$anim_pid"
-  rm -rf "$tmpdir" >/dev/null 2>&1 || true
-
-  if (( rc != 0 )); then
-    echo "---- step failed rc=${rc}: ${msg} ----" >> "${LOG_FILE}"
-    fail "$rc"
+  log "Starting Docker service..."
+  if systemd_running; then
+    systemctl enable --now docker >/dev/null 2>&1 || systemctl start docker
+  elif have rc-service; then
+    rc-update add docker default >/dev/null 2>&1 || true
+    rc-service docker start
+  elif have service; then
+    service docker start
+  elif have dockerd; then
+    nohup dockerd >/var/log/dockerd.log 2>&1 &
   fi
 
-  CURRENT_PCT="$to"
-  bar_render "$to" 0
-}
-
-monitor_apt_update() {
-  local from="$1" to="$2" range="$3"
-  local stage_m=0
-  while IFS= read -r line; do
-    case "$line" in
-      Hit:*|Get:*|Ign:*|Err:*) (( stage_m < 300 )) && stage_m=300 ;;
-      "Reading package lists..."*) (( stage_m < 900 )) && stage_m=900 ;;
-      "Reading package lists... Done"*) (( stage_m < 950 )) && stage_m=950 ;;
-    esac
-    local pct=$(( from + (stage_m * range) / 1000 ))
-    (( pct >= to )) && pct=$((to-1))
-    (( pct > CURRENT_PCT )) && CURRENT_PCT="$pct"
-  done
-}
-
-apt_sim_count_install() {
-  apt-get -s -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 install --no-install-recommends "$@" 2>/dev/null \
-    | awk '/^Inst[[:space:]]/ {c++} END{print c+0}'
-}
-
-monitor_apt_install() {
-  local from="$1" to="$2" range="$3"
-  local total="${APT_TOTAL:-0}"
-  local get_seen=0 fetched=0 unpack=0 setup=0
-
-  while IFS= read -r line; do
-    case "$line" in
-      Hit:*|Get:*|Ign:*|Err:*) ((get_seen++)) ;;
-      Fetched*) fetched=1 ;;
-      Unpacking\ *) ((unpack++)) ;;
-      Setting\ up\ *) ((setup++)) ;;
-    esac
-
-    local dl_m=0
-    if (( fetched == 1 )); then
-      dl_m=200
-    else
-      local cap=20; local gs=$get_seen
-      (( gs > cap )) && gs=$cap
-      dl_m=$(( gs * 200 / cap ))
+  for _ in $(seq 1 30); do
+    if docker info >/dev/null 2>&1; then
+      log "Docker is running."
+      return 0
     fi
-
-    local inst_m=0
-    if (( total > 0 )); then
-      local done=$((unpack + setup))
-      local denom=$((2 * total))
-      inst_m=$(( done * 800 / denom ))
-      (( inst_m > 800 )) && inst_m=800
-    else
-      (( dl_m > 0 )) && inst_m=50
-    fi
-
-    local sub_m=$(( dl_m + inst_m ))
-    (( sub_m > 990 )) && sub_m=990
-
-    local pct=$(( from + (sub_m * range) / 1000 ))
-    (( pct >= to )) && pct=$((to-1))
-    (( pct > CURRENT_PCT )) && CURRENT_PCT="$pct"
+    sleep 1
   done
-}
-
-apt_sim_count_purge() {
-  apt-get -s -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 purge "$@" 2>/dev/null \
-    | awk '/^Remv[[:space:]]/ {c++} END{print c+0}'
-}
-
-monitor_apt_purge() {
-  local from="$1" to="$2" range="$3"
-  local total="${APT_TOTAL:-0}"
-  local removing=0 purging=0 triggers=0
-
-  while IFS= read -r line; do
-    case "$line" in
-      Removing\ *) ((removing++)) ;;
-      Purging\ *) ((purging++)) ;;
-      Processing\ triggers\ for\ *) ((triggers++)) ;;
-    esac
-
-    local m=0
-    if (( total > 0 )); then
-      # removing+purging are the main work; triggers are the tail
-      local done=$((removing + purging))
-      local denom=$((2 * total))
-      m=$(( done * 900 / denom ))
-      (( m > 900 )) && m=900
-      (( triggers > 0 )) && m=$((m + 50))
-    else
-      (( removing + purging > 0 )) && m=700
-      (( triggers > 0 )) && m=900
-    fi
-    (( m > 990 )) && m=990
-
-    local pct=$(( from + (m * range) / 1000 ))
-    (( pct >= to )) && pct=$((to-1))
-    (( pct > CURRENT_PCT )) && CURRENT_PCT="$pct"
-  done
-}
-
-pkg_installed() {
-  dpkg -s "$1" >/dev/null 2>&1
-}
-
-version_ge() {
-  local current="$1"
-  local required="$2"
-  [[ "$(printf '%s\n%s\n' "${required}" "${current}" | sort -V | head -n1)" == "${required}" ]]
+  die "Docker is installed but did not start. Check Docker service logs."
 }
 
 go_version_satisfies() {
-  local current=""
-
-  if ! command -v go >/dev/null 2>&1; then
-    return 1
-  fi
-
-  current="$(go env GOVERSION 2>/dev/null || true)"
-  if [[ -z "${current}" ]]; then
-    current="$(go version 2>/dev/null | awk '{print $3}' || true)"
-  fi
-  current="${current#go}"
-
-  [[ -n "${current}" ]] || return 1
-  version_ge "${current}" "1.24.0"
+  have go || return 1
+  local raw major rest minor
+  raw="$(go env GOVERSION 2>/dev/null || go version 2>/dev/null | awk '{print $3}' || true)"
+  raw="${raw#go}"
+  major="${raw%%.*}"
+  rest="${raw#*.}"
+  minor="${rest%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  (( major > 1 || (major == 1 && minor >= 24) ))
 }
 
 detect_go_arch() {
@@ -508,226 +266,372 @@ detect_go_arch() {
     x86_64|amd64) echo "amd64" ;;
     aarch64|arm64) echo "arm64" ;;
     armv6l|armv7l) echo "armv6l" ;;
-    *)
-      echo "Unsupported CPU architecture for Go toolchain install: $(uname -m)" >&2
-      return 1
-      ;;
+    *) die "Unsupported CPU architecture for Go: $(uname -m)" ;;
   esac
 }
 
 install_go_toolchain() {
+  if go_version_satisfies; then
+    log "Go $(go env GOVERSION 2>/dev/null || go version | awk '{print $3}') already installed."
+    return 0
+  fi
+
   local arch tarball url alt_url tmpdir
   arch="$(detect_go_arch)"
-  tarball="go${GO_VERSION}.linux-${arch}.tar.gz"
-  url="https://go.dev/dl/${tarball}"
-  alt_url="https://dl.google.com/go/${tarball}"
+  tarball="go$GO_VERSION.linux-$arch.tar.gz"
+  url="https://go.dev/dl/$tarball"
+  alt_url="https://dl.google.com/go/$tarball"
   tmpdir="$(mktemp -d)"
 
-  echo "---- install go ${GO_VERSION} (${arch}) ----" >> "${LOG_FILE}"
-
-  if ! curl -fsSL "${url}" -o "${tmpdir}/${tarball}" >> "${LOG_FILE}" 2>&1; then
-    curl -fsSL "${alt_url}" -o "${tmpdir}/${tarball}" >> "${LOG_FILE}" 2>&1
+  log "Installing Go $GO_VERSION ($arch)..."
+  if ! curl -fsSL "$url" -o "$tmpdir/$tarball"; then
+    curl -fsSL "$alt_url" -o "$tmpdir/$tarball"
   fi
-
-  rm -rf "${GO_INSTALL_ROOT}" >> "${LOG_FILE}" 2>&1 || true
-  tar -C /usr/local -xzf "${tmpdir}/${tarball}" >> "${LOG_FILE}" 2>&1
-  ln -sf "${GO_INSTALL_ROOT}/bin/go" "${GO_BIN_LINK}" >> "${LOG_FILE}" 2>&1
-  ln -sf "${GO_INSTALL_ROOT}/bin/gofmt" "${GOFMT_BIN_LINK}" >> "${LOG_FILE}" 2>&1
-  rm -rf "${tmpdir}" >> "${LOG_FILE}" 2>&1 || true
-
-  go_version_satisfies
+  rm -rf "$GO_INSTALL_ROOT"
+  tar -C /usr/local -xzf "$tmpdir/$tarball"
+  ln -sf "$GO_INSTALL_ROOT/bin/go" /usr/local/bin/go
+  ln -sf "$GO_INSTALL_ROOT/bin/gofmt" /usr/local/bin/gofmt
+  rm -rf "$tmpdir"
+  go_version_satisfies || die "Installed Go does not satisfy ADaemon requirements."
 }
 
-remove_go_toolchain() {
-  echo "---- remove go toolchain ----" >> "${LOG_FILE}"
-  rm -rf "${GO_INSTALL_ROOT}" >> "${LOG_FILE}" 2>&1 || true
-  rm -f "${GO_BIN_LINK}" "${GOFMT_BIN_LINK}" >> "${LOG_FILE}" 2>&1 || true
-}
-
-APT_UPDATED=0
-apt_update_progress() {
-  if (( APT_UPDATED == 1 )); then return 0; fi
-  export DEBIAN_FRONTEND=noninteractive
-  export NEEDRESTART_MODE=a
-  export APT_LISTCHANGES_FRONTEND=none
-  dpkg --configure -a >> "${LOG_FILE}" 2>&1 || true
-  apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 -f install >> "${LOG_FILE}" 2>&1 || true
-  echo "---- apt-get update ----" >> "${LOG_FILE}"
-  run_stream_step 8 14 "Updating package lists…" monitor_apt_update \
-    apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 update
-  APT_UPDATED=1
-}
-
-apt_install_progress() {
-  local from="$1"; shift
-  local to="$1"; shift
-  local msg="$1"; shift
-  export DEBIAN_FRONTEND=noninteractive
-  export NEEDRESTART_MODE=a
-  export APT_LISTCHANGES_FRONTEND=none
-  APT_TOTAL="$(apt_sim_count_install "$@")"
-  echo "---- apt-get install: $* (plan=${APT_TOTAL}) ----" >> "${LOG_FILE}"
-  run_stream_step "$from" "$to" "$msg" monitor_apt_install \
-    apt-get -y -o Dpkg::Use-Pty=0 \
-      -o DPkg::Lock::Timeout=300 \
-      -o Dpkg::Options::=--force-confdef \
-      -o Dpkg::Options::=--force-confold \
-      -o Acquire::Retries=3 \
-      install --no-install-recommends "$@"
-  unset APT_TOTAL
-}
-
-apt_purge_progress() {
-  local from="$1"; shift
-  local to="$1"; shift
-  local msg="$1"; shift
-  export DEBIAN_FRONTEND=noninteractive
-  export NEEDRESTART_MODE=a
-  export APT_LISTCHANGES_FRONTEND=none
-  APT_TOTAL="$(apt_sim_count_purge "$@")"
-  echo "---- apt-get purge: $* (plan=${APT_TOTAL}) ----" >> "${LOG_FILE}"
-  run_stream_step "$from" "$to" "$msg" monitor_apt_purge \
-    apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 purge "$@"
-  unset APT_TOTAL
-}
-
-save_state() {
-  mkdir -p "${STATE_DIR}"
-  chmod 0755 "${STATE_DIR}"
-  cat > "${STATE_FILE}" <<EOF
-INST_GIT=${INST_GIT:-0}
-INST_DOCKER=${INST_DOCKER:-0}
-INST_GO=${INST_GO:-0}
-EOF
-  chmod 0644 "${STATE_FILE}"
-}
-
-load_state() {
-  INST_GIT=0; INST_DOCKER=0; INST_GO=0
-  [[ -f "${STATE_FILE}" ]] || return 0
-  while IFS= read -r line; do
-    case "$line" in
-      INST_GIT=0|INST_GIT=1|INST_DOCKER=0|INST_DOCKER=1|INST_GO=0|INST_GO=1) eval "$line" ;;
-    esac
-  done < "${STATE_FILE}"
-}
-
-# --------------- Install/Uninstall actions ---------------
-ensure_dirs() {
-  mkdir -p "${NODE_DIR}" "${GO_DIR}"
-  chmod 0750 "${NODE_DIR}" "${GO_DIR}"
-}
-
-backup_if_needed() {
-  [[ -d "${NODE_DIR}/.git" ]] && return 0
-  if [[ -n "$(ls -A "${NODE_DIR}" 2>/dev/null || true)" ]]; then
-    local ts; ts="$(date +%Y%m%d-%H%M%S)"
-    local bak="${NODE_DIR}.bak-${ts}"
-    echo "---- backup ${NODE_DIR} -> ${bak} ----" >> "${LOG_FILE}"
-    mv "${NODE_DIR}" "${bak}" >> "${LOG_FILE}" 2>&1
-    mkdir -p "${NODE_DIR}"
+backup_non_git_node_dir() {
+  [ -d "$NODE_DIR" ] || return 0
+  [ -d "$NODE_DIR/.git" ] && return 0
+  if [ -n "$(find "$NODE_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]; then
+    local backup
+    backup="$NODE_DIR.bak-$(date +%Y%m%d-%H%M%S)"
+    log "Existing non-git node directory found; moving it to $backup"
+    mv "$NODE_DIR" "$backup"
   fi
 }
 
-git_clone_or_update() {
-  if [[ -d "${NODE_DIR}/.git" ]]; then
-    echo "---- git fetch/reset ----" >> "${LOG_FILE}"
-    git -C "${NODE_DIR}" fetch --all --prune >> "${LOG_FILE}" 2>&1
-    local def
-    def="$(git -C "${NODE_DIR}" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
-    [[ -z "${def}" ]] && def="main"
-    git -C "${NODE_DIR}" reset --hard "origin/${def}" >> "${LOG_FILE}" 2>&1
+deploy_source() {
+  log "Deploying ADaemon source..."
+  mkdir -p "$(dirname "$NODE_DIR")" "$GO_DIR"
+  if [ -d "$NODE_DIR/.git" ]; then
+    git -C "$NODE_DIR" remote set-url origin "$REPO_URL" >/dev/null 2>&1 || true
+    git -C "$NODE_DIR" fetch --all --prune
+    local branch
+    branch="$(git -C "$NODE_DIR" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
+    [ -n "$branch" ] || branch="main"
+    git -C "$NODE_DIR" reset --hard "origin/$branch"
   else
-    backup_if_needed
-    echo "---- git clone ----" >> "${LOG_FILE}"
-    git clone --depth=1 --progress "${REPO_URL}" "${NODE_DIR}" >> "${LOG_FILE}" 2>&1
+    backup_non_git_node_dir
+    git clone --depth=1 "$REPO_URL" "$NODE_DIR"
   fi
+}
+
+write_config() {
+  mkdir -p "$NODE_DIR"
+
+  if [ -n "$CONFIG_B64" ]; then
+    log "Writing /var/lib/node/config.yml from embedded panel config..."
+    if base64 -d </dev/null >/dev/null 2>&1; then
+      printf '%s' "$CONFIG_B64" | base64 -d > "$NODE_DIR/config.yml"
+    else
+      printf '%s' "$CONFIG_B64" | base64 --decode > "$NODE_DIR/config.yml"
+    fi
+  elif [ -n "$CONFIG_URL" ]; then
+    log "Downloading /var/lib/node/config.yml from panel..."
+    if [ -n "$CONFIG_HEADER" ]; then
+      curl -fsSL -H "$CONFIG_HEADER" "$CONFIG_URL" -o "$NODE_DIR/config.yml"
+    else
+      curl -fsSL "$CONFIG_URL" -o "$NODE_DIR/config.yml"
+    fi
+  elif [ -f "$NODE_DIR/config.yml" ]; then
+    log "Keeping existing /var/lib/node/config.yml."
+  else
+    warn "No node config provided. Create /var/lib/node/config.yml before starting ADaemon."
+    return 0
+  fi
+
+  chmod 0640 "$NODE_DIR/config.yml" 2>/dev/null || true
+}
+
+apply_docker_compat_patch() {
+  rm -f "$NODE_DIR/docker_types_compat.go"
+  if grep -Rqs "type dockerHostConfig" "$NODE_DIR"/*.go 2>/dev/null && grep -Rqs "func (d Docker) engineRequest" "$NODE_DIR"/*.go 2>/dev/null; then
+    return 0
+  fi
+
+  if [ -n "${ADPANEL_INSTALLER_SOURCE_DIR:-}" ] && [ -f "$ADPANEL_INSTALLER_SOURCE_DIR/docker_engine.go" ]; then
+    log "Copying Docker API compatibility file into /var/lib/node..."
+    cp "$ADPANEL_INSTALLER_SOURCE_DIR/docker_engine.go" "$NODE_DIR/docker_engine.go"
+    return 0
+  fi
+
+  log "Applying ADaemon Docker API compatibility patch..."
+  cat > "$NODE_DIR/docker_types_compat.go" <<'GO_COMPAT'
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+type dockerPortBinding struct {
+	HostIP   string `json:"HostIp,omitempty"`
+	HostPort string `json:"HostPort,omitempty"`
+}
+
+type dockerRestartPolicy struct {
+	Name              string `json:"Name,omitempty"`
+	MaximumRetryCount int    `json:"MaximumRetryCount,omitempty"`
+}
+
+type dockerUlimit struct {
+	Name string `json:"Name"`
+	Soft int64  `json:"Soft"`
+	Hard int64  `json:"Hard"`
+}
+
+type dockerHostConfig struct {
+	Binds             []string                       `json:"Binds,omitempty"`
+	PortBindings      map[string][]dockerPortBinding `json:"PortBindings,omitempty"`
+	RestartPolicy     dockerRestartPolicy            `json:"RestartPolicy,omitempty"`
+	CapDrop           []string                       `json:"CapDrop,omitempty"`
+	CapAdd            []string                       `json:"CapAdd,omitempty"`
+	SecurityOpt       []string                       `json:"SecurityOpt,omitempty"`
+	PidsLimit         int64                          `json:"PidsLimit,omitempty"`
+	ReadonlyRootfs    bool                           `json:"ReadonlyRootfs,omitempty"`
+	Tmpfs             map[string]string              `json:"Tmpfs,omitempty"`
+	Memory            int64                          `json:"Memory,omitempty"`
+	MemoryReservation int64                          `json:"MemoryReservation,omitempty"`
+	MemorySwap        int64                          `json:"MemorySwap,omitempty"`
+	CpuPeriod         int64                          `json:"CpuPeriod,omitempty"`
+	CpuQuota          int64                          `json:"CpuQuota,omitempty"`
+	CpuShares         int64                          `json:"CpuShares,omitempty"`
+	BlkioWeight       int64                          `json:"BlkioWeight,omitempty"`
+	Ulimits           []dockerUlimit                 `json:"Ulimits,omitempty"`
+}
+
+type dockerContainerCreateRequest struct {
+	Image        string              `json:"Image"`
+	Env          []string            `json:"Env,omitempty"`
+	Cmd          []string            `json:"Cmd,omitempty"`
+	Entrypoint   []string            `json:"Entrypoint,omitempty"`
+	WorkingDir   string              `json:"WorkingDir,omitempty"`
+	User         string              `json:"User,omitempty"`
+	Tty          bool                `json:"Tty,omitempty"`
+	OpenStdin    bool                `json:"OpenStdin,omitempty"`
+	AttachStdin  bool                `json:"AttachStdin,omitempty"`
+	AttachStdout bool                `json:"AttachStdout,omitempty"`
+	AttachStderr bool                `json:"AttachStderr,omitempty"`
+	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	HostConfig   dockerHostConfig    `json:"HostConfig,omitempty"`
+}
+
+type dockerImageInspectResponse struct {
+	Config struct {
+		Volumes    map[string]any `json:"Volumes"`
+		WorkingDir string         `json:"WorkingDir"`
+		User       string         `json:"User"`
+		Env        []string       `json:"Env"`
+		Entrypoint []string       `json:"Entrypoint"`
+		Cmd        []string       `json:"Cmd"`
+	} `json:"Config"`
+}
+
+type dockerContainerInspectResponse struct {
+	HostConfig dockerHostConfig `json:"HostConfig"`
+}
+
+func decodeDockerAPIError(body []byte) string {
+	var payload struct {
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if len(body) > 0 && json.Unmarshal(body, &payload) == nil {
+		if msg := strings.TrimSpace(payload.Message); msg != "" {
+			return msg
+		}
+		if msg := strings.TrimSpace(payload.Error); msg != "" {
+			return msg
+		}
+	}
+	msg := strings.TrimSpace(string(body))
+	if msg == "" {
+		return "Docker API request failed"
+	}
+	if len(msg) > 800 {
+		msg = msg[:800]
+	}
+	return msg
+}
+
+func dockerHTTPClient() *http.Client {
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", "/var/run/docker.sock")
+		},
+	}
+	return &http.Client{Transport: transport, Timeout: 10 * time.Minute}
+}
+
+func (d Docker) engineRequest(ctx context.Context, method, endpoint string, query url.Values, body any) ([]byte, int, error) {
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+	var reader io.Reader
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, err
+		}
+		reader = bytes.NewReader(payload)
+	}
+	reqURL := "http://docker" + endpoint
+	if query != nil && len(query) > 0 {
+		reqURL += "?" + query.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, reader)
+	if err != nil {
+		return nil, 0, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := dockerHTTPClient().Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024*1024))
+	if readErr != nil {
+		return nil, resp.StatusCode, readErr
+	}
+	return data, resp.StatusCode, nil
+}
+
+func (d Docker) runContainerAPI(ctx context.Context, name string, req dockerContainerCreateRequest) error {
+	query := url.Values{}
+	query.Set("name", name)
+	body, status, err := d.engineRequest(ctx, http.MethodPost, "/containers/create", query, req)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("failed to create container %s: %s", name, decodeDockerAPIError(body))
+	}
+	body, status, err = d.engineRequest(ctx, http.MethodPost, "/containers/"+url.PathEscape(name)+"/start", nil, nil)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusNoContent && status != http.StatusNotModified {
+		return fmt.Errorf("failed to start container %s: %s", name, decodeDockerAPIError(body))
+	}
+	return nil
+}
+
+func (d Docker) pullImageAPI(ctx context.Context, imageRef string) error {
+	_, stderr, code, err := d.runCollect(ctx, "pull", imageRef)
+	if err != nil || code != 0 {
+		msg := strings.TrimSpace(stderr)
+		if msg == "" && err != nil {
+			msg = err.Error()
+		}
+		if msg == "" {
+			msg = "docker pull failed"
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	return nil
+}
+
+func (d Docker) inspectImageConfigAPI(ctx context.Context, ref string) (imageConfig, error) {
+	body, status, err := d.engineRequest(ctx, http.MethodGet, "/images/"+url.PathEscape(ref)+"/json", nil, nil)
+	if err != nil {
+		return imageConfig{}, err
+	}
+	if status < 200 || status >= 300 {
+		return imageConfig{}, fmt.Errorf("failed to inspect image %s: %s", ref, decodeDockerAPIError(body))
+	}
+	var payload dockerImageInspectResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return imageConfig{}, err
+	}
+	cfg := imageConfig{Env: map[string]string{}}
+	for path := range payload.Config.Volumes {
+		path = strings.TrimSpace(path)
+		if path != "" && path != "/" {
+			cfg.Volumes = append(cfg.Volumes, path)
+		}
+	}
+	cfg.Workdir = strings.TrimSpace(payload.Config.WorkingDir)
+	cfg.User = strings.TrimSpace(payload.Config.User)
+	for _, kv := range payload.Config.Env {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			cfg.Env[k] = v
+		}
+	}
+	cfg.Entrypoint = payload.Config.Entrypoint
+	cfg.Cmd = payload.Config.Cmd
+	return cfg, nil
+}
+
+func (d Docker) inspectContainerAPI(ctx context.Context, name string) (dockerContainerInspectResponse, error) {
+	body, status, err := d.engineRequest(ctx, http.MethodGet, "/containers/"+url.PathEscape(name)+"/json", nil, nil)
+	if err != nil {
+		return dockerContainerInspectResponse{}, err
+	}
+	if status < 200 || status >= 300 {
+		return dockerContainerInspectResponse{}, fmt.Errorf("failed to inspect container %s: %s", name, decodeDockerAPIError(body))
+	}
+	var payload dockerContainerInspectResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return dockerContainerInspectResponse{}, err
+	}
+	return payload, nil
+}
+GO_COMPAT
 }
 
 ensure_user() {
+  log "Ensuring adaemon system user..."
   if ! id adaemon >/dev/null 2>&1; then
-    echo "---- useradd adaemon ----" >> "${LOG_FILE}"
-    local nologin_shell="/usr/sbin/nologin"
-    [[ -x "${nologin_shell}" ]] || nologin_shell="/sbin/nologin"
-    [[ -x "${nologin_shell}" ]] || nologin_shell="/bin/false"
-    useradd --system --home-dir "${NODE_DIR}" --shell "${nologin_shell}" --comment "ADPanel Daemon" adaemon >> "${LOG_FILE}" 2>&1
+    if have useradd; then
+      local nologin="/usr/sbin/nologin"
+      [ -x "$nologin" ] || nologin="/sbin/nologin"
+      [ -x "$nologin" ] || nologin="/bin/false"
+      useradd --system --home-dir "$NODE_DIR" --shell "$nologin" --comment "ADPanel Daemon" adaemon
+    elif have adduser; then
+      addgroup -S adaemon >/dev/null 2>&1 || addgroup adaemon >/dev/null 2>&1 || true
+      adduser -S -D -H -h "$NODE_DIR" -s /sbin/nologin -G adaemon adaemon >/dev/null 2>&1 \
+        || adduser -D -H -h "$NODE_DIR" -s /sbin/nologin -G adaemon adaemon
+    else
+      die "Cannot create adaemon user: useradd/adduser not found."
+    fi
   fi
-  echo "---- perms ----" >> "${LOG_FILE}"
-  chown -R adaemon:adaemon "${NODE_DIR}" "${GO_DIR}" >> "${LOG_FILE}" 2>&1
-  chmod 0750 "${NODE_DIR}" "${GO_DIR}" >> "${LOG_FILE}" 2>&1
+  ensure_docker_group
+  chown -R adaemon:adaemon "$NODE_DIR" "$GO_DIR" 2>/dev/null || chown -R adaemon "$NODE_DIR" "$GO_DIR"
+  chmod 0750 "$NODE_DIR" "$GO_DIR"
+  chmod 0640 "$NODE_DIR/config.yml" 2>/dev/null || true
 }
 
-docker_enable() {
-  echo "---- systemctl enable docker ----" >> "${LOG_FILE}"
-  systemctl enable --now docker >> "${LOG_FILE}" 2>&1
-
-  if ! systemctl is-active --quiet docker; then
-    echo "---- docker status ----" >> "${LOG_FILE}"
-    systemctl status docker --no-pager -l >> "${LOG_FILE}" 2>&1 || true
-    echo "---- docker journal ----" >> "${LOG_FILE}"
-    journalctl -u docker -n 200 --no-pager >> "${LOG_FILE}" 2>&1 || true
-    return 1
-  fi
-
-  if ! getent group docker >/dev/null 2>&1; then
-    echo "---- groupadd docker ----" >> "${LOG_FILE}"
-    groupadd docker >> "${LOG_FILE}" 2>&1 || true
-  fi
-
-  if id adaemon >/dev/null 2>&1; then
-    echo "---- usermod docker group ----" >> "${LOG_FILE}"
-    usermod -aG docker adaemon >> "${LOG_FILE}" 2>&1 || true
-  fi
+build_binary() {
+  log "Building ADaemon..."
+  mkdir -p "$GO_DIR/gopath" "$GO_DIR/gocache" "$GO_DIR/gomodcache"
+  cd "$NODE_DIR"
+  export GOPATH="$GO_DIR/gopath"
+  export GOCACHE="$GO_DIR/gocache"
+  export GOMODCACHE="$GO_DIR/gomodcache"
+  go build -trimpath -buildvcs=false -ldflags "-s -w" -o "$GO_DIR/adnode" .
+  install -m 0755 -o root -g root "$GO_DIR/adnode" "$BIN_DST"
 }
 
-detect_build_target() {
-  if [[ -f "${NODE_DIR}/main.go" ]]; then echo "."; return; fi
-  if compgen -G "${NODE_DIR}/cmd/*/main.go" >/dev/null 2>&1; then
-    local f; f="$(ls -1 "${NODE_DIR}"/cmd/*/main.go 2>/dev/null | head -n1)"
-    echo "./$(dirname "${f#"${NODE_DIR}/"}")"
-    return
-  fi
-  local found
-  found="$(grep -Rsl --include='*.go' '^package main' "${NODE_DIR}" 2>/dev/null | head -n1 || true)"
-  if [[ -n "${found}" ]]; then
-    echo "./$(dirname "${found#"${NODE_DIR}/"}")"
-    return
-  fi
-  echo "."
-}
-
-build_binary_as_adaemon() {
-  local target; target="$(detect_build_target)"
-  mkdir -p "${GO_DIR}/gopath" "${GO_DIR}/gocache" "${GO_DIR}/gomodcache"
-  chown -R adaemon:adaemon "${GO_DIR}"
-
-  echo "---- go build target=${target} ----" >> "${LOG_FILE}"
-  runuser -u adaemon -- bash -lc "
-    set -eEu
-    set -o pipefail
-    export HOME='${NODE_DIR}'
-    export GOPATH='${GO_DIR}/gopath'
-    export GOCACHE='${GO_DIR}/gocache'
-    export GOMODCACHE='${GO_DIR}/gomodcache'
-    cd '${NODE_DIR}'
-    go build -trimpath -buildvcs=false -ldflags '-s -w' -o '${GO_DIR}/adnode' '${target}'
-  " </dev/null >> "${LOG_FILE}" 2>&1
-
-  echo "---- install binary ----" >> "${LOG_FILE}"
-  install -m 0755 -o root -g root "${GO_DIR}/adnode" "${BIN_DST}" >> "${LOG_FILE}" 2>&1
-}
-
-cleanup_legacy_unit() {
-  echo "---- remove legacy unit ${LEGACY_UNIT_NAME} ----" >> "${LOG_FILE}"
-  systemctl stop "${LEGACY_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
-  systemctl disable "${LEGACY_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
-  rm -f "${LEGACY_UNIT_PATH}" >> "${LOG_FILE}" 2>&1 || true
-}
-
-write_systemd_unit() {
-  cleanup_legacy_unit
-  echo "---- write systemd unit ----" >> "${LOG_FILE}"
-  cat > "${UNIT_PATH}" <<UNIT
+write_systemd_service() {
+  log "Writing systemd service..."
+  cat > "/etc/systemd/system/$SERVICE_NAME.service" <<'UNIT'
 [Unit]
 Description=ADaemon
 After=network-online.target docker.service
@@ -741,7 +645,6 @@ Group=adaemon
 SupplementaryGroups=docker
 WorkingDirectory=/var/lib/node
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
 ExecStart=/usr/local/bin/adnode
 Restart=on-failure
 RestartSec=2
@@ -750,7 +653,6 @@ TimeoutStopSec=30
 KillSignal=SIGTERM
 UMask=0027
 LimitNOFILE=1048576
-
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -763,271 +665,165 @@ LockPersonality=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 SystemCallArchitectures=native
-
 ReadWritePaths=/var/lib/node /var/lib/gonode /var/run/docker.sock
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-
-  echo "---- systemctl daemon-reload/enable ----" >> "${LOG_FILE}"
-  ln -sf "${UNIT_NAME}" "${ALIAS_UNIT_PATH}" >> "${LOG_FILE}" 2>&1
-  systemctl daemon-reload >> "${LOG_FILE}" 2>&1
-  systemctl enable "${UNIT_NAME}" >> "${LOG_FILE}" 2>&1
+  ln -sf "$SERVICE_NAME.service" "/etc/systemd/system/$ALIAS_SERVICE_NAME.service"
+  rm -f /etc/systemd/system/adpanel-daemon.service
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_NAME.service"
 }
 
-START_WARN=0
-start_and_verify() {
-  echo "---- systemctl restart ----" >> "${LOG_FILE}"
-  systemctl restart "${UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
+write_openrc_service() {
+  log "Writing OpenRC service..."
+  cat > /etc/init.d/adaemon <<'RC'
+#!/sbin/openrc-run
+name="ADaemon"
+description="ADPanel Daemon"
+command="/usr/local/bin/adnode"
+command_user="adaemon:adaemon"
+directory="/var/lib/node"
+pidfile="/run/adaemon.pid"
+command_background="yes"
+output_log="/var/log/adaemon.log"
+error_log="/var/log/adaemon.err"
 
-  if systemctl is-active --quiet "${UNIT_NAME}"; then
+depend() {
+  need net
+  after docker
+}
+RC
+  chmod +x /etc/init.d/adaemon
+  rc-update add adaemon default >/dev/null 2>&1 || true
+}
+
+write_sysv_service() {
+  log "Writing SysV service..."
+  cat > /etc/init.d/adaemon <<'INIT'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          adaemon
+# Required-Start:    $remote_fs $network docker
+# Required-Stop:     $remote_fs $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: ADPanel Daemon
+### END INIT INFO
+
+PIDFILE=/run/adaemon.pid
+DAEMON=/usr/local/bin/adnode
+WORKDIR=/var/lib/node
+USER=adaemon
+
+start_service() {
+  if command -v start-stop-daemon >/dev/null 2>&1; then
+    start-stop-daemon --start --background --make-pidfile --pidfile "$PIDFILE" --chuid "$USER" --chdir "$WORKDIR" --exec "$DAEMON"
+  else
+    su -s /bin/sh "$USER" -c "cd '$WORKDIR' && nohup '$DAEMON' >/var/log/adaemon.log 2>/var/log/adaemon.err & echo \$! > '$PIDFILE'"
+  fi
+}
+
+stop_service() {
+  if [ -f "$PIDFILE" ]; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null || true
+    rm -f "$PIDFILE"
+  fi
+}
+
+case "$1" in
+  start) start_service ;;
+  stop) stop_service ;;
+  restart) stop_service; sleep 1; start_service ;;
+  status) [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null ;;
+  *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+INIT
+  chmod +x /etc/init.d/adaemon
+  if have update-rc.d; then update-rc.d adaemon defaults >/dev/null 2>&1 || true; fi
+  if have chkconfig; then chkconfig --add adaemon >/dev/null 2>&1 || true; fi
+}
+
+write_service() {
+  if systemd_running; then
+    write_systemd_service
+  elif have rc-service && [ -d /etc/init.d ]; then
+    write_openrc_service
+  elif [ -d /etc/init.d ]; then
+    write_sysv_service
+  else
+    warn "No supported init system found; daemon can still be started manually with $BIN_DST"
+  fi
+}
+
+open_firewall_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+  if have ufw && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    ufw allow "$port/tcp" >/dev/null 2>&1 || true
+  fi
+}
+
+start_service() {
+  if [ ! -f "$NODE_DIR/config.yml" ]; then
+    warn "Skipping ADaemon start because /var/lib/node/config.yml is missing."
     return 0
   fi
-
-  echo "---- systemctl status ----" >> "${LOG_FILE}"
-  systemctl status "${UNIT_NAME}" --no-pager -l >> "${LOG_FILE}" 2>&1 || true
-  echo "---- journalctl ----" >> "${LOG_FILE}"
-  journalctl -u "${UNIT_NAME}" -n 200 --no-pager >> "${LOG_FILE}" 2>&1 || true
-
-  # If user asked to NOT auto-create config.yml, don’t hard-fail the installer on missing config.
-  if [[ ! -f "${NODE_DIR}/config.yml" ]]; then
-    START_WARN=1
-    return 0
+  log "Starting ADaemon..."
+  if systemd_running; then
+    systemctl restart "$SERVICE_NAME.service" || systemctl restart "$ALIAS_SERVICE_NAME.service"
+    systemctl is-active --quiet "$SERVICE_NAME.service" || systemctl is-active --quiet "$ALIAS_SERVICE_NAME.service"
+  elif have rc-service; then
+    rc-service adaemon restart || rc-service adaemon start
+  elif have service; then
+    service adaemon restart || service adaemon start
+  else
+    cd "$NODE_DIR"
+    nohup "$BIN_DST" >/var/log/adaemon.log 2>/var/log/adaemon.err &
   fi
-  return 1
 }
 
-stop_disable_service() {
-  echo "---- stop/disable service ----" >> "${LOG_FILE}"
-  systemctl stop "${UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
-  systemctl stop "${ALIAS_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
-  systemctl disable "${UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
-  systemctl disable "${ALIAS_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
-  systemctl stop "${LEGACY_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
-  systemctl disable "${LEGACY_UNIT_NAME}" >> "${LOG_FILE}" 2>&1 || true
-  systemctl daemon-reload >> "${LOG_FILE}" 2>&1 || true
+main() {
+  require_root
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  log "ADPanel node daemon installation started."
+  detect_platform
+  install_base_packages
+  install_docker
+  start_docker
+  install_go_toolchain
+  deploy_source
+  write_config
+  apply_docker_compat_patch
+  ensure_user
+  build_binary
+  ensure_user
+  write_service
+  open_firewall_port "$NODE_API_PORT"
+  open_firewall_port "$NODE_SFTP_PORT"
+  start_service
+  log "ADaemon installed successfully. Config: $NODE_DIR/config.yml"
 }
 
-remove_files_users() {
-  echo "---- remove unit/binary/dirs/user ----" >> "${LOG_FILE}"
-  rm -f "${UNIT_PATH}" >> "${LOG_FILE}" 2>&1 || true
-  rm -f "${ALIAS_UNIT_PATH}" >> "${LOG_FILE}" 2>&1 || true
-  rm -f "${LEGACY_UNIT_PATH}" >> "${LOG_FILE}" 2>&1 || true
-  rm -f "${BIN_DST}" >> "${LOG_FILE}" 2>&1 || true
-  rm -rf "${NODE_DIR}" "${GO_DIR}" >> "${LOG_FILE}" 2>&1 || true
-  userdel adaemon >> "${LOG_FILE}" 2>&1 || true
-  rm -rf "${STATE_DIR}" >> "${LOG_FILE}" 2>&1 || true
-  systemctl daemon-reload >> "${LOG_FILE}" 2>&1 || true
-}
+main "$@"
+ADPANEL_NODE_INSTALLER
 
-# ---------------- Main ----------------
-require_root
-require_systemd
-mkdir -p "$(dirname "${LOG_FILE}")"
-: > "${LOG_FILE}"
-
-ui_splash
-status_set "Ready."
-CURRENT_PCT=0
-bar_render 0 0
-
-INSTALL_CHOSEN=0
-UNINSTALL_CHOSEN=0
-
-if (( ASSUME_YES == 1 )); then
-  INSTALL_CHOSEN=1
-  UNINSTALL_CHOSEN=0
+chmod 700 "$tmp_script"
+set +e
+if [ "$(id -u)" -eq 0 ]; then
+  bash "$tmp_script"
 else
-  if (( TTY_OK == 0 )) && [[ ! -t 0 ]]; then
-    echo
-    echo "${C_RED}${C_BOLD}No interactive TTY available for questions.${C_RESET}"
-    echo "Re-run with:"
-    echo "  curl -fsSL 'https://bash.ad-panel.com/install.sh?nocache=$(date +%s)' | tr -d '\r' | sudo bash -s -- --yes"
-    exit 1
-  fi
-
-  # Q1 (always continue to Q2 no matter what)
-  if ask_yes_no_tty "1) Do you want to install the daemon?"; then
-    INSTALL_CHOSEN=1
-  else
-    INSTALL_CHOSEN=0
-  fi
-
-  # Q2
-  if ask_yes_no_tty "2) Do you want to uninstall the panel?"; then
-    UNINSTALL_CHOSEN=1
-  else
-    UNINSTALL_CHOSEN=0
-  fi
+  sudo -E bash "$tmp_script"
 fi
-
-prompt_clear
-status_set "Booting…"
-CURRENT_PCT=2
-bar_render 2 0
-
-# If both selected => refuse
-if (( INSTALL_CHOSEN == 1 && UNINSTALL_CHOSEN == 1 )); then
-  prompt_clear
-  status_set "Only one option can be selected at a time (install OR uninstall)."
-  ui_bye
-  exit 1
-fi
-
-# If none selected => exit
-if (( INSTALL_CHOSEN == 0 && UNINSTALL_CHOSEN == 0 )); then
-  ui_bye
-  exit 0
-fi
-
-if ! command -v apt-get >/dev/null 2>&1; then
-  echo "${C_RED}${C_BOLD}Unsupported system: only apt-based distros (Ubuntu/Debian) are supported.${C_RESET}"
-  exit 1
-fi
-
-# ---------------- UNINSTALL ----------------
-if (( UNINSTALL_CHOSEN == 1 )); then
-  load_state
-
-  run_stream_step 5  15 "Stopping daemon…"                   monitor_none stop_disable_service
-  run_stream_step 15 35 "Removing files and user…"           monitor_none remove_files_users
-
-  # Remove packages ONLY if installer marked them as installed by it.
-  if (( INST_GO == 1 )); then
-    run_stream_step 35 45 "Removing Go toolchain files…"        monitor_none remove_go_toolchain
-    apt_purge_progress 45 55 "Removing Go toolchain package…" golang-go
-  fi
-  if (( INST_DOCKER == 1 )); then
-    apt_purge_progress 55 78 "Removing Docker (docker.io)…" docker.io
-  fi
-  if (( INST_GIT == 1 )); then
-    apt_purge_progress 78 90 "Removing Git (git)…" git
-  fi
-
-  run_stream_step 90 96 "Cleaning up (autoremove)…"          monitor_none apt-get -y -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300 autoremove
-  run_stream_step 96 100 "Finishing…"                         monitor_none true
-
-  prompt_clear
-  status_set "✓ Uninstall complete."
-  CURRENT_PCT=100
-  bar_render 100 0
-
-  if (( UI )); then
-    box_row=$((ROW_STATUS+2))
-    center_at_plain "$box_row"       "┌──────────────────────────────────────────────┐" "${C_DIM}" "${C_RESET}"
-    center_at_plain "$((box_row+1))" "│  ADaemon has been removed.                   │" "${C_WHITE}" "${C_RESET}"
-    center_at_plain "$((box_row+2))" "│  Service, binary, user, and directories gone.│" "${C_WHITE}" "${C_RESET}"
-    center_at_plain "$((box_row+3))" "└──────────────────────────────────────────────┘" "${C_DIM}" "${C_RESET}"
-    cup "$((box_row+5))" 1
-  fi
-
-  exit 0
-fi
-
-# ---------------- INSTALL ----------------
-# Track what THIS install actually installs (for future uninstall).
-INST_GIT=0
-INST_DOCKER=0
-INST_GO=0
-
-prompt_clear
-status_set "Preparing…"
-CURRENT_PCT=3
-bar_render 3 0
-
-apt_update_progress
-
-run_stream_step 14 18 "Preparing directories…"              monitor_none ensure_dirs
-
-# Core deps (don’t purge these on uninstall)
-# Install only if missing: ca-certificates curl sed grep util-linux
-missing_core=()
-for p in ca-certificates curl sed grep util-linux; do
-  pkg_installed "$p" || missing_core+=("$p")
-done
-if (( ${#missing_core[@]} > 0 )); then
-  apt_install_progress 18 30 "Installing core dependencies…" "${missing_core[@]}"
-else
-  run_stream_step 18 30 "Core dependencies already present…" monitor_none true
-fi
-
-# Git
-if ! command -v git >/dev/null 2>&1; then
-  pkg_installed git || INST_GIT=1
-  apt_install_progress 30 38 "Installing Git…" git
-else
-  run_stream_step 30 38 "Git already installed…" monitor_none true
-fi
-
-# Source
-run_stream_step 38 50 "Deploying daemon source…"            monitor_none git_clone_or_update
-
-# User must exist before docker group ops
-run_stream_step 50 56 "Creating restricted user (adaemon)…" monitor_none ensure_user
-
-# Docker
-if ! command -v docker >/dev/null 2>&1; then
-  pkg_installed docker.io || INST_DOCKER=1
-  apt_install_progress 56 72 "Installing Docker (docker.io)…" docker.io
-else
-  run_stream_step 56 72 "Docker already installed…" monitor_none true
-fi
-run_stream_step 72 78 "Enabling Docker service…"            monitor_none docker_enable
-
-# Go
-if ! go_version_satisfies; then
-  INST_GO=1
-  run_stream_step 78 88 "Installing Go toolchain (Go ${GO_VERSION})…" monitor_none install_go_toolchain
-else
-  run_stream_step 78 88 "Go already installed…" monitor_none true
-fi
-
-# Build + service
-run_stream_step 88 95 "Building & installing daemon…"       monitor_none build_binary_as_adaemon
-run_stream_step 95 98 "Creating systemd service…"           monitor_none write_systemd_unit
-run_stream_step 98 100 "Starting daemon (best-effort)…"     monitor_none start_and_verify
-
-save_state
-
-prompt_clear
-if (( START_WARN == 1 )); then
-  status_set "✓ Install complete (daemon NOT started: missing config.yml)."
-else
-  status_set "✓ Install complete."
-fi
-CURRENT_PCT=100
-bar_render 100 0
-
-if (( UI )); then
-  box_row=$((ROW_STATUS+2))
-  center_at_plain "$box_row"       "┌──────────────────────────────────────────────┐" "${C_DIM}" "${C_RESET}"
-  center_at_plain "$((box_row+1))" "│  Service control (systemd)                   │" "${C_WHITE}" "${C_RESET}"
-  center_at_plain "$((box_row+2))" "├──────────────────────────────────────────────┤" "${C_DIM}" "${C_RESET}"
-  center_at_plain "$((box_row+3))" "│  Start:    systemctl start ADaemon           │" "${C_WHITE}" "${C_RESET}"
-  center_at_plain "$((box_row+4))" "│  Stop:     systemctl stop ADaemon            │" "${C_WHITE}" "${C_RESET}"
-  center_at_plain "$((box_row+5))" "│  Restart:  systemctl restart ADaemon         │" "${C_WHITE}" "${C_RESET}"
-  center_at_plain "$((box_row+6))" "│  Status:   systemctl status ADaemon          │" "${C_WHITE}" "${C_RESET}"
-  center_at_plain "$((box_row+7))" "└──────────────────────────────────────────────┘" "${C_DIM}" "${C_RESET}"
-
-  if (( START_WARN == 1 )); then
-    center_at_plain "$((box_row+9))" "Create /var/lib/node/config.yml then start the service." "${C_YELLOW}${C_BOLD}" "${C_RESET}"
-  else
-    center_at_plain "$((box_row+9))" "Tip: config at /var/lib/node/config.yml" "${C_DIM}" "${C_RESET}"
-  fi
-
-  cup "$((box_row+11))" 1
-else
-  echo
-  echo "Service control:"
-  echo "  Start: systemctl start ADaemon"
-  echo "  Stop: systemctl stop ADaemon"
-  echo "  Restart: systemctl restart ADaemon"
-  echo "  Alias: systemctl restart adaemon"
-  echo "  Status: systemctl status ADaemon"
-  echo
-  echo "Config: /var/lib/node/config.yml"
-  if (( START_WARN == 1 )); then
-    echo "NOTE: daemon not started because config.yml is missing."
-  fi
-fi
+rc=$?
+set -e
+rm -f "$tmp_script"
+exit "$rc"
