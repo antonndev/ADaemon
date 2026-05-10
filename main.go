@@ -6193,7 +6193,42 @@ func startupTemplateFromDockerConfig(cfg *dockerTemplateConfig) string {
 	if startup := strings.TrimSpace(cfg.ADPanelStartup); startup != "" {
 		return startup
 	}
-	return strings.TrimSpace(cfg.LegacyStartup)
+	if startup := strings.TrimSpace(cfg.ADPanelStartupSnake); startup != "" {
+		return startup
+	}
+	if startup := strings.TrimSpace(cfg.LegacyStartup); startup != "" {
+		return startup
+	}
+	return strings.TrimSpace(cfg.LegacyStartupSnake)
+}
+
+func startupDisplayFromDockerConfig(cfg *dockerTemplateConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	for _, value := range []string{
+		cfg.StartupDisplay,
+		cfg.StartupDisplaySnake,
+		cfg.StartupPreview,
+		cfg.StartupPreviewSnake,
+		cfg.ImageDefaultStartup,
+		cfg.ImageDefaultStartupSnake,
+	} {
+		if display := strings.TrimSpace(value); display != "" {
+			return display
+		}
+	}
+	return ""
+}
+
+func javaVersionFromDockerConfig(cfg *dockerTemplateConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	if version := strings.TrimSpace(cfg.JavaVersion); version != "" {
+		return version
+	}
+	return strings.TrimSpace(cfg.Java)
 }
 
 func freeDiskMb(path string) int64 {
@@ -10323,23 +10358,33 @@ type resourceLimits struct {
 }
 
 type dockerTemplateConfig struct {
-	Image          string                 `json:"image"`
-	Tag            string                 `json:"tag"`
-	Command        string                 `json:"command"`
-	ADPanelStartup string                 `json:"adpanelStartup"`
-	LegacyStartup  string                 `json:"pterodactylStartup"`
-	Ports          []int                  `json:"ports"`
-	PortProtocols  map[string][]string    `json:"portProtocols"`
-	Volumes        []string               `json:"volumes"`
-	Workdir        string                 `json:"workdir"`
-	WorkingDir     string                 `json:"workingDir"`
-	Env            map[string]string      `json:"env"`
-	Restart        string                 `json:"restart"`
-	RestartPolicy  string                 `json:"restartPolicy"`
-	StartupCommand string                 `json:"startupCommand"`
-	Install        *templateInstallConfig `json:"install"`
-	Installation   *templateInstallConfig `json:"installation"`
-	Console        any                    `json:"console"`
+	Image                    string                 `json:"image"`
+	Tag                      string                 `json:"tag"`
+	Command                  string                 `json:"command"`
+	ADPanelStartup           string                 `json:"adpanelStartup"`
+	ADPanelStartupSnake      string                 `json:"adpanel_startup"`
+	LegacyStartup            string                 `json:"pterodactylStartup"`
+	LegacyStartupSnake       string                 `json:"pterodactyl_startup"`
+	StartupDisplay           string                 `json:"startupDisplay"`
+	StartupDisplaySnake      string                 `json:"startup_display"`
+	StartupPreview           string                 `json:"startupPreview"`
+	StartupPreviewSnake      string                 `json:"startup_preview"`
+	ImageDefaultStartup      string                 `json:"imageDefaultStartup"`
+	ImageDefaultStartupSnake string                 `json:"image_default_startup"`
+	JavaVersion              string                 `json:"javaVersion"`
+	Java                     string                 `json:"java"`
+	Ports                    []int                  `json:"ports"`
+	PortProtocols            map[string][]string    `json:"portProtocols"`
+	Volumes                  []string               `json:"volumes"`
+	Workdir                  string                 `json:"workdir"`
+	WorkingDir               string                 `json:"workingDir"`
+	Env                      map[string]string      `json:"env"`
+	Restart                  string                 `json:"restart"`
+	RestartPolicy            string                 `json:"restartPolicy"`
+	StartupCommand           string                 `json:"startupCommand"`
+	Install                  *templateInstallConfig `json:"install"`
+	Installation             *templateInstallConfig `json:"installation"`
+	Console                  any                    `json:"console"`
 }
 
 type templateInstallConfig struct {
@@ -10620,8 +10665,12 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 		mcTag := defaultMinecraftProcessTag
 		mcCommand := defaultMinecraftProcessCommand
 		mcWorkdir := "/data"
-		mcJavaVersion := normalizeMinecraftJavaVersion(req.JavaVersion)
-		if strings.TrimSpace(req.JavaVersion) != "" && mcJavaVersion == "" {
+		rawJavaVersion := strings.TrimSpace(req.JavaVersion)
+		if rawJavaVersion == "" && req.Docker != nil {
+			rawJavaVersion = javaVersionFromDockerConfig(req.Docker)
+		}
+		mcJavaVersion := normalizeMinecraftJavaVersion(rawJavaVersion)
+		if strings.TrimSpace(rawJavaVersion) != "" && mcJavaVersion == "" {
 			jsonWrite(w, 400, map[string]any{"error": "unsupported minecraft java version"})
 			return
 		}
@@ -10679,6 +10728,11 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(resourcesMeta) > 0 {
 			meta["resources"] = resourcesMeta
+		}
+		if startupDisplay := startupDisplayFromDockerConfig(req.Docker); startupDisplay != "" {
+			if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
+				runtimeObj["startupDisplay"] = startupDisplay
+			}
 		}
 		if req.AsyncSetup {
 			meta["setupStatus"] = "queued"
@@ -10775,6 +10829,9 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 			if startup := startupTemplateFromDockerConfig(req.Docker); startup != "" {
 				runtimeConfig["adpanelStartup"] = startup
 				delete(runtimeConfig, "command")
+			}
+			if startupDisplay := startupDisplayFromDockerConfig(req.Docker); startupDisplay != "" {
+				runtimeConfig["startupDisplay"] = startupDisplay
 			}
 			if install := dockerTemplateInstall(req.Docker); install != nil {
 				runtimeConfig["install"] = install
@@ -13973,7 +14030,11 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 	}
 
 	runtimeConfig := map[string]any{}
-	if cleanJavaVersion := normalizeMinecraftJavaVersion(req.JavaVersion); strings.TrimSpace(req.JavaVersion) != "" {
+	rawJavaVersion := strings.TrimSpace(req.JavaVersion)
+	if rawJavaVersion == "" && req.Docker != nil {
+		rawJavaVersion = javaVersionFromDockerConfig(req.Docker)
+	}
+	if cleanJavaVersion := normalizeMinecraftJavaVersion(rawJavaVersion); strings.TrimSpace(rawJavaVersion) != "" {
 		if cleanJavaVersion == "" {
 			jsonWrite(w, 400, map[string]any{"ok": false, "error": "unsupported minecraft java version"})
 			return
@@ -14016,6 +14077,9 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 		if startup := startupTemplateFromDockerConfig(req.Docker); startup != "" {
 			runtimeConfig["adpanelStartup"] = startup
 			delete(runtimeConfig, "command")
+		}
+		if startupDisplay := startupDisplayFromDockerConfig(req.Docker); startupDisplay != "" {
+			runtimeConfig["startupDisplay"] = startupDisplay
 		}
 		if install := dockerTemplateInstall(req.Docker); install != nil {
 			runtimeConfig["install"] = install
