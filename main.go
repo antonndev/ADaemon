@@ -9,46 +9,74 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/hmac"
-	"nhooyr.io/websocket"
-	"nhooyr.io/websocket/wsjson"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"nhooyr.io/websocket"
+	"nhooyr.io/websocket/wsjson"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/ulikunitz/xz"
 )
 
-
 const (
-	NodeVersion       = "1.2.1"
+	NodeVersion       = "1.2.2"
 	DefaultConfigPath = "/var/lib/node/config.yml"
 	DefaultDataRoot   = "/var/lib/node"
 	DefaultAPIHost    = "0.0.0.0"
 	DefaultAPIPort    = 8080
 	DefaultSFTPPort   = 2022
+	NodeInfoFileName  = "node-information.json"
+	NodeUpdateMaxBody = 20 * 1024 * 1024
 )
 
 type Config struct {
 	Raw map[string]any
+}
+
+type NodeInformation struct {
+	NodeVersion      string `json:"node-version"`
+	NodeArchitecture string `json:"node-architecture"`
+	NodeAutoUpdate   bool   `json:"node-auto-update"`
+	UpdatedAt        string `json:"updated-at,omitempty"`
+}
+
+type nodeUpdateFilePayload struct {
+	Path          string `json:"path"`
+	ContentBase64 string `json:"contentBase64"`
+}
+
+type nodeUpdateInstallRequest struct {
+	Version string                  `json:"version"`
+	Files   []nodeUpdateFilePayload `json:"files"`
+}
+
+type nodeUpdateAutoRequest struct {
+	Enabled bool `json:"enabled"`
 }
 
 func (c Config) Bool(path ...string) bool {
@@ -148,7 +176,6 @@ func parseYAMLSubset(src string) (map[string]any, error) {
 	return root, nil
 }
 
-
 func mustReadFile(p string) []byte {
 	b, err := os.ReadFile(p)
 	if err != nil {
@@ -180,6 +207,44 @@ func anyToInt(v any) int {
 	}
 }
 
+func anyToInt64(v any) int64 {
+	switch x := v.(type) {
+	case int:
+		return int64(x)
+	case int64:
+		return x
+	case int32:
+		return int64(x)
+	case float64:
+		return int64(x)
+	case float32:
+		return int64(x)
+	case string:
+		n, _ := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
+		return n
+	default:
+		return 0
+	}
+}
+
+func anyToFloat64(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case float32:
+		return float64(x)
+	case int:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case string:
+		n, _ := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		return n
+	default:
+		return 0
+	}
+}
+
 func openWriteNoFollow(path string, perm os.FileMode) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, perm)
 	if err != nil {
@@ -202,6 +267,80 @@ func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
 		return werr
 	}
 	return cerr
+}
+
+func normalizeNodeVersionTag(version string) string {
+	clean := strings.TrimSpace(version)
+	if clean == "" {
+		return "v" + NodeVersion
+	}
+	if strings.HasPrefix(strings.ToLower(clean), "v") {
+		return "v" + strings.TrimPrefix(strings.TrimPrefix(clean, "v"), "V")
+	}
+	return "v" + clean
+}
+
+func validNodeUpdateVersion(version string) bool {
+	return regexp.MustCompile(`^v?\d+\.\d+\.\d+([\-+][A-Za-z0-9_.-]+)?$`).MatchString(strings.TrimSpace(version))
+}
+
+func allowedNodeUpdateFile(rel string) bool {
+	raw := strings.TrimSpace(rel)
+	if strings.Contains(raw, "/") || strings.Contains(raw, "\\") {
+		return false
+	}
+	clean := filepath.Clean(raw)
+	if clean == "." || clean == "" || strings.Contains(clean, "/") || strings.Contains(clean, string(filepath.Separator)) {
+		return false
+	}
+	if clean == "go.mod" || clean == "go.sum" {
+		return true
+	}
+	return regexp.MustCompile(`^[A-Za-z0-9_.-]+\.go$`).MatchString(clean)
+}
+
+func validateNodeUpdateFileContent(rel string, data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("%s is empty", rel)
+	}
+	if len(data) > 8*1024*1024 {
+		return fmt.Errorf("%s is too large", rel)
+	}
+	if strings.HasSuffix(rel, ".go") && !bytes.HasPrefix(bytes.TrimSpace(data), []byte("package main")) {
+		return fmt.Errorf("%s is not a package main Go file", rel)
+	}
+	if rel == "go.mod" && !bytes.HasPrefix(bytes.TrimSpace(data), []byte("module ")) {
+		return fmt.Errorf("go.mod is invalid")
+	}
+	return nil
+}
+
+func copyRegularFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	st, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return nil
+	}
+	if err := ensureDir(filepath.Dir(dst)); err != nil {
+		return err
+	}
+	out, err := openWriteNoFollow(dst, st.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 func sanitizeName(raw string) string {
@@ -231,6 +370,94 @@ func isValidContainerName(name string) bool {
 		}
 	}
 	return true
+}
+
+func isDockerNativeContainerName(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	if len(name) < 2 {
+		return false
+	}
+	if !((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= '0' && name[0] <= '9')) {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func dockerContainerName(name string) string {
+	clean := strings.TrimSpace(name)
+	if isDockerNativeContainerName(clean) {
+		return clean
+	}
+	safe := sanitizeName(clean)
+	if safe == "" {
+		return clean
+	}
+	sum := sha256.Sum256([]byte(clean))
+	hash := hex.EncodeToString(sum[:])[:12]
+	if len(safe) > 64 {
+		safe = safe[:64]
+	}
+	return "adpanel-" + hash + "-" + safe
+}
+
+func dockerContainerSpecName(spec string) string {
+	if left, right, ok := strings.Cut(spec, ":"); ok && left != "" && !strings.Contains(left, "/") {
+		return dockerContainerName(left) + ":" + right
+	}
+	return spec
+}
+
+func rewriteDockerCLIArgs(args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	out := append([]string(nil), args...)
+	rewriteLast := func() {
+		if len(out) > 1 {
+			out[len(out)-1] = dockerContainerName(out[len(out)-1])
+		}
+	}
+
+	switch out[0] {
+	case "logs", "diff", "stop", "kill", "restart", "stats", "update":
+		rewriteLast()
+	case "inspect":
+		rewriteLast()
+	case "rm":
+		for i := 1; i < len(out); i++ {
+			if strings.HasPrefix(out[i], "-") {
+				continue
+			}
+			out[i] = dockerContainerName(out[i])
+		}
+	case "exec":
+		for i := 1; i < len(out); i++ {
+			if strings.HasPrefix(out[i], "-") {
+				continue
+			}
+			out[i] = dockerContainerName(out[i])
+			break
+		}
+	case "cp":
+		for i := 1; i < len(out); i++ {
+			out[i] = dockerContainerSpecName(out[i])
+		}
+	case "run":
+		for i := 1; i < len(out)-1; i++ {
+			if out[i] == "--name" {
+				out[i+1] = dockerContainerName(out[i+1])
+				i++
+			}
+		}
+	}
+	return out
 }
 
 func safeJoin(base, rel string) (string, bool) {
@@ -332,12 +559,12 @@ func readJSON(w http.ResponseWriter, r *http.Request, limitBytes int64, dst any)
 	return dec.Decode(dst)
 }
 
-
 type Docker struct {
 	debug bool
 }
 
 func (d Docker) runCollect(ctx context.Context, args ...string) (string, string, int, error) {
+	args = rewriteDockerCLIArgs(args)
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
@@ -361,6 +588,14 @@ func (d Docker) containerExists(ctx context.Context, name string) bool {
 	return err == nil
 }
 
+func (d Docker) containerState(ctx context.Context, name string) string {
+	out, _, _, err := d.runCollect(ctx, "inspect", "-f", "{{.State.Status}}", name)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(out))
+}
+
 func (d Docker) rmForce(ctx context.Context, name string) {
 	_, _, _, _ = d.runCollect(ctx, "rm", "-f", name)
 }
@@ -375,22 +610,28 @@ func (d Docker) imageExistsLocally(ctx context.Context, ref string) bool {
 }
 
 type imageConfig struct {
-	Volumes []string
-	Workdir string
-	User    string
-	Env     map[string]string
+	Volumes    []string
+	Workdir    string
+	User       string
+	Env        map[string]string
+	Entrypoint []string
+	Cmd        []string
 }
 
 func (d Docker) inspectImageConfig(ctx context.Context, ref string) imageConfig {
+	if apiCfg, err := d.inspectImageConfigAPI(ctx, ref); err == nil {
+		return apiCfg
+	}
+
 	cfg := imageConfig{Env: map[string]string{}}
 
 	out, _, code, err := d.runCollect(ctx, "inspect", "--format",
-		`{{json .Config.Volumes}}||{{.Config.WorkingDir}}||{{.Config.User}}||{{json .Config.Env}}`, ref)
+		`{{json .Config.Volumes}}||{{.Config.WorkingDir}}||{{.Config.User}}||{{json .Config.Env}}||{{json .Config.Entrypoint}}||{{json .Config.Cmd}}`, ref)
 	if err != nil || code != 0 {
 		return cfg
 	}
 
-	parts := strings.SplitN(strings.TrimSpace(out), "||", 4)
+	parts := strings.SplitN(strings.TrimSpace(out), "||", 6)
 	if len(parts) < 3 {
 		return cfg
 	}
@@ -425,7 +666,148 @@ func (d Docker) inspectImageConfig(ctx context.Context, ref string) imageConfig 
 		}
 	}
 
+	if len(parts) >= 5 {
+		cfg.Entrypoint = parseImageConfigStringList(parts[4])
+	}
+
+	if len(parts) >= 6 {
+		cfg.Cmd = parseImageConfigStringList(parts[5])
+	}
+
 	return cfg
+}
+
+func parseImageConfigStringList(raw string) []string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal([]byte(trimmed), &list); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		clean := strings.TrimSpace(item)
+		if clean != "" {
+			out = append(out, clean)
+		}
+	}
+	return out
+}
+
+func runtimeArgNeedsQuoting(arg string) bool {
+	if arg == "" {
+		return true
+	}
+	for _, r := range arg {
+		switch r {
+		case ' ', '\t', '\n', '\r', '"', '\\':
+			return true
+		}
+	}
+	return false
+}
+
+func quoteRuntimeArg(arg string) string {
+	if !runtimeArgNeedsQuoting(arg) {
+		return arg
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range arg {
+		if r == '"' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+func runtimeCommandFromArgs(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	encoded := make([]string, 0, len(args))
+	for _, arg := range args {
+		clean := strings.TrimSpace(arg)
+		if clean == "" {
+			continue
+		}
+		encoded = append(encoded, quoteRuntimeArg(clean))
+	}
+	return strings.TrimSpace(strings.Join(encoded, " "))
+}
+
+func trimRuntimeProcessArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		clean := strings.TrimSpace(arg)
+		if clean != "" {
+			out = append(out, clean)
+		}
+	}
+	return out
+}
+
+func isRuntimeShellName(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "sh", "bash", "ash", "dash", "zsh", "ksh":
+		return true
+	default:
+		return false
+	}
+}
+
+func shellEntrypointInfo(entrypoint []string) (bool, int) {
+	if len(entrypoint) < 2 {
+		return false, 0
+	}
+
+	execIndex := 0
+	flagIndex := 1
+	cmdIndex := 2
+	execName := strings.ToLower(strings.TrimSpace(filepath.Base(entrypoint[execIndex])))
+
+	if execName == "env" && len(entrypoint) >= 3 {
+		execIndex = 1
+		flagIndex = 2
+		cmdIndex = 3
+		execName = strings.ToLower(strings.TrimSpace(filepath.Base(entrypoint[execIndex])))
+	}
+
+	if !isRuntimeShellName(execName) || len(entrypoint) <= flagIndex {
+		return false, 0
+	}
+
+	flags := strings.TrimSpace(entrypoint[flagIndex])
+	if !strings.HasPrefix(flags, "-") || !strings.Contains(flags, "c") {
+		return false, 0
+	}
+
+	return true, cmdIndex
+}
+
+func runtimeCommandFromImageConfig(cfg imageConfig) string {
+	entrypoint := trimRuntimeProcessArgs(cfg.Entrypoint)
+	cmd := trimRuntimeProcessArgs(cfg.Cmd)
+
+	if isShell, cmdIndex := shellEntrypointInfo(entrypoint); isShell {
+		if len(cmd) > 0 {
+			// Docker treats Cmd as a single shell command string when Entrypoint is a shell wrapper.
+			return strings.TrimSpace(strings.Join(cmd, " "))
+		}
+		if len(entrypoint) > cmdIndex {
+			return strings.TrimSpace(strings.Join(entrypoint[cmdIndex:], " "))
+		}
+		return ""
+	}
+
+	args := make([]string, 0, len(entrypoint)+len(cmd))
+	args = append(args, entrypoint...)
+	args = append(args, cmd...)
+	return runtimeCommandFromArgs(args)
 }
 
 func getDataPathsFromEnv(env map[string]string) []string {
@@ -457,18 +839,21 @@ func ensureVolumeWritable(serverDir string) {
 	if err := os.Chmod(serverDir, 0777); err != nil {
 		fmt.Printf("[volumes] warning: chmod 0777 %s failed: %v\n", serverDir, err)
 	}
-	entries, err := os.ReadDir(serverDir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		child := filepath.Join(serverDir, e.Name())
-		if e.IsDir() {
-			_ = os.Chmod(child, 0777)
-		} else {
-			_ = os.Chmod(child, 0666)
+	_ = filepath.Walk(serverDir, func(child string, info os.FileInfo, err error) error {
+		if err != nil || child == serverDir || info == nil {
+			return nil
 		}
-	}
+		if info.IsDir() {
+			_ = os.Chmod(child, 0777)
+			return nil
+		}
+		mode := os.FileMode(0666)
+		if info.Mode().Perm()&0111 != 0 {
+			mode = 0777
+		}
+		_ = os.Chmod(child, mode)
+		return nil
+	})
 }
 
 func (a *Agent) recoverMisplacedFiles(name, serverDir string) {
@@ -667,6 +1052,19 @@ func (d Docker) updateRestartNo(ctx context.Context, name string) {
 	_, _, _, _ = d.runCollect(ctx, "update", "--restart=no", name)
 }
 
+func (d Docker) updateRestartPolicy(ctx context.Context, name, policy string) {
+	clean := strings.ToLower(strings.TrimSpace(policy))
+	switch clean {
+	case "", "no", "always", "unless-stopped", "on-failure":
+	default:
+		clean = "unless-stopped"
+	}
+	if clean == "" {
+		clean = "no"
+	}
+	_, _, _, _ = d.runCollect(ctx, "update", "--restart="+clean, name)
+}
+
 func (d Docker) getImageDigest(ctx context.Context, imageRef string) string {
 	out, _, code, err := d.runCollect(ctx, "inspect", "--format", "{{.Id}}", imageRef)
 	if err != nil || code != 0 {
@@ -759,10 +1157,105 @@ func (a *Agent) syncNewFilesToServer(ctx context.Context, imageRef, serverDir st
 	return err
 }
 
+func serverDirVisibleFileCount(serverDir string) int {
+	entries, err := os.ReadDir(serverDir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == ".adpanel" || name == ".adpanel_meta" || name == "adpanel.json" || strings.HasPrefix(name, ".adpanel_") {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func appendUniqueContainerPath(paths []string, seen map[string]struct{}, raw string) []string {
+	clean := path.Clean(strings.TrimSpace(raw))
+	if clean == "" || clean == "." || clean == "/" || !strings.HasPrefix(clean, "/") {
+		return paths
+	}
+	if _, ok := seen[clean]; ok {
+		return paths
+	}
+	seen[clean] = struct{}{}
+	return append(paths, clean)
+}
+
+func commandReferencedContainerPaths(command, workdir, dataDir string) []string {
+	args := parseShellArgs(command)
+	if len(args) == 0 {
+		return nil
+	}
+	paths := []string{}
+	seen := map[string]struct{}{}
+	for _, arg := range args[1:] {
+		token := strings.TrimSpace(arg)
+		if token == "" || strings.HasPrefix(token, "-") {
+			continue
+		}
+		lower := strings.ToLower(token)
+		if strings.HasPrefix(token, "/") {
+			paths = appendUniqueContainerPath(paths, seen, path.Dir(token))
+			continue
+		}
+		if strings.Contains(token, "/") || strings.HasSuffix(lower, ".sh") || strings.HasSuffix(lower, ".py") || strings.HasSuffix(lower, ".js") {
+			base := strings.TrimSpace(workdir)
+			if base == "" {
+				base = dataDir
+			}
+			if base != "" {
+				paths = appendUniqueContainerPath(paths, seen, path.Dir(path.Join(base, token)))
+			}
+		}
+	}
+	return paths
+}
+
+func (a *Agent) prepareServerDirFromImage(ctx context.Context, imageRef, serverDir string, imgCfg imageConfig, paths []string) string {
+	if serverDirVisibleFileCount(serverDir) > 0 {
+		return ""
+	}
+
+	seen := map[string]struct{}{}
+	candidates := []string{}
+	for _, p := range paths {
+		candidates = appendUniqueContainerPath(candidates, seen, p)
+	}
+	for _, p := range imgCfg.Volumes {
+		candidates = appendUniqueContainerPath(candidates, seen, p)
+	}
+	for _, p := range getDataPathsFromEnv(imgCfg.Env) {
+		candidates = appendUniqueContainerPath(candidates, seen, p)
+	}
+	candidates = appendUniqueContainerPath(candidates, seen, imgCfg.Workdir)
+	for _, p := range []string{"/app", "/data", "/config", "/srv", "/opt"} {
+		candidates = appendUniqueContainerPath(candidates, seen, p)
+	}
+
+	for _, p := range candidates {
+		extractCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		err := a.docker.extractImageFiles(extractCtx, imageRef, serverDir, p)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if serverDirVisibleFileCount(serverDir) > 0 {
+			_ = sanitizeExtractedTree(serverDir)
+			ensureVolumeWritable(serverDir)
+			fmt.Printf("[docker] prepared server directory from image %s:%s\n", imageRef, p)
+			return p
+		}
+	}
+	return ""
+}
+
 func (d Docker) stop(ctx context.Context, name string) {
 	_, _, _, _ = d.runCollect(ctx, "stop", "-t", "15", name)
 }
-
 
 const (
 	stdinMaxContainers = 100
@@ -770,7 +1263,18 @@ const (
 	stdinWriteTimeout  = 5 * time.Second
 	stdinCommandMaxLen = 4096
 	stdinBufferSize    = 256
+
+	consoleCommandDuplicateWindow  = 1200 * time.Millisecond
+	consoleCommandRequestIDWindow  = 30 * time.Second
+	consoleCommandRequestIDMaxLen  = 128
+	consoleCommandRecentMaxServers = 1000
 )
+
+type recentConsoleCommand struct {
+	command   string
+	requestID string
+	at        time.Time
+}
 
 type stdinConn struct {
 	name     string
@@ -955,7 +1459,7 @@ func (sm *stdinManager) stop() {
 }
 
 func (sm *stdinManager) getOrCreate(ctx context.Context, containerName string) (*stdinConn, error) {
-	name := strings.TrimSpace(containerName)
+	name := dockerContainerName(containerName)
 	if name == "" {
 		return nil, fmt.Errorf("empty container name")
 	}
@@ -1007,7 +1511,7 @@ func (sm *stdinManager) getOrCreate(ctx context.Context, containerName string) (
 }
 
 func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdinConn, error) {
-	cmd := exec.Command("docker", "attach", "--no-stdout", "--no-stderr", "--sig-proxy=false", name)
+	cmd := exec.Command("script", "-qfc", fmt.Sprintf("docker attach --sig-proxy=false %s", name), "/dev/null")
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -1106,6 +1610,7 @@ func (c *stdinConn) sendCommand(cmd string) error {
 }
 
 func (sm *stdinManager) remove(name string) {
+	name = dockerContainerName(name)
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	if conn, ok := sm.conns[name]; ok {
@@ -1114,9 +1619,80 @@ func (sm *stdinManager) remove(name string) {
 	}
 }
 
+func exitCodeFromErr(err error) int {
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
+func (d Docker) writeToContainerProcessStdin(ctx context.Context, containerName, command string) error {
+	name := dockerContainerName(containerName)
+	cmd := strings.TrimSpace(command)
+	if name == "" || cmd == "" {
+		return fmt.Errorf("missing-params")
+	}
+	shells := []string{"sh", "/bin/sh", "bash", "/bin/bash"}
+	for idx, shellPath := range shells {
+		pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, shellPath, "-lc", "cat > /proc/1/fd/0")
+		pipeCmd.Stdin = strings.NewReader(cmd + "\r")
+		pipeCmd.Stdout = io.Discard
+		var stderr bytes.Buffer
+		pipeCmd.Stderr = &stderr
+		if err := pipeCmd.Run(); err == nil {
+			return nil
+		} else {
+			exitCode := exitCodeFromErr(err)
+			if isMissingExecShell(stderr.String(), shellPath, exitCode) && idx < len(shells)-1 {
+				continue
+			}
+			detail := strings.TrimSpace(stderr.String())
+			if detail == "" {
+				detail = err.Error()
+			}
+			return fmt.Errorf("process stdin write failed: %s", detail)
+		}
+	}
+	return fmt.Errorf("process stdin write failed: no supported shell found in container")
+}
+
+func (d Docker) writeToMinecraftProcessStdin(ctx context.Context, containerName, command string) error {
+	name := dockerContainerName(containerName)
+	cmd := strings.TrimSpace(command)
+	if name == "" || cmd == "" {
+		return fmt.Errorf("missing-params")
+	}
+	script := "pid=$(pgrep -n java || pgrep -n bedrock_server || echo 1); cat > /proc/$pid/fd/0"
+	shells := []string{"sh", "/bin/sh", "bash", "/bin/bash"}
+	for idx, shellPath := range shells {
+		pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, shellPath, "-lc", script)
+		pipeCmd.Stdin = strings.NewReader(cmd + "\r")
+		pipeCmd.Stdout = io.Discard
+		var stderr bytes.Buffer
+		pipeCmd.Stderr = &stderr
+		if err := pipeCmd.Run(); err == nil {
+			return nil
+		} else {
+			exitCode := exitCodeFromErr(err)
+			if isMissingExecShell(stderr.String(), shellPath, exitCode) && idx < len(shells)-1 {
+				continue
+			}
+			detail := strings.TrimSpace(stderr.String())
+			if detail == "" {
+				detail = err.Error()
+			}
+			return fmt.Errorf("minecraft stdin write failed: %s", detail)
+		}
+	}
+	return fmt.Errorf("minecraft stdin write failed: no supported shell found in container")
+}
 
 func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, containerName, command string, isMinecraft bool) error {
-	name := strings.TrimSpace(containerName)
+	name := dockerContainerName(containerName)
 	cmd := strings.TrimSpace(command)
 	if name == "" || cmd == "" {
 		return fmt.Errorf("missing-params")
@@ -1135,13 +1711,15 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 	}
 
 	if isMinecraft {
-		pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, "sh", "-c", "cat > /tmp/minecraft-console-in")
-		pipeCmd.Stdin = strings.NewReader(cmd + "\n")
-		if err := pipeCmd.Run(); err == nil {
-			if d.debug {
-				fmt.Printf("[docker] minecraft command sent via console-in pipe\n")
+		if _, _, exitCode, err := d.runCollect(ctx, "exec", name, "sh", "-lc", "test -p /tmp/minecraft-console-in"); err == nil && exitCode == 0 {
+			pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, "sh", "-lc", "cat > /tmp/minecraft-console-in")
+			pipeCmd.Stdin = strings.NewReader(cmd + "\r")
+			if err := pipeCmd.Run(); err == nil {
+				if d.debug {
+					fmt.Printf("[docker] minecraft command sent via console-in pipe\n")
+				}
+				return nil
 			}
-			return nil
 		}
 
 		execCmd := exec.CommandContext(ctx, "docker", "exec", name, "mc-send-to-console", cmd)
@@ -1159,34 +1737,45 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 			}
 			return nil
 		}
-	}
-
-	if stdinMgr != nil {
-		conn, err := stdinMgr.getOrCreate(ctx, name)
-		if err == nil {
-			if err := conn.sendCommand(cmd); err == nil {
-				if d.debug {
-					fmt.Printf("[docker] command sent via stdin manager\n")
+		if stdinMgr != nil {
+			for attempt := 0; attempt < 2; attempt++ {
+				conn, err := stdinMgr.getOrCreate(ctx, name)
+				if err == nil {
+					if err := conn.sendCommand(cmd); err == nil {
+						if d.debug {
+							fmt.Printf("[docker] minecraft command sent via stdin manager\n")
+						}
+						return nil
+					}
+					stdinMgr.remove(name)
+					continue
 				}
-				return nil
+				if attempt == 0 {
+					stdinMgr.remove(name)
+					continue
+				}
 			}
-			stdinMgr.remove(name)
+		}
+		if err := d.writeToMinecraftProcessStdin(ctx, name, cmd); err == nil {
+			if d.debug {
+				fmt.Printf("[docker] minecraft command sent via /proc/<pid>/fd/0\n")
+			}
+			return nil
 		}
 	}
 
-	execCtx, cancel := context.WithTimeout(ctx, stdinWriteTimeout)
-	defer cancel()
-
-	execCmd := exec.CommandContext(execCtx, "docker", "exec", "-i", name, "cat")
-	execCmd.Stdin = strings.NewReader(cmd + "\n")
-	if err := execCmd.Run(); err == nil {
+	if err := d.writeToContainerProcessStdin(ctx, name, cmd); err == nil {
 		if d.debug {
-			fmt.Printf("[docker] command sent via docker exec stdin\n")
+			fmt.Printf("[docker] command sent via /proc/1/fd/0\n")
 		}
 		return nil
+	} else if stdinMgr != nil && d.debug {
+		fmt.Printf("[docker] stdin manager bypassed after /proc/1/fd/0 failure for %s: %v\n", name, err)
+		return fmt.Errorf("failed-to-send: %w", err)
+	} else if err != nil {
+		return fmt.Errorf("failed-to-send: %w", err)
 	}
-
-	return fmt.Errorf("failed-to-send: all methods exhausted")
+	return fmt.Errorf("failed-to-send: stdin channel unavailable")
 }
 
 func validateCommandInput(cmd string) error {
@@ -1201,7 +1790,6 @@ func validateCommandInput(cmd string) error {
 	return nil
 }
 
-
 type Downloader struct {
 	headerTimeout time.Duration
 	maxBytes      int64
@@ -1215,25 +1803,54 @@ func (dl Downloader) safeURL(raw string) (*url.URL, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("invalid scheme")
 	}
+	if u.User != nil && u.User.String() != "" {
+		return nil, fmt.Errorf("credentials not allowed")
+	}
 	host := u.Hostname()
 	if host == "" {
 		return nil, fmt.Errorf("missing host")
+	}
+	if isBlockedOutboundHostname(host) {
+		return nil, fmt.Errorf("blocked host")
 	}
 
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		return nil, fmt.Errorf("dns failed: %w", err)
 	}
+	checkedIP := false
 	for _, ip := range ips {
 		addr, ok := netip.AddrFromSlice(ip)
 		if !ok {
 			continue
 		}
-		if !addr.IsGlobalUnicast() {
+		checkedIP = true
+		if isBlockedOutboundAddr(addr) {
 			return nil, fmt.Errorf("blocked host ip: %s", addr.String())
 		}
 	}
+	if !checkedIP {
+		return nil, fmt.Errorf("dns returned no usable ip")
+	}
 	return u, nil
+}
+
+func isBlockedOutboundHostname(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	return h == "localhost" || strings.HasSuffix(h, ".localhost") || strings.HasSuffix(h, ".local")
+}
+
+func isBlockedOutboundAddr(addr netip.Addr) bool {
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	return !addr.IsGlobalUnicast() ||
+		addr.IsPrivate() ||
+		addr.IsLoopback() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsMulticast() ||
+		addr.IsUnspecified()
 }
 
 func isPrivateIP(ip net.IP) bool {
@@ -1241,17 +1858,25 @@ func isPrivateIP(ip net.IP) bool {
 	if !ok {
 		return true
 	}
-	return !addr.IsGlobalUnicast()
+	return isBlockedOutboundAddr(addr)
 }
 
 func (dl Downloader) client() *http.Client {
+	return dl.clientWithProxy(http.ProxyFromEnvironment)
+}
+
+func (dl Downloader) clientNoProxy() *http.Client {
+	return dl.clientWithProxy(nil)
+}
+
+func (dl Downloader) clientWithProxy(proxy func(*http.Request) (*url.URL, error)) *http.Client {
 	safeDialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: proxy,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -1355,7 +1980,6 @@ func (dl Downloader) downloadToFile(ctx context.Context, rawURL, destPath string
 	}
 	return os.Rename(tmp, destPath)
 }
-
 
 func writeMinecraftScaffold(serverDir, name, fork, version string) {
 	_ = os.WriteFile(filepath.Join(serverDir, "eula.txt"), []byte("eula=true\n"), 0o644)
@@ -1474,8 +2098,7 @@ func getMinecraftJarURL(ctx context.Context, dl Downloader, fork, version string
 	return fmt.Sprintf("https://api.purpurmc.org/v2/purpur/%s/latest/download", v)
 }
 
-
-const pythonMainTemplate = `def greet(name="World"):
+const legacyPythonMainTemplate = `def greet(name="World"):
     return f"Hello, {name}!"
 
 if __name__ == "__main__":
@@ -1491,23 +2114,533 @@ if __name__ == "__main__":
     print("--- Execution finished ---")
 `
 
+const pythonMainTemplate = `from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ADPanel Python server is running.\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args), flush=True)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print(f"ADPanel Python server listening on 0.0.0.0:{port}", flush=True)
+    server.serve_forever()
+`
+
 func clampPort(p any, fallback int) int {
-	switch v := p.(type) {
-	case float64:
-		p = int(v)
+	if n, ok := parseStrictPortValue(p); ok {
+		return n
+	}
+	return fallback
+}
+
+func isStrictNumericPortString(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] < '1' || s[0] > '9' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func parseStrictPortValue(v any) (int, bool) {
+	switch x := v.(type) {
 	case int:
+		if x < 1 || x > 65535 {
+			return 0, false
+		}
+		return x, true
+	case int64:
+		if x < 1 || x > 65535 {
+			return 0, false
+		}
+		return int(x), true
+	case float64:
+		if x < 1 || x > 65535 || x != float64(int(x)) {
+			return 0, false
+		}
+		return int(x), true
+	case float32:
+		if x < 1 || x > 65535 || x != float32(int(x)) {
+			return 0, false
+		}
+		return int(x), true
 	case string:
-		n, _ := strconv.Atoi(strings.TrimSpace(v))
-		p = n
+		s := strings.TrimSpace(x)
+		if !isStrictNumericPortString(s) {
+			return 0, false
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 1 || n > 65535 {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
 	}
-	n, ok := p.(int)
-	if !ok {
-		return fallback
+}
+
+func normalizePortProtocolName(v any) string {
+	protocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(v)))
+	switch protocol {
+	case "tcp", "udp", "sctp":
+		return protocol
+	default:
+		return ""
 	}
-	if n < 1 || n > 65535 {
-		return fallback
+}
+
+func normalizePortProtocolSlice(v any) []string {
+	var raw []any
+	switch x := v.(type) {
+	case []string:
+		raw = make([]any, 0, len(x))
+		for _, item := range x {
+			raw = append(raw, item)
+		}
+	case []any:
+		raw = x
+	case string:
+		raw = []any{x}
+	default:
+		return nil
 	}
-	return n
+
+	out := make([]string, 0, len(raw))
+	seen := map[string]struct{}{}
+	for _, item := range raw {
+		protocol := normalizePortProtocolName(item)
+		if protocol == "" {
+			continue
+		}
+		if _, ok := seen[protocol]; ok {
+			continue
+		}
+		seen[protocol] = struct{}{}
+		out = append(out, protocol)
+	}
+	return out
+}
+
+func runtimePortProtocolMap(raw any) map[int][]string {
+	out := map[int][]string{}
+	switch x := raw.(type) {
+	case map[string][]string:
+		for key, protocolsRaw := range x {
+			port, ok := parseStrictPortValue(key)
+			if !ok {
+				continue
+			}
+			protocols := normalizePortProtocolSlice(protocolsRaw)
+			if len(protocols) > 0 {
+				out[port] = protocols
+			}
+		}
+	case map[string]any:
+		for key, protocolsRaw := range x {
+			port, ok := parseStrictPortValue(key)
+			if !ok {
+				continue
+			}
+			protocols := normalizePortProtocolSlice(protocolsRaw)
+			if len(protocols) > 0 {
+				out[port] = protocols
+			}
+		}
+	case map[int][]string:
+		for port, protocolsRaw := range x {
+			if _, ok := parseStrictPortValue(port); !ok {
+				continue
+			}
+			protocols := normalizePortProtocolSlice(protocolsRaw)
+			if len(protocols) > 0 {
+				out[port] = protocols
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func portProtocolsFor(protocolsByPort map[int][]string, port int) []string {
+	if port > 0 {
+		if protocols := protocolsByPort[port]; len(protocols) > 0 {
+			return protocols
+		}
+	}
+	return []string{"tcp"}
+}
+
+func mergePortProtocols(a, b []string) []string {
+	out := make([]string, 0, len(a)+len(b))
+	seen := map[string]struct{}{}
+	for _, source := range [][]string{a, b} {
+		for _, raw := range source {
+			protocol := normalizePortProtocolName(raw)
+			if protocol == "" {
+				continue
+			}
+			if _, ok := seen[protocol]; ok {
+				continue
+			}
+			seen[protocol] = struct{}{}
+			out = append(out, protocol)
+		}
+	}
+	return out
+}
+
+func sanitizeDockerPortProtocols(raw map[string][]string, ports []int) map[string][]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	allowedPorts := map[int]struct{}{}
+	for _, port := range ports {
+		if _, ok := parseStrictPortValue(port); ok {
+			allowedPorts[port] = struct{}{}
+		}
+	}
+
+	out := map[string][]string{}
+	for rawPort, protocolsRaw := range raw {
+		port, ok := parseStrictPortValue(rawPort)
+		if !ok {
+			continue
+		}
+		if len(allowedPorts) > 0 {
+			if _, ok := allowedPorts[port]; !ok {
+				continue
+			}
+		}
+		protocols := normalizePortProtocolSlice(protocolsRaw)
+		if len(protocols) > 0 {
+			out[strconv.Itoa(port)] = protocols
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (a *Agent) dockerHostPortOwner(ctx context.Context, port int, excludeName string) string {
+	if a == nil || port <= 0 {
+		return ""
+	}
+	out, _, code, err := a.docker.runCollect(ctx, "ps", "--format", "{{.Names}}\t{{.Ports}}")
+	if err != nil || code != 0 {
+		return ""
+	}
+	needle := ":" + strconv.Itoa(port) + "->"
+	excluded := strings.ToLower(strings.TrimSpace(excludeName))
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		if excluded != "" && strings.ToLower(name) == excluded {
+			continue
+		}
+		if strings.Contains(parts[1], needle) {
+			return name
+		}
+	}
+	return ""
+}
+
+func tcpHostPortBindable(port int) bool {
+	if port <= 0 {
+		return true
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+func udpHostPortBindable(port int) bool {
+	if port <= 0 {
+		return true
+	}
+	ln, err := net.ListenPacket("udp", fmt.Sprintf("0.0.0.0:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+func hostPortBindableForProtocols(port int, protocols []string) bool {
+	if port <= 0 {
+		return true
+	}
+	cleanProtocols := normalizePortProtocolSlice(protocols)
+	if len(cleanProtocols) == 0 {
+		cleanProtocols = []string{"tcp"}
+	}
+	for _, protocol := range cleanProtocols {
+		switch protocol {
+		case "udp":
+			if !udpHostPortBindable(port) {
+				return false
+			}
+		case "tcp", "sctp":
+			if !tcpHostPortBindable(port) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (a *Agent) hostPortAvailability(ctx context.Context, port int, excludeName string) (bool, string, string) {
+	return a.hostPortAvailabilityForProtocols(ctx, port, []string{"tcp"}, excludeName)
+}
+
+func (a *Agent) hostPortAvailabilityForProtocols(ctx context.Context, port int, protocols []string, excludeName string) (bool, string, string) {
+	if port <= 0 {
+		return true, "", ""
+	}
+	if owner := a.dockerHostPortOwner(ctx, port, excludeName); owner != "" {
+		return false, owner, "docker"
+	}
+	if !hostPortBindableForProtocols(port, protocols) {
+		return false, "", "socket"
+	}
+	return true, "", ""
+}
+
+var dockerRunFlagsWithValue = map[string]bool{
+	"-e": true, "--env": true, "-v": true, "--volume": true,
+	"-p": true, "--publish": true, "-w": true, "--workdir": true,
+	"--name": true, "-m": true, "--memory": true, "--cpus": true,
+	"--memory-swap": true, "--memory-reservation": true, "--cpu-period": true, "--cpu-quota": true,
+	"-u": true, "--user": true, "-h": true, "--hostname": true,
+	"--network": true, "--net": true, "--restart": true,
+	"-l": true, "--label": true, "--entrypoint": true,
+	"--mount": true, "--tmpfs": true, "--device": true,
+	"--pid": true, "--ipc": true, "--userns": true, "--uts": true, "--cgroupns": true,
+	"--shm-size": true, "--ulimit": true, "--dns": true, "--dns-search": true,
+	"--add-host": true, "--log-driver": true, "--log-opt": true,
+	"--stop-signal": true, "--stop-timeout": true, "--health-cmd": true,
+	"--health-interval": true, "--health-retries": true, "--health-timeout": true,
+	"--runtime": true, "--platform": true, "--pull": true,
+	"--ip": true, "--ip6": true, "--mac-address": true,
+	"--expose": true, "--link": true, "--cidfile": true,
+}
+
+var dockerRunSafeStandaloneFlags = map[string]bool{
+	"-d": true, "--detach": true, "-i": true, "--interactive": true,
+	"-t": true, "--tty": true, "--rm": true, "--init": true, "--read-only": true,
+}
+
+var dockerRunBlockedFlags = map[string]bool{
+	"--privileged":         true,
+	"--cap-add":            true,
+	"--cap-drop":           true,
+	"--security-opt":       true,
+	"--volumes-from":       true,
+	"--env-file":           true,
+	"--device":             true,
+	"--device-cgroup-rule": true,
+	"--sysctl":             true,
+	"--oom-kill-disable":   true,
+	"--oom-score-adj":      true,
+}
+
+var dockerRunHostNamespaceFlags = map[string]bool{
+	"--network": true, "--net": true, "--pid": true, "--userns": true,
+	"--ipc": true, "--uts": true, "--cgroupns": true,
+}
+
+func isSafeShortDockerFlagCluster(flag string) bool {
+	if len(flag) < 2 || flag[0] != '-' || strings.HasPrefix(flag, "--") {
+		return false
+	}
+	for i := 1; i < len(flag); i++ {
+		switch flag[i] {
+		case 'd', 'D', 'i', 'I', 't', 'T':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func parseDockerFlagToken(token string) (string, string) {
+	trimmed := strings.TrimSpace(token)
+	lower := strings.ToLower(trimmed)
+	if eqIdx := strings.Index(lower, "="); eqIdx > 0 {
+		return lower[:eqIdx], strings.TrimSpace(trimmed[eqIdx+1:])
+	}
+	return lower, ""
+}
+
+func readDockerFlagValue(args []string, index int, inlineValue string) (string, int) {
+	if strings.TrimSpace(inlineValue) != "" {
+		return inlineValue, index
+	}
+	if index+1 >= len(args) {
+		return "", index
+	}
+	return args[index+1], index + 1
+}
+
+func validateDockerRunCommandSafety(command string, allowedHostPorts []int, reservedHostPorts []int, expectedImageRef string) string {
+	cmd := strings.TrimSpace(command)
+	if cmd == "" {
+		return ""
+	}
+	if !strings.HasPrefix(strings.ToLower(cmd), "docker run") {
+		return "Startup command must start with 'docker run'."
+	}
+	for _, r := range cmd {
+		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' {
+			return "Startup command contains unsupported control characters."
+		}
+	}
+
+	allowedSet := make(map[int]bool, len(allowedHostPorts))
+	for _, p := range allowedHostPorts {
+		if port, ok := parseStrictPortValue(p); ok {
+			allowedSet[port] = true
+		}
+	}
+	reservedSet := make(map[int]bool, len(reservedHostPorts))
+	for _, p := range reservedHostPorts {
+		if port, ok := parseStrictPortValue(p); ok {
+			reservedSet[port] = true
+		}
+	}
+
+	args := parseShellArgs(strings.TrimSpace(cmd[len("docker run"):]))
+	for i := 0; i < len(args); i++ {
+		token := strings.TrimSpace(args[i])
+		if token == "" {
+			continue
+		}
+		tokenLower := strings.ToLower(token)
+		if !strings.HasPrefix(tokenLower, "-") {
+			if strings.TrimSpace(expectedImageRef) != "" {
+				normalizedExpected := normalizeDockerImage(expectedImageRef)
+				normalizedCommand := normalizeDockerImage(token)
+				if normalizedExpected != "" && normalizedCommand != "" && normalizedExpected != normalizedCommand {
+					return fmt.Sprintf("The Docker image in the startup command (%s) does not match the configured image (%s).", token, expectedImageRef)
+				}
+			}
+			return ""
+		}
+
+		flagName, inlineValue := parseDockerFlagToken(token)
+
+		if dockerRunBlockedFlags[flagName] {
+			return fmt.Sprintf("Blocked dangerous Docker flag: %s", flagName)
+		}
+
+		if flagName == "--mount" {
+			value, nextIndex := readDockerFlagValue(args, i, inlineValue)
+			mountValue := strings.ToLower(strings.TrimSpace(value))
+			if mountValue == "" {
+				return "Docker flag --mount requires a value."
+			}
+			if strings.Contains(mountValue, "type=bind") {
+				return "Blocked dangerous Docker flag: --mount with bind"
+			}
+			i = nextIndex
+			continue
+		}
+
+		if flagName == "--tmpfs" {
+			value, nextIndex := readDockerFlagValue(args, i, inlineValue)
+			tmpfsValue := strings.ToLower(strings.TrimSpace(value))
+			if tmpfsValue == "" {
+				return "Docker flag --tmpfs requires a value."
+			}
+			if strings.Contains(tmpfsValue, "exec") {
+				return "Blocked dangerous Docker flag: --tmpfs with exec"
+			}
+			i = nextIndex
+			continue
+		}
+
+		if dockerRunHostNamespaceFlags[flagName] {
+			value, nextIndex := readDockerFlagValue(args, i, inlineValue)
+			nsMode := strings.ToLower(strings.TrimSpace(value))
+			if nsMode == "" {
+				return fmt.Sprintf("Docker flag %s requires a value.", flagName)
+			}
+			if nsMode == "host" {
+				return fmt.Sprintf("Blocked dangerous Docker flag: %s=host", flagName)
+			}
+			i = nextIndex
+			continue
+		}
+
+		if flagName == "-p" || flagName == "--publish" {
+			value, nextIndex := readDockerFlagValue(args, i, inlineValue)
+			mapping := strings.TrimSpace(value)
+			if mapping == "" {
+				return "Docker publish flag is missing a port mapping."
+			}
+			if !strings.Contains(mapping, "{PORT}") {
+				hostPort := extractHostPortFromMapping(mapping)
+				if hostPort == 0 {
+					return fmt.Sprintf("Invalid Docker port mapping: %s", mapping)
+				}
+				if !allowedSet[hostPort] {
+					return "Port config through docker edit command is not allowed. Add or remove a port through Port Management."
+				}
+				if reservedSet[hostPort] {
+					return fmt.Sprintf("Port %d in the Docker command conflicts with a port forwarding rule.", hostPort)
+				}
+			}
+			i = nextIndex
+			continue
+		}
+
+		if isSafeShortDockerFlagCluster(flagName) || dockerRunSafeStandaloneFlags[flagName] {
+			continue
+		}
+
+		if dockerRunFlagsWithValue[flagName] {
+			value, nextIndex := readDockerFlagValue(args, i, inlineValue)
+			if strings.TrimSpace(value) == "" {
+				return fmt.Sprintf("Docker flag %s requires a value.", flagName)
+			}
+			i = nextIndex
+			continue
+		}
+
+		return fmt.Sprintf("Unsupported Docker flag in startup command: %s", flagName)
+	}
+
+	return "Startup command must include a Docker image."
 }
 
 func buildNodeIndexTemplate(port int) string {
@@ -1515,19 +2648,47 @@ func buildNodeIndexTemplate(port int) string {
 	if p < 1 || p > 65535 {
 		p = 3001
 	}
-	return fmt.Sprintf(`const express = require("express");
-const app = express();
+	return fmt.Sprintf(`const http = require("http");
 
-app.get("/", (req, res) => {
-  res.send("Hello World from ADPanel!");
+const PORT = Number(process.env.PORT || %d);
+
+const server = http.createServer((req, res) => {
+  const body = "ADPanel Node.js server is running.\n";
+  res.writeHead(200, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body)
+  });
+  res.end(body);
 });
 
-const PORT = %d;
-
-app.listen(PORT, () => {
-  console.log(`+"`"+`Server running on http://localhost:%d`+"`"+`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`+"`"+`ADPanel Node.js server listening on 0.0.0.0:${PORT}`+"`"+`);
 });
-`, p, p)
+`, p)
+}
+
+func writeGeneratedRuntimeFile(path string, content []byte, isReplaceableLegacy func([]byte) bool) {
+	if strings.TrimSpace(path) == "" {
+		return
+	}
+	if existing, err := os.ReadFile(path); err == nil {
+		if isReplaceableLegacy != nil && isReplaceableLegacy(existing) {
+			_ = os.WriteFile(path, content, 0o644)
+		}
+		return
+	}
+	_ = ensureDir(filepath.Dir(path))
+	_ = os.WriteFile(path, content, 0o644)
+}
+
+func isLegacyPythonScaffold(content []byte) bool {
+	return strings.TrimSpace(string(content)) == strings.TrimSpace(legacyPythonMainTemplate)
+}
+
+func isLegacyNodeScaffold(content []byte) bool {
+	s := string(content)
+	return strings.Contains(s, `const express = require("express");`) &&
+		strings.Contains(s, "Hello World from ADPanel!")
 }
 
 func scaffoldPython(serverDir, startFile string) {
@@ -1539,7 +2700,7 @@ func scaffoldPython(serverDir, startFile string) {
 	if sf == "." || sf == ".." || sf == "" {
 		sf = "main.py"
 	}
-	_ = os.WriteFile(filepath.Join(serverDir, sf), []byte(pythonMainTemplate), 0o644)
+	writeGeneratedRuntimeFile(filepath.Join(serverDir, sf), []byte(pythonMainTemplate), isLegacyPythonScaffold)
 }
 
 func scaffoldNode(serverDir, startFile string, port int) {
@@ -1551,7 +2712,7 @@ func scaffoldNode(serverDir, startFile string, port int) {
 	if sf == "." || sf == ".." || sf == "" {
 		sf = "index.js"
 	}
-	_ = os.WriteFile(filepath.Join(serverDir, sf), []byte(buildNodeIndexTemplate(port)), 0o644)
+	writeGeneratedRuntimeFile(filepath.Join(serverDir, sf), []byte(buildNodeIndexTemplate(port)), isLegacyNodeScaffold)
 
 	pkgPath := filepath.Join(serverDir, "package.json")
 	if _, err := os.Stat(pkgPath); err == nil {
@@ -1559,34 +2720,190 @@ func scaffoldNode(serverDir, startFile string, port int) {
 	}
 
 	pkg := map[string]any{
-		"name":    filepath.Base(serverDir),
-		"private": true,
-		"version": "1.0.0",
-		"main":    "index.js",
-		"scripts": map[string]string{"start": "node index.js"},
-		"dependencies": map[string]string{
-			"express": "^4.19.2",
-		},
+		"name":         filepath.Base(serverDir),
+		"private":      true,
+		"version":      "1.0.0",
+		"main":         "index.js",
+		"scripts":      map[string]string{"start": "node index.js"},
+		"dependencies": map[string]string{},
 	}
 	b, _ := json.MarshalIndent(pkg, "", "  ")
 	_ = os.WriteFile(pkgPath, b, 0o644)
 }
 
-
-var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+var ansiSGRRE = regexp.MustCompile(`\x1b\[[0-9;:]*m`)
 var mcHexRE = regexp.MustCompile(`§x(?:§[0-9A-Fa-f]){6}`)
 var mcRE = regexp.MustCompile(`§[0-9A-FK-ORa-fk-or]`)
+var promptArtifactRE = regexp.MustCompile(`(?m)^\s*>\.{2,}\s*`)
+var ttyOnlyLineRE = regexp.MustCompile(`^[\s>.=…-]+$`)
+
+func stripDockerStreamFraming(s string) string {
+	buf := []byte(s)
+	if len(buf) < 8 {
+		return s
+	}
+	out := make([]byte, 0, len(buf))
+	usedFrames := false
+	for i := 0; i < len(buf); {
+		if len(buf)-i >= 8 && buf[i] >= 1 && buf[i] <= 3 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 0 {
+			frameLen := int(binary.BigEndian.Uint32(buf[i+4 : i+8]))
+			if frameLen == 0 {
+				usedFrames = true
+				i += 8
+				continue
+			}
+			if frameLen > 0 && len(buf)-i-8 >= frameLen {
+				out = append(out, buf[i+8:i+8+frameLen]...)
+				i += 8 + frameLen
+				usedFrames = true
+				continue
+			}
+		}
+		out = append(out, buf[i])
+		i++
+	}
+	if usedFrames {
+		return string(out)
+	}
+	return s
+}
+
+func consumeAnsiCSISequence(s string, idx int) (next int, keep bool) {
+	i := idx
+	for i < len(s) {
+		c := s[i]
+		if c >= 0x40 && c <= 0x7e {
+			return i + 1, c == 'm'
+		}
+		i++
+	}
+	return len(s), false
+}
+
+func skipAnsiOSCSequence(s string, idx int) int {
+	i := idx
+	for i < len(s) {
+		if s[i] == 0x07 {
+			return i + 1
+		}
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+			return i + 2
+		}
+		i++
+	}
+	return len(s)
+}
+
+func skipAnsiEscTerminatedSequence(s string, idx int) int {
+	i := idx
+	for i < len(s) {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+			return i + 2
+		}
+		i++
+	}
+	return len(s)
+}
+
+func sanitizeAnsiForConsole(s string) string {
+	if s == "" {
+		return s
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case 0x9b:
+			next, keep := consumeAnsiCSISequence(s, i+1)
+			if keep {
+				out.WriteString(s[i:next])
+			}
+			i = next
+			continue
+		case 0x1b:
+			if i+1 >= len(s) {
+				i++
+				continue
+			}
+			nextByte := s[i+1]
+			switch nextByte {
+			case '[':
+				next, keep := consumeAnsiCSISequence(s, i+2)
+				if keep {
+					out.WriteString(s[i:next])
+				}
+				i = next
+				continue
+			case ']':
+				i = skipAnsiOSCSequence(s, i+2)
+				continue
+			case 'P', 'X', '^', '_':
+				i = skipAnsiEscTerminatedSequence(s, i+2)
+				continue
+			default:
+				if nextByte >= 0x40 && nextByte <= 0x5f {
+					i += 2
+					continue
+				}
+				i++
+				continue
+			}
+		default:
+			if (s[i] < 32 || s[i] == 127) && s[i] != '\n' && s[i] != '\r' && s[i] != '\t' {
+				i++
+				continue
+			}
+			out.WriteByte(s[i])
+			i++
+		}
+	}
+	return out.String()
+}
 
 func cleanLogLine(s string) string {
 	if s == "" {
 		return s
 	}
-	s = ansiRE.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = stripDockerStreamFraming(s)
+	s = sanitizeAnsiForConsole(s)
 	s = mcHexRE.ReplaceAllString(s, "")
 	s = mcRE.ReplaceAllString(s, "")
-	return s
+	s = promptArtifactRE.ReplaceAllString(s, "")
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.ReplaceAll(line, "…", "")
+		line = strings.TrimRight(line, " \t")
+		line = strings.TrimLeft(line, ">=. ")
+		plain := strings.TrimSpace(ansiSGRRE.ReplaceAllString(line, ""))
+		if plain == "" || ttyOnlyLineRE.MatchString(plain) {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
+func normalizeConsoleMode(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		mode := strings.ToLower(strings.TrimSpace(v))
+		switch mode {
+		case "stdin", "exec", "exec-shell", "shell":
+			return mode
+		}
+	case map[string]any:
+		if mode := normalizeConsoleMode(v["mode"]); mode != "" {
+			return mode
+		}
+		if mode := normalizeConsoleMode(v["type"]); mode != "" {
+			return mode
+		}
+	}
+	return ""
+}
 
 const (
 	maxExtractSize  = 10 << 30
@@ -1810,6 +3127,8 @@ func detectArchiveType(p string) string {
 		return "targz"
 	case strings.HasSuffix(l, ".tar.bz2") || strings.HasSuffix(l, ".tbz2"):
 		return "tarbz2"
+	case strings.HasSuffix(l, ".tar.xz") || strings.HasSuffix(l, ".txz"):
+		return "tarxz"
 	case strings.HasSuffix(l, ".7z"):
 		return "7z"
 	case strings.HasSuffix(l, ".rar"):
@@ -1818,7 +3137,6 @@ func detectArchiveType(p string) string {
 		return ""
 	}
 }
-
 
 type AuditLogger struct {
 	enabled bool
@@ -1881,8 +3199,13 @@ type Agent struct {
 	logs     *logManager
 	stdinMgr *stdinManager
 
+	resourceStats *serverResourceStatsCache
+
 	stopMu      sync.Mutex
 	stoppingNow map[string]time.Time
+
+	commandMu      sync.Mutex
+	recentCommands map[string]recentConsoleCommand
 
 	importProgressMu sync.RWMutex
 	importProgress   map[string]*ImportProgress
@@ -1895,6 +3218,143 @@ type Agent struct {
 	metaLocks sync.Map
 
 	serverOpLocks sync.Map
+}
+
+const (
+	serverResourceStatsDefaultTTL = 2500 * time.Millisecond
+	serverResourceStatsDiskTTL    = 15 * time.Second
+	serverResourceStatsMaxIdle    = 10 * time.Minute
+)
+
+type serverResourceStatsCache struct {
+	ttl     time.Duration
+	diskTTL time.Duration
+	mu      sync.Mutex
+	entries map[string]*serverResourceStatsCacheEntry
+}
+
+type serverResourceStatsCacheEntry struct {
+	mu sync.Mutex
+
+	payload   map[string]any
+	expiresAt time.Time
+	touchedAt time.Time
+
+	diskBytes     int64
+	diskExpiresAt time.Time
+
+	containerID string
+	seenNetwork bool
+	lastRawRx   uint64
+	lastRawTx   uint64
+	totalRx     uint64
+	totalTx     uint64
+
+	networkWindowStartedAt time.Time
+	networkWindowRx        uint64
+	networkWindowTx        uint64
+}
+
+func newServerResourceStatsCache(ttl, diskTTL time.Duration) *serverResourceStatsCache {
+	if ttl <= 0 {
+		ttl = serverResourceStatsDefaultTTL
+	}
+	if diskTTL <= 0 {
+		diskTTL = serverResourceStatsDiskTTL
+	}
+	return &serverResourceStatsCache{
+		ttl:     ttl,
+		diskTTL: diskTTL,
+		entries: make(map[string]*serverResourceStatsCacheEntry),
+	}
+}
+
+func (c *serverResourceStatsCache) get(name string) *serverResourceStatsCacheEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.entries[name]
+	if entry == nil {
+		entry = &serverResourceStatsCacheEntry{}
+		c.entries[name] = entry
+	}
+	return entry
+}
+
+func (c *serverResourceStatsCache) cleanup(maxIdle time.Duration) {
+	if c == nil || maxIdle <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-maxIdle)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for name, entry := range c.entries {
+		entry.mu.Lock()
+		idle := !entry.touchedAt.IsZero() && entry.touchedAt.Before(cutoff)
+		entry.mu.Unlock()
+		if idle {
+			delete(c.entries, name)
+		}
+	}
+}
+
+func (e *serverResourceStatsCacheEntry) cachedDiskUsage(a *Agent, serverDir string, now time.Time, ttl time.Duration) int64 {
+	if now.Before(e.diskExpiresAt) {
+		return e.diskBytes
+	}
+	e.diskBytes = a.getServerDiskUsage(serverDir)
+	e.diskExpiresAt = now.Add(ttl)
+	return e.diskBytes
+}
+
+func addUint64Saturating(a, b uint64) uint64 {
+	if ^uint64(0)-a < b {
+		return ^uint64(0)
+	}
+	return a + b
+}
+
+func (e *serverResourceStatsCacheEntry) updateNetworkCounters(containerID string, rawRx, rawTx uint64, now time.Time, resetEvery time.Duration) (uint64, uint64, uint64, uint64, time.Time) {
+	if e.seenNetwork && containerID != "" && e.containerID != "" && containerID != e.containerID {
+		e.lastRawRx = 0
+		e.lastRawTx = 0
+	}
+
+	var rxDelta, txDelta uint64
+	if !e.seenNetwork {
+		e.totalRx = rawRx
+		e.totalTx = rawTx
+		rxDelta = rawRx
+		txDelta = rawTx
+	} else {
+		if rawRx >= e.lastRawRx {
+			rxDelta = rawRx - e.lastRawRx
+		} else {
+			rxDelta = rawRx
+		}
+		if rawTx >= e.lastRawTx {
+			txDelta = rawTx - e.lastRawTx
+		} else {
+			txDelta = rawTx
+		}
+		e.totalRx = addUint64Saturating(e.totalRx, rxDelta)
+		e.totalTx = addUint64Saturating(e.totalTx, txDelta)
+	}
+
+	if resetEvery > 0 {
+		if e.networkWindowStartedAt.IsZero() || now.Sub(e.networkWindowStartedAt) >= resetEvery || now.Before(e.networkWindowStartedAt) {
+			e.networkWindowStartedAt = now
+			e.networkWindowRx = 0
+			e.networkWindowTx = 0
+		}
+		e.networkWindowRx = addUint64Saturating(e.networkWindowRx, rxDelta)
+		e.networkWindowTx = addUint64Saturating(e.networkWindowTx, txDelta)
+	}
+
+	e.lastRawRx = rawRx
+	e.lastRawTx = rawTx
+	e.containerID = containerID
+	e.seenNetwork = true
+	return e.totalRx, e.totalTx, e.networkWindowRx, e.networkWindowTx, e.networkWindowStartedAt
 }
 
 type ImportProgress struct {
@@ -2001,6 +3461,333 @@ func (a *Agent) verifyReinstallAdminRequest(r *http.Request, name, template stri
 	return true, ""
 }
 
+func (a *Agent) nodeInformationPath() string {
+	return filepath.Join(a.dataRoot, NodeInfoFileName)
+}
+
+func (a *Agent) defaultNodeInformation() NodeInformation {
+	return NodeInformation{
+		NodeVersion:      normalizeNodeVersionTag(NodeVersion),
+		NodeArchitecture: runtime.GOOS + "/" + runtime.GOARCH,
+		NodeAutoUpdate:   false,
+	}
+}
+
+func (a *Agent) readNodeInformation() NodeInformation {
+	info := a.defaultNodeInformation()
+	b, err := os.ReadFile(a.nodeInformationPath())
+	if err != nil || len(bytes.TrimSpace(b)) == 0 {
+		return info
+	}
+
+	var arr []NodeInformation
+	if err := json.Unmarshal(b, &arr); err == nil && len(arr) > 0 {
+		if arr[0].NodeVersion != "" {
+			info.NodeVersion = normalizeNodeVersionTag(arr[0].NodeVersion)
+		}
+		if arr[0].NodeArchitecture != "" {
+			info.NodeArchitecture = arr[0].NodeArchitecture
+		}
+		info.NodeAutoUpdate = arr[0].NodeAutoUpdate
+		info.UpdatedAt = arr[0].UpdatedAt
+		return info
+	}
+
+	var obj NodeInformation
+	if err := json.Unmarshal(b, &obj); err == nil {
+		if obj.NodeVersion != "" {
+			info.NodeVersion = normalizeNodeVersionTag(obj.NodeVersion)
+		}
+		if obj.NodeArchitecture != "" {
+			info.NodeArchitecture = obj.NodeArchitecture
+		}
+		info.NodeAutoUpdate = obj.NodeAutoUpdate
+		info.UpdatedAt = obj.UpdatedAt
+	}
+	return info
+}
+
+func (a *Agent) writeNodeInformation(info NodeInformation) error {
+	if err := ensureDir(a.dataRoot); err != nil {
+		return err
+	}
+	if info.NodeVersion == "" {
+		info.NodeVersion = normalizeNodeVersionTag(NodeVersion)
+	} else {
+		info.NodeVersion = normalizeNodeVersionTag(info.NodeVersion)
+	}
+	if info.NodeArchitecture == "" {
+		info.NodeArchitecture = runtime.GOOS + "/" + runtime.GOARCH
+	}
+	info.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	b, err := json.MarshalIndent([]NodeInformation{info}, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return writeFileNoFollow(a.nodeInformationPath(), b, 0o644)
+}
+
+func (a *Agent) ensureNodeInformationFile() NodeInformation {
+	info := a.readNodeInformation()
+	if _, err := os.Stat(a.nodeInformationPath()); err != nil {
+		if writeErr := a.writeNodeInformation(info); writeErr != nil {
+			fmt.Fprintf(os.Stderr, "[node-update] failed to initialize %s: %v\n", NodeInfoFileName, writeErr)
+		}
+	}
+	return info
+}
+
+func (a *Agent) verifyNodeAdminRequest(r *http.Request, action, subject string) (bool, string) {
+	role := strings.ToLower(strings.TrimSpace(r.Header.Get("x-panel-role")))
+	if role != "admin" {
+		return false, "admin-required"
+	}
+
+	secret := strings.TrimSpace(a.panelHMAC)
+	if secret == "" {
+		secret = strings.TrimSpace(a.token)
+	}
+	if secret == "" {
+		return false, "hmac-not-configured"
+	}
+
+	ts := r.Header.Get("x-panel-ts")
+	sig := r.Header.Get("x-panel-sign")
+	if ts == "" || sig == "" {
+		return false, "missing-signature"
+	}
+
+	tsNum, err := strconv.ParseInt(strings.TrimSpace(ts), 10, 64)
+	if err != nil {
+		return false, "expired"
+	}
+	now := time.Now().UnixMilli()
+	drift := now - tsNum
+	if drift < 0 {
+		drift = -drift
+	}
+	if drift > 5*60*1000 {
+		return false, "expired"
+	}
+
+	base := fmt.Sprintf("%s|%s|%s|%s|%s", strings.TrimSpace(a.uuid), strings.TrimSpace(action), strings.TrimSpace(subject), role, ts)
+	m := hmac.New(sha256.New, []byte(secret))
+	_, _ = m.Write([]byte(base))
+	expect := hex.EncodeToString(m.Sum(nil))
+	if !timingSafeEq(strings.TrimSpace(sig), expect) {
+		return false, "bad-signature"
+	}
+	return true, ""
+}
+
+func (a *Agent) writeNodeUpdateFile(rel string, data []byte, backupDir string) error {
+	if !allowedNodeUpdateFile(rel) {
+		return fmt.Errorf("file is not allowed: %s", rel)
+	}
+	if err := validateNodeUpdateFileContent(rel, data); err != nil {
+		return err
+	}
+	if err := ensureDir(a.dataRoot); err != nil {
+		return err
+	}
+
+	target := filepath.Join(a.dataRoot, rel)
+	resolvedRoot, err := filepath.Abs(a.dataRoot)
+	if err != nil {
+		return err
+	}
+	resolvedTarget, err := filepath.Abs(target)
+	if err != nil {
+		return err
+	}
+	if resolvedTarget != resolvedRoot && !strings.HasPrefix(resolvedTarget, resolvedRoot+string(filepath.Separator)) {
+		return fmt.Errorf("refusing path outside node root: %s", rel)
+	}
+
+	if st, err := os.Lstat(target); err == nil && st.Mode().IsRegular() && backupDir != "" {
+		if err := copyRegularFile(target, filepath.Join(backupDir, rel)); err != nil {
+			return fmt.Errorf("backup failed for %s: %w", rel, err)
+		}
+	}
+
+	tmp := filepath.Join(a.dataRoot, fmt.Sprintf(".%s.tmp.%d", rel, time.Now().UnixNano()))
+	if err := writeFileNoFollow(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func (a *Agent) runGoClean() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "go", "clean")
+	cmd.Dir = a.dataRoot
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("go clean timed out")
+	}
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if len(msg) > 400 {
+			msg = msg[:400]
+		}
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("go clean failed: %s", msg)
+	}
+	return nil
+}
+
+func (a *Agent) scheduleAdaemonRestart() {
+	go func() {
+		time.Sleep(900 * time.Millisecond)
+		cmd := exec.Command("systemctl", "restart", "adaemon")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			msg := strings.TrimSpace(string(out))
+			if len(msg) > 400 {
+				msg = msg[:400]
+			}
+			fmt.Fprintf(os.Stderr, "[node-update] systemctl restart adaemon failed: %v %s\n", err, msg)
+			return
+		}
+		fmt.Println("[node-update] systemctl restart adaemon executed")
+	}()
+}
+
+func (a *Agent) handleNodeUpdateInfo(w http.ResponseWriter, r *http.Request) {
+	info := a.ensureNodeInformationFile()
+	jsonWrite(w, 200, map[string]any{
+		"ok":                true,
+		"version":           info.NodeVersion,
+		"architecture":      info.NodeArchitecture,
+		"autoUpdateEnabled": info.NodeAutoUpdate,
+		"nodeId":            a.uuid,
+	})
+}
+
+func (a *Agent) handleNodeUpdateAuto(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
+	var payload nodeUpdateAutoRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid request body"})
+		return
+	}
+	subject := "off"
+	if payload.Enabled {
+		subject = "on"
+	}
+	if ok, reason := a.verifyNodeAdminRequest(r, "node-update-auto", subject); !ok {
+		jsonWrite(w, 403, map[string]any{"ok": false, "error": reason})
+		return
+	}
+	info := a.readNodeInformation()
+	info.NodeAutoUpdate = payload.Enabled
+	if err := a.writeNodeInformation(info); err != nil {
+		jsonWrite(w, 500, map[string]any{"ok": false, "error": "failed to save node information"})
+		return
+	}
+	jsonWrite(w, 200, map[string]any{"ok": true, "autoUpdateEnabled": payload.Enabled})
+}
+
+func (a *Agent) handleNodeUpdateInstall(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, NodeUpdateMaxBody)
+	var payload nodeUpdateInstallRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid request body"})
+		return
+	}
+
+	version := normalizeNodeVersionTag(payload.Version)
+	if !validNodeUpdateVersion(version) {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid version"})
+		return
+	}
+	if ok, reason := a.verifyNodeAdminRequest(r, "node-update-install", version); !ok {
+		jsonWrite(w, 403, map[string]any{"ok": false, "error": reason})
+		return
+	}
+	if len(payload.Files) == 0 || len(payload.Files) > 32 {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid update file set"})
+		return
+	}
+
+	seenMain := false
+	totalBytes := 0
+	decoded := make(map[string][]byte, len(payload.Files))
+	for _, file := range payload.Files {
+		rel := strings.TrimSpace(file.Path)
+		if !allowedNodeUpdateFile(rel) {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "update contains an unsupported file"})
+			return
+		}
+		if _, exists := decoded[rel]; exists {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "duplicate update file"})
+			return
+		}
+		data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(file.ContentBase64))
+		if err != nil {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid update file encoding"})
+			return
+		}
+		if err := validateNodeUpdateFileContent(rel, data); err != nil {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		totalBytes += len(data)
+		if totalBytes > NodeUpdateMaxBody {
+			jsonWrite(w, 413, map[string]any{"ok": false, "error": "update payload too large"})
+			return
+		}
+		if rel == "main.go" {
+			seenMain = true
+		}
+		decoded[rel] = data
+	}
+	if !seenMain {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "main.go is required"})
+		return
+	}
+
+	backupDir := filepath.Join(a.dataRoot, ".update-backups", time.Now().UTC().Format("20060102-150405"))
+	filesUpdated := 0
+	for rel, data := range decoded {
+		if err := a.writeNodeUpdateFile(rel, data, backupDir); err != nil {
+			jsonWrite(w, 500, map[string]any{"ok": false, "error": "failed to write update file"})
+			return
+		}
+		filesUpdated++
+	}
+
+	info := a.readNodeInformation()
+	info.NodeVersion = version
+	info.NodeArchitecture = runtime.GOOS + "/" + runtime.GOARCH
+	if err := a.writeNodeInformation(info); err != nil {
+		jsonWrite(w, 500, map[string]any{"ok": false, "error": "failed to save node information"})
+		return
+	}
+
+	if err := a.runGoClean(); err != nil {
+		jsonWrite(w, 500, map[string]any{"ok": false, "error": err.Error(), "filesUpdated": filesUpdated})
+		return
+	}
+
+	a.scheduleAdaemonRestart()
+	jsonWrite(w, 200, map[string]any{
+		"ok":             true,
+		"version":        version,
+		"filesUpdated":   filesUpdated,
+		"restartCommand": "systemctl restart adaemon",
+		"message":        "Node update installed. go clean completed and adaemon restart was scheduled.",
+	})
+}
 
 const (
 	wsMaxSubscribers    = 5
@@ -2098,8 +3885,7 @@ func (a *Agent) collectServerStatuses() map[string]any {
 }
 
 func (a *Agent) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-	})
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{})
 	if err != nil {
 		if a.debug {
 			fmt.Printf("[ws] accept error: %v\n", err)
@@ -2221,7 +4007,6 @@ func (a *Agent) broadcastContainerEvent(name, status string) {
 	}
 }
 
-
 func statUIDGID(p string) (uid, gid int) {
 	uid, gid = 1000, 1000
 	st, err := os.Stat(p)
@@ -2235,20 +4020,83 @@ func statUIDGID(p string) (uid, gid int) {
 	return int(sys.Uid), int(sys.Gid)
 }
 
-const cpuPeriod = 100000
+const (
+	cpuPeriod        = 100000
+	defaultPidsLimit = 512
+	minIoWeight      = 10
+	maxIoWeight      = 1000
+	minCpuWeight     = 1
+	maxCpuWeight     = 1000
+	minPidsLimit     = 64
+	maxPidsLimit     = 4096
+	minFileLimit     = 1024
+	maxFileLimit     = 1048576
+
+	minNetworkLimitMb       int64 = 1
+	maxNetworkLimitMb       int64 = 1073741824
+	defaultNetworkResetMins       = 1440
+	minNetworkResetMins           = 1
+	maxNetworkResetMins           = 43200
+)
+
+func dockerCpuSharesFromWeight(weight int) int64 {
+	if weight <= 0 {
+		return 0
+	}
+	if weight < minCpuWeight {
+		weight = minCpuWeight
+	}
+	if weight > maxCpuWeight {
+		weight = maxCpuWeight
+	}
+	shares := int64((weight * 2048) / maxCpuWeight)
+	if shares < 2 {
+		return 2
+	}
+	return shares
+}
+
+func validateResourcePerformanceLimits(resources *resourceLimits) string {
+	if resources == nil {
+		return ""
+	}
+	if resources.IoWeight != nil && (*resources.IoWeight < minIoWeight || *resources.IoWeight > maxIoWeight) {
+		return fmt.Sprintf("I/O Priority must be between %d and %d.", minIoWeight, maxIoWeight)
+	}
+	if resources.CpuWeight != nil && (*resources.CpuWeight < minCpuWeight || *resources.CpuWeight > maxCpuWeight) {
+		return fmt.Sprintf("CPU Priority must be between %d and %d.", minCpuWeight, maxCpuWeight)
+	}
+	if resources.PidsLimit != nil && (*resources.PidsLimit < minPidsLimit || *resources.PidsLimit > maxPidsLimit) {
+		return fmt.Sprintf("Process Limit must be between %d and %d.", minPidsLimit, maxPidsLimit)
+	}
+	if resources.FileLimit != nil && (*resources.FileLimit < minFileLimit || *resources.FileLimit > maxFileLimit) {
+		return fmt.Sprintf("File Limit must be between %d and %d.", minFileLimit, maxFileLimit)
+	}
+	if resources.NetworkInboundLimitMb != nil && *resources.NetworkInboundLimitMb != 0 && (*resources.NetworkInboundLimitMb < minNetworkLimitMb || *resources.NetworkInboundLimitMb > maxNetworkLimitMb) {
+		return fmt.Sprintf("Inbound Limit must be between %d and %d.", minNetworkLimitMb, maxNetworkLimitMb)
+	}
+	if resources.NetworkOutboundLimitMb != nil && *resources.NetworkOutboundLimitMb != 0 && (*resources.NetworkOutboundLimitMb < minNetworkLimitMb || *resources.NetworkOutboundLimitMb > maxNetworkLimitMb) {
+		return fmt.Sprintf("Outbound Limit must be between %d and %d.", minNetworkLimitMb, maxNetworkLimitMb)
+	}
+	if resources.NetworkResetMinutes != nil && *resources.NetworkResetMinutes != 0 && (*resources.NetworkResetMinutes < minNetworkResetMins || *resources.NetworkResetMinutes > maxNetworkResetMins) {
+		return fmt.Sprintf("Reset Time must be between %d and %d.", minNetworkResetMins, maxNetworkResetMins)
+	}
+	return ""
+}
 
 func computeCpuLimit(allocatedCores float64) (effectiveCores, maxPercent float64) {
 	hostCores := float64(runtime.NumCPU())
+	if hostCores <= 0 {
+		hostCores = 1
+	}
+	effectiveCores = hostCores
 	if allocatedCores > 0 {
 		effectiveCores = allocatedCores
 		if effectiveCores > hostCores {
 			effectiveCores = hostCores
 		}
-		maxPercent = effectiveCores * 100
-	} else {
-		effectiveCores = hostCores * 0.85
-		maxPercent = effectiveCores * 100
 	}
+	maxPercent = effectiveCores * 100
 	return
 }
 
@@ -2271,96 +4119,2714 @@ func metaCpuCores(meta map[string]any) float64 {
 	return 0
 }
 
-func (a *Agent) startMinecraftContainer(ctx context.Context, name, serverDir string, hostPort int, resources *resourceLimits, extraEnv map[string]string) error {
-	a.docker.rmForce(ctx, name)
-	a.docker.pull(ctx, "itzg/minecraft-server:latest")
-	ensureVolumeWritable(serverDir)
-	uid, gid := statUIDGID(serverDir)
+const (
+	defaultMinecraftProcessImage   = "eclipse-temurin"
+	defaultMinecraftProcessTag     = "21-jre"
+	defaultMinecraftProcessCommand = "java -Xms128M -Xmx{RAM_MB}M -jar /data/server.jar nogui"
+	maxRuntimeCommandLen           = 4000
+)
 
-	args := []string{
-		"run", "-d", "-t",
-		"--name", name,
-		"--restart", "unless-stopped",
-		"--cap-drop=ALL",
+var (
+	fallbackMinecraftJavaVersions      = []string{"8", "11", "17", "21", "22", "23", "24", "25", "26"}
+	minecraftJavaVersionsCache         []string
+	minecraftJavaVersionsCacheExpireAt time.Time
+	minecraftJavaVersionsMu            sync.Mutex
+)
+
+const (
+	minecraftJavaMinVersion       = 8
+	minecraftJavaMaxVersion       = 99
+	minecraftJavaDiscoveryURL     = "https://hub.docker.com/v2/repositories/library/eclipse-temurin/tags?page_size=100&name=-jre"
+	minecraftJavaDiscoveryTimeout = 4500 * time.Millisecond
+	minecraftJavaDiscoveryTTL     = 6 * time.Hour
+	minecraftJavaDiscoveryFailTTL = 5 * time.Minute
+)
+
+type dockerHubTagsResponse struct {
+	Next    string `json:"next"`
+	Results []struct {
+		Name string `json:"name"`
+	} `json:"results"`
+}
+
+func normalizeMinecraftJavaVersion(raw any) string {
+	value := strings.TrimSpace(strings.ToLower(fmt.Sprint(raw)))
+	if value == "" || value == "<nil>" {
+		return ""
 	}
-	args = append(args, panelSafeCaps()...)
-	args = append(args,
-		"--pids-limit=512",
-		"-p", fmt.Sprintf("%d:25565", hostPort),
-	)
-	portForwards := a.loadPortForwards(serverDir)
-	for _, pf := range portForwards {
-		containerPort := 25565
-		args = append(args, "-p", fmt.Sprintf("%d:%d", pf.Public, containerPort))
-		fmt.Printf("[port-forwards] %s: forwarding public %d -> container %d\n", name, pf.Public, containerPort)
+	var digits strings.Builder
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			break
+		}
+		digits.WriteRune(r)
 	}
-	if mcMeta := a.loadMeta(serverDir); mcMeta != nil {
-		if metaRes, ok := mcMeta["resources"].(map[string]any); ok {
-			if ports, ok := metaRes["ports"].([]any); ok {
-				for _, p := range ports {
-					ap := anyToInt(p)
-					if ap > 0 && ap != hostPort {
-						args = append(args, "-p", fmt.Sprintf("%d:%d", ap, ap))
-						fmt.Printf("[port-manage] %s: exposing additional port %d:%d\n", name, ap, ap)
-					}
+	version := digits.String()
+	if version == "" {
+		return ""
+	}
+	parsed, err := strconv.Atoi(version)
+	if err != nil || parsed < minecraftJavaMinVersion || parsed > minecraftJavaMaxVersion {
+		return ""
+	}
+	return fmt.Sprint(parsed)
+}
+
+func minecraftJavaTag(version any) string {
+	clean := normalizeMinecraftJavaVersion(version)
+	if clean == "" {
+		return defaultMinecraftProcessTag
+	}
+	return clean + "-jre"
+}
+
+func minecraftJavaVersionFromTag(raw any) string {
+	tag := strings.TrimSpace(strings.ToLower(fmt.Sprint(raw)))
+	if tag == "" || tag == "<nil>" {
+		return ""
+	}
+	if idx := strings.LastIndex(tag, ":"); idx >= 0 && idx+1 < len(tag) {
+		tag = tag[idx+1:]
+	}
+	return normalizeMinecraftJavaVersion(tag)
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
+}
+
+func mergeMinecraftJavaVersions(discovered []string) []string {
+	seen := make(map[int]struct{})
+	for _, raw := range fallbackMinecraftJavaVersions {
+		if clean := normalizeMinecraftJavaVersion(raw); clean != "" {
+			if n, err := strconv.Atoi(clean); err == nil {
+				seen[n] = struct{}{}
+			}
+		}
+	}
+	for _, raw := range discovered {
+		if clean := normalizeMinecraftJavaVersion(raw); clean != "" {
+			if n, err := strconv.Atoi(clean); err == nil {
+				seen[n] = struct{}{}
+			}
+		}
+	}
+	nums := make([]int, 0, len(seen))
+	for n := range seen {
+		nums = append(nums, n)
+	}
+	sort.Ints(nums)
+	out := make([]string, 0, len(nums))
+	for _, n := range nums {
+		out = append(out, fmt.Sprint(n))
+	}
+	return out
+}
+
+func extractMinecraftJavaVersionsFromDockerHubPayload(payload dockerHubTagsResponse) []string {
+	versions := []string{}
+	for _, result := range payload.Results {
+		name := strings.TrimSpace(strings.ToLower(result.Name))
+		if !strings.HasSuffix(name, "-jre") {
+			continue
+		}
+		prefix := strings.TrimSuffix(name, "-jre")
+		if prefix == "" || strings.ContainsAny(prefix, ".-_") {
+			continue
+		}
+		if version := normalizeMinecraftJavaVersion(prefix); version != "" {
+			versions = append(versions, version)
+		}
+	}
+	return versions
+}
+
+func discoverMinecraftJavaVersions(ctx context.Context) ([]string, bool) {
+	discovered := []string{}
+	nextURL := minecraftJavaDiscoveryURL
+	client := &http.Client{Timeout: minecraftJavaDiscoveryTimeout}
+	ok := false
+	for page := 0; page < 5 && nextURL != ""; page++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
+		if err != nil {
+			break
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			break
+		}
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				nextURL = ""
+				return
+			}
+			ok = true
+			var payload dockerHubTagsResponse
+			if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&payload); err != nil {
+				nextURL = ""
+				return
+			}
+			discovered = append(discovered, extractMinecraftJavaVersionsFromDockerHubPayload(payload)...)
+			next := strings.TrimSpace(payload.Next)
+			if next == "" || !strings.HasPrefix(next, "https://hub.docker.com/v2/repositories/library/eclipse-temurin/tags") {
+				nextURL = ""
+				return
+			}
+			nextURL = next
+		}()
+	}
+	return mergeMinecraftJavaVersions(discovered), ok
+}
+
+func minecraftJavaVersions() []string {
+	now := time.Now()
+	minecraftJavaVersionsMu.Lock()
+	if len(minecraftJavaVersionsCache) > 0 && now.Before(minecraftJavaVersionsCacheExpireAt) {
+		cached := cloneStringSlice(minecraftJavaVersionsCache)
+		minecraftJavaVersionsMu.Unlock()
+		return cached
+	}
+	minecraftJavaVersionsMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), minecraftJavaDiscoveryTimeout)
+	discovered, ok := discoverMinecraftJavaVersions(ctx)
+	cancel()
+	if len(discovered) == 0 {
+		discovered = mergeMinecraftJavaVersions(nil)
+	}
+
+	minecraftJavaVersionsMu.Lock()
+	minecraftJavaVersionsCache = cloneStringSlice(discovered)
+	if ok {
+		minecraftJavaVersionsCacheExpireAt = time.Now().Add(minecraftJavaDiscoveryTTL)
+	} else {
+		minecraftJavaVersionsCacheExpireAt = time.Now().Add(minecraftJavaDiscoveryFailTTL)
+	}
+	out := cloneStringSlice(minecraftJavaVersionsCache)
+	minecraftJavaVersionsMu.Unlock()
+	return out
+}
+
+func minecraftJavaOptionsPayload(selected string) map[string]any {
+	selected = normalizeMinecraftJavaVersion(selected)
+	if selected == "" {
+		selected = minecraftJavaVersionFromTag(defaultMinecraftProcessTag)
+	}
+	if selected == "" {
+		selected = "21"
+	}
+	versions := minecraftJavaVersions()
+	hasSelected := false
+	for _, version := range versions {
+		if version == selected {
+			hasSelected = true
+			break
+		}
+	}
+	if !hasSelected {
+		versions = mergeMinecraftJavaVersions(append(versions, selected))
+	}
+	options := make([]map[string]string, 0, len(versions))
+	for _, version := range versions {
+		options = append(options, map[string]string{
+			"version": version,
+			"tag":     minecraftJavaTag(version),
+			"label":   "Java " + version,
+		})
+	}
+	return map[string]any{
+		"selected": selected,
+		"image":    defaultMinecraftProcessImage,
+		"tag":      minecraftJavaTag(selected),
+		"options":  options,
+	}
+}
+
+func sanitizeRuntimeCommand(raw any) string {
+	s := strings.ReplaceAll(fmt.Sprint(raw), "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = strings.TrimSpace(s)
+	if len(s) > maxRuntimeCommandLen {
+		s = s[:maxRuntimeCommandLen]
+	}
+	if s == "<nil>" {
+		return ""
+	}
+	return s
+}
+
+func stripLegacyStartupCommandFields(meta map[string]any) bool {
+	if meta == nil {
+		return false
+	}
+	changed := false
+	if _, ok := meta["startupCommand"]; ok {
+		delete(meta, "startupCommand")
+		changed = true
+	}
+	if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
+		if _, ok := runtimeObj["startupCommand"]; ok {
+			delete(runtimeObj, "startupCommand")
+			meta["runtime"] = runtimeObj
+			changed = true
+		}
+	}
+	return changed
+}
+
+func defaultStartFileForType(tpl string) string {
+	switch strings.ToLower(strings.TrimSpace(tpl)) {
+	case "minecraft":
+		return "server.jar"
+	case "python":
+		return "main.py"
+	case "nodejs", "discord-bot":
+		return "index.js"
+	default:
+		return ""
+	}
+}
+
+func defaultDataDirForType(tpl string) string {
+	switch strings.ToLower(strings.TrimSpace(tpl)) {
+	case "python", "nodejs", "discord-bot", "runtime":
+		return "/app"
+	default:
+		return "/data"
+	}
+}
+
+func hasManagedRuntimeDefaults(tpl string) bool {
+	switch strings.ToLower(strings.TrimSpace(tpl)) {
+	case "minecraft", "python", "nodejs", "discord-bot", "runtime":
+		return true
+	default:
+		return false
+	}
+}
+
+func isManagedProcessRuntime(tpl string) bool {
+	switch strings.ToLower(strings.TrimSpace(tpl)) {
+	case "python", "nodejs", "discord-bot", "runtime":
+		return true
+	default:
+		return false
+	}
+}
+
+func defaultRuntimeCommandForType(tpl, startFile, dataDir string) string {
+	switch strings.ToLower(strings.TrimSpace(tpl)) {
+	case "minecraft":
+		return defaultMinecraftProcessCommand
+	case "python":
+		if startFile == "" {
+			startFile = "main.py"
+		}
+		return fmt.Sprintf("python %s/%s", strings.TrimRight(dataDir, "/"), startFile)
+	case "nodejs", "discord-bot":
+		if startFile == "" {
+			startFile = "index.js"
+		}
+		return fmt.Sprintf("node %s/%s", strings.TrimRight(dataDir, "/"), startFile)
+	default:
+		return ""
+	}
+}
+
+func (a *Agent) inferRuntimeProcessCommandFromImage(ctx context.Context, tpl, imageRef, startFile, dataDir, fallbackCommand string) (string, string, imageConfig, error) {
+	cleanTemplate := strings.ToLower(strings.TrimSpace(tpl))
+	cleanImageRef := strings.TrimSpace(imageRef)
+	cleanStartFile := strings.TrimSpace(startFile)
+	providedDataDir := strings.TrimSpace(dataDir) != ""
+	cleanDataDir := strings.TrimSpace(dataDir)
+	if cleanStartFile == "" {
+		cleanStartFile = defaultStartFileForType(cleanTemplate)
+	}
+	if cleanDataDir == "" {
+		cleanDataDir = defaultDataDirForType(cleanTemplate)
+	}
+
+	fallback := sanitizeRuntimeCommand(fallbackCommand)
+	if fallback == "" {
+		fallback = defaultRuntimeCommandForType(cleanTemplate, cleanStartFile, cleanDataDir)
+	}
+	inspected := imageConfig{Env: map[string]string{}}
+
+	if cleanImageRef != "" {
+		if !a.docker.imageExistsLocally(ctx, cleanImageRef) {
+			a.docker.pull(ctx, cleanImageRef)
+		}
+
+		imgCfg := a.docker.inspectImageConfig(ctx, cleanImageRef)
+		inspected = imgCfg
+		if !providedDataDir {
+			if wd := strings.TrimSpace(imgCfg.Workdir); wd != "" {
+				cleanDataDir = wd
+			}
+		}
+
+		candidate := runtimeCommandFromImageConfig(imgCfg)
+		if candidate != "" {
+			candidate = normalizeLegacyRuntimeProcessCommand(cleanTemplate, candidate, cleanStartFile, cleanDataDir)
+			if shouldPreferImageDefaultRuntimeCommand(candidate, imgCfg) {
+				return candidate, "image-default", inspected, nil
+			}
+			if reason := validateRuntimeProcessCommand(candidate); reason == "" {
+				return candidate, "image-inspect", inspected, nil
+			}
+		}
+	}
+
+	fallback = normalizeLegacyRuntimeProcessCommand(cleanTemplate, fallback, cleanStartFile, cleanDataDir)
+	if reason := validateRuntimeProcessCommand(fallback); reason != "" {
+		return "", "", inspected, fmt.Errorf("%s", reason)
+	}
+	if fallback != "" {
+		return fallback, "template-default", inspected, nil
+	}
+
+	return "", "", inspected, fmt.Errorf("no startup command could be inferred")
+}
+
+func metaIntValue(meta map[string]any, key string, fallback int) int {
+	if meta == nil {
+		return fallback
+	}
+	resources, _ := meta["resources"].(map[string]any)
+	if resources == nil {
+		return fallback
+	}
+	switch v := resources[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func metaFloatValue(meta map[string]any, key string, fallback float64) float64 {
+	if meta == nil {
+		return fallback
+	}
+	resources, _ := meta["resources"].(map[string]any)
+	if resources == nil {
+		return fallback
+	}
+	switch v := resources[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case string:
+		if parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func effectiveRamMb(resources *resourceLimits, meta map[string]any, fallback int) int {
+	if resources != nil && resources.RamMb != nil && *resources.RamMb > 0 {
+		return *resources.RamMb
+	}
+	return metaIntValue(meta, "ramMb", fallback)
+}
+
+func effectiveCpuCores(resources *resourceLimits, meta map[string]any, fallback float64) float64 {
+	if resources != nil && resources.CpuCores != nil && *resources.CpuCores > 0 {
+		return *resources.CpuCores
+	}
+	return metaFloatValue(meta, "cpuCores", fallback)
+}
+
+func resourceLimitsFromMeta(meta map[string]any) *resourceLimits {
+	rm, ok := meta["resources"].(map[string]any)
+	if !ok || rm == nil {
+		return nil
+	}
+	resources := &resourceLimits{}
+	if v := anyToInt(rm["ramMb"]); v > 0 {
+		i := v
+		resources.RamMb = &i
+	}
+	if v := anyToFloat64(rm["cpuCores"]); v > 0 {
+		resources.CpuCores = &v
+	}
+	if v := anyToInt(rm["storageMb"]); v > 0 {
+		i := v
+		resources.StorageMb = &i
+	} else if v := anyToInt(rm["storageGb"]); v > 0 {
+		i := v * 1024
+		resources.StorageMb = &i
+	}
+	if _, ok := rm["swapMb"]; ok {
+		i := anyToInt(rm["swapMb"])
+		resources.SwapMb = &i
+	}
+	if v := anyToInt(rm["backupsMax"]); v > 0 {
+		i := v
+		resources.BackupsMax = &i
+	}
+	if v := anyToInt(rm["maxSchedules"]); v > 0 {
+		i := v
+		resources.MaxSchedules = &i
+	}
+	if v := anyToInt(rm["ioWeight"]); v > 0 {
+		i := v
+		resources.IoWeight = &i
+	}
+	if v := anyToInt(rm["cpuWeight"]); v > 0 {
+		i := v
+		resources.CpuWeight = &i
+	}
+	if v := anyToInt(rm["pidsLimit"]); v > 0 {
+		i := v
+		resources.PidsLimit = &i
+	}
+	if v := anyToInt(rm["fileLimit"]); v > 0 {
+		i := v
+		resources.FileLimit = &i
+	}
+	if v := anyToInt64(rm["networkInboundLimitMb"]); v > 0 {
+		i := v
+		resources.NetworkInboundLimitMb = &i
+	}
+	if v := anyToInt64(rm["networkOutboundLimitMb"]); v > 0 {
+		i := v
+		resources.NetworkOutboundLimitMb = &i
+	}
+	if v := anyToInt(rm["networkResetMinutes"]); v > 0 {
+		i := v
+		resources.NetworkResetMinutes = &i
+	}
+	return resources
+}
+
+func renderRuntimeCommandTemplate(command, dataDir, startFile, imageRef string, hostPort int, resources *resourceLimits, meta map[string]any) string {
+	cmd := sanitizeRuntimeCommand(command)
+	if cmd == "" {
+		return ""
+	}
+	ramMb := effectiveRamMb(resources, meta, 2048)
+	cpuCores := effectiveCpuCores(resources, meta, 1)
+	values := map[string]string{
+		"PORT":          fmt.Sprint(hostPort),
+		"SERVER_PORT":   fmt.Sprint(hostPort),
+		"DATA_DIR":      dataDir,
+		"START_FILE":    startFile,
+		"RAM_MB":        fmt.Sprint(ramMb),
+		"SERVER_MEMORY": fmt.Sprint(ramMb),
+		"CPU_CORES":     strconv.FormatFloat(cpuCores, 'f', -1, 64),
+		"IMAGE":         imageRef,
+	}
+	if meta != nil {
+		if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
+			for key, value := range runtimeEnvMap(runtimeObj["env"]) {
+				envKey := strings.TrimSpace(key)
+				if envKey != "" {
+					values[envKey] = value
 				}
 			}
 		}
 	}
-	args = append(args,
-		"-v", fmt.Sprintf("%s:/data", serverDir),
-		"-e", "EULA=TRUE",
-		"-e", "TYPE=CUSTOM",
-		"-e", "CUSTOM_SERVER=/data/server.jar",
-		"-e", "ENABLE_RCON=false",
-		"-e", "CREATE_CONSOLE_IN_PIPE=true",
-		"-e", fmt.Sprintf("UID=%d", uid),
-		"-e", fmt.Sprintf("GID=%d", gid),
+	replacer := strings.NewReplacer(
+		"{PORT}", values["PORT"],
+		"{SERVER_PORT}", values["SERVER_PORT"],
+		"{DATA_DIR}", values["DATA_DIR"],
+		"{START_FILE}", values["START_FILE"],
+		"{RAM_MB}", values["RAM_MB"],
+		"{SERVER_MEMORY}", values["SERVER_MEMORY"],
+		"{CPU_CORES}", values["CPU_CORES"],
+		"{IMAGE}", values["IMAGE"],
 	)
+	rendered := replacer.Replace(cmd)
+	doubleBraceReplacer := regexp.MustCompile(`\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}`)
+	rendered = doubleBraceReplacer.ReplaceAllStringFunc(rendered, func(token string) string {
+		match := doubleBraceReplacer.FindStringSubmatch(token)
+		if len(match) != 2 {
+			return token
+		}
+		key := strings.TrimSpace(match[1])
+		if key == "server.build.default.port" {
+			if hostPort > 0 {
+				return fmt.Sprint(hostPort)
+			}
+			return token
+		}
+		if strings.HasPrefix(key, "env.") {
+			key = strings.TrimPrefix(key, "env.")
+		}
+		if value, ok := values[key]; ok {
+			return value
+		}
+		return token
+	})
+	return strings.TrimSpace(rendered)
+}
 
-	for k, v := range extraEnv {
-		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+func isPythonRuntimeExecutable(execName string) bool {
+	execName = strings.ToLower(strings.TrimSpace(execName))
+	return execName == "python" || strings.HasPrefix(execName, "python3") || strings.HasPrefix(execName, "python2")
+}
+
+func isNodeRuntimeExecutable(execName string) bool {
+	execName = strings.ToLower(strings.TrimSpace(execName))
+	return execName == "node" || execName == "nodejs"
+}
+
+func firstRuntimeCommandFileTarget(args []string, startIndex int, extensions map[string]bool) string {
+	for i := startIndex + 1; i < len(args); i++ {
+		token := strings.TrimSpace(args[i])
+		if token == "" || token == "--" {
+			continue
+		}
+		if strings.HasPrefix(token, "-") {
+			continue
+		}
+		ext := strings.ToLower(path.Ext(strings.SplitN(token, "?", 2)[0]))
+		if extensions[ext] {
+			return token
+		}
+	}
+	return ""
+}
+
+func containerPathToServerPath(serverDir, dataDir, workdir, rawPath string) string {
+	clean := strings.TrimSpace(rawPath)
+	if clean == "" || strings.Contains(clean, "\x00") {
+		return ""
+	}
+	clean = strings.ReplaceAll(clean, "\\", "/")
+
+	var rel string
+	if path.IsAbs(clean) {
+		for _, root := range []string{dataDir, workdir} {
+			root = path.Clean(strings.TrimSpace(root))
+			if root == "" || root == "." || root == "/" {
+				continue
+			}
+			if clean == root {
+				return ""
+			}
+			prefix := strings.TrimRight(root, "/") + "/"
+			if strings.HasPrefix(clean, prefix) {
+				rel = strings.TrimPrefix(clean, prefix)
+				break
+			}
+		}
+		if rel == "" {
+			return ""
+		}
+	} else {
+		rel = clean
+	}
+
+	rel = path.Clean("/" + rel)
+	rel = strings.TrimPrefix(rel, "/")
+	if rel == "" || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return ""
+	}
+	return filepath.Join(serverDir, filepath.FromSlash(rel))
+}
+
+func ensureRuntimeEntrypointScaffold(serverDir, tpl, commandTemplate, dataDir, workdir, startFile string, hostPort int) {
+	command := sanitizeRuntimeCommand(commandTemplate)
+	if command == "" {
+		return
+	}
+	args := parseShellArgs(command)
+	execName, execIndex := resolveRuntimeProcessExecutable(args)
+	if execIndex < 0 {
+		return
+	}
+
+	if isPythonRuntimeExecutable(execName) {
+		target := firstRuntimeCommandFileTarget(args, execIndex, map[string]bool{".py": true})
+		if target == "" && strings.EqualFold(strings.TrimSpace(tpl), "python") {
+			if startFile == "" {
+				startFile = "main.py"
+			}
+			target = path.Join(strings.TrimRight(dataDir, "/"), startFile)
+		}
+		hostPath := containerPathToServerPath(serverDir, dataDir, workdir, target)
+		if hostPath != "" {
+			writeGeneratedRuntimeFile(hostPath, []byte(pythonMainTemplate), isLegacyPythonScaffold)
+		}
+		return
+	}
+
+	if isNodeRuntimeExecutable(execName) {
+		target := firstRuntimeCommandFileTarget(args, execIndex, map[string]bool{".js": true, ".mjs": true, ".cjs": true})
+		normalizedTpl := strings.ToLower(strings.TrimSpace(tpl))
+		if target == "" && (normalizedTpl == "nodejs" || normalizedTpl == "discord-bot") {
+			if startFile == "" {
+				startFile = "index.js"
+			}
+			target = path.Join(strings.TrimRight(dataDir, "/"), startFile)
+		}
+		hostPath := containerPathToServerPath(serverDir, dataDir, workdir, target)
+		if hostPath != "" {
+			writeGeneratedRuntimeFile(hostPath, []byte(buildNodeIndexTemplate(hostPort)), isLegacyNodeScaffold)
+		}
+	}
+}
+
+func parseVolumeSpecContainerPath(spec string) string {
+	parts := strings.Split(spec, ":")
+	if len(parts) < 2 {
+		return ""
+	}
+	containerPath := strings.TrimSpace(parts[1])
+	if idx := strings.LastIndex(containerPath, ":"); idx > 0 {
+		containerPath = containerPath[:idx]
+	}
+	return strings.TrimSpace(containerPath)
+}
+
+func replaceVolumeSpecContainerPath(spec, containerPath string) string {
+	cleanTarget := strings.TrimSpace(containerPath)
+	if cleanTarget == "" {
+		return spec
+	}
+	parts := strings.Split(spec, ":")
+	if len(parts) < 2 {
+		return spec
+	}
+	parts[1] = cleanTarget
+	return strings.Join(parts, ":")
+}
+
+func imageConfigHasRuntimeDefault(cfg imageConfig) bool {
+	return len(trimRuntimeProcessArgs(cfg.Entrypoint)) > 0 || len(trimRuntimeProcessArgs(cfg.Cmd)) > 0
+}
+
+func imageConfigDeclaresVolume(cfg imageConfig, containerPath string) bool {
+	cleanPath := path.Clean(strings.TrimSpace(containerPath))
+	if cleanPath == "." || cleanPath == "/" || cleanPath == "" {
+		return false
+	}
+	for _, volumePath := range cfg.Volumes {
+		if path.Clean(strings.TrimSpace(volumePath)) == cleanPath {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) inspectRuntimeImageConfig(ctx context.Context, imageRef string) imageConfig {
+	cleanImageRef := strings.TrimSpace(imageRef)
+	if cleanImageRef == "" {
+		return imageConfig{Env: map[string]string{}}
+	}
+	if !a.docker.imageExistsLocally(ctx, cleanImageRef) {
+		a.docker.pull(ctx, cleanImageRef)
+	}
+	return a.docker.inspectImageConfig(ctx, cleanImageRef)
+}
+
+func sanitizeCustomImageDefaultBinds(imageRef string, imgCfg imageConfig, binds []string, dataDir string) ([]string, string) {
+	workdir := path.Clean(strings.TrimSpace(imgCfg.Workdir))
+	if workdir == "" || workdir == "." || workdir == "/" || !imageConfigHasRuntimeDefault(imgCfg) || imageConfigDeclaresVolume(imgCfg, workdir) {
+		return binds, dataDir
+	}
+
+	gameDataPath := ""
+	if isGameServerDockerImage(imageRef) {
+		gameDataPath = path.Clean(getGameServerDataPath(imageRef))
+	}
+	if gameDataPath == "." || gameDataPath == "/" || gameDataPath == workdir {
+		gameDataPath = ""
+	}
+
+	changed := false
+	out := make([]string, 0, len(binds))
+	for _, bind := range binds {
+		containerPath := path.Clean(parseVolumeSpecContainerPath(bind))
+		if containerPath == workdir {
+			if gameDataPath != "" {
+				out = append(out, replaceVolumeSpecContainerPath(bind, gameDataPath))
+				if path.Clean(strings.TrimSpace(dataDir)) == workdir {
+					dataDir = gameDataPath
+				}
+				changed = true
+				fmt.Printf("[docker] remapped volume away from image workdir for %s: %s -> %s\n", imageRef, workdir, gameDataPath)
+				continue
+			}
+			changed = true
+			fmt.Printf("[docker] skipped volume that would hide image workdir for %s: %s\n", imageRef, bind)
+			continue
+		}
+		out = append(out, bind)
+	}
+
+	if !changed {
+		return binds, dataDir
+	}
+	if len(out) == 0 {
+		return nil, ""
+	}
+	return out, dataDir
+}
+
+func runtimeStringSlice(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, entry := range v {
+			clean := strings.TrimSpace(entry)
+			if clean != "" && clean != "<nil>" {
+				out = append(out, clean)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, entry := range v {
+			clean := strings.TrimSpace(fmt.Sprint(entry))
+			if clean != "" && clean != "<nil>" {
+				out = append(out, clean)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func runtimeIntSlice(raw any) []int {
+	switch v := raw.(type) {
+	case []int:
+		out := make([]int, 0, len(v))
+		for _, entry := range v {
+			if port, ok := parseStrictPortValue(entry); ok {
+				out = append(out, port)
+			}
+		}
+		return out
+	case []float64:
+		out := make([]int, 0, len(v))
+		for _, entry := range v {
+			if port, ok := parseStrictPortValue(entry); ok {
+				out = append(out, port)
+			}
+		}
+		return out
+	case []string:
+		out := make([]int, 0, len(v))
+		for _, entry := range v {
+			if port, ok := parseStrictPortValue(entry); ok {
+				out = append(out, port)
+			}
+		}
+		return out
+	case []any:
+		out := make([]int, 0, len(v))
+		for _, entry := range v {
+			if port, ok := parseStrictPortValue(entry); ok {
+				out = append(out, port)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func runtimeEnvMap(raw any) map[string]string {
+	out := map[string]string{}
+	switch v := raw.(type) {
+	case map[string]string:
+		for key, value := range v {
+			envKey := strings.TrimSpace(key)
+			if envKey != "" {
+				out[envKey] = value
+			}
+		}
+	case map[string]any:
+		for key, value := range v {
+			envKey := strings.TrimSpace(key)
+			if envKey != "" {
+				out[envKey] = fmt.Sprint(value)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (a *Agent) resolveStructuredBinds(tpl string, runtimeObj map[string]any, serverDir string) ([]string, string) {
+	defaultDir := defaultDataDirForType(tpl)
+	binds := []string{}
+	primaryDir := defaultDir
+
+	if volumes := runtimeStringSlice(runtimeObj["volumes"]); len(volumes) > 0 {
+		for _, s := range volumes {
+			s = strings.ReplaceAll(s, "{BOT_DIR}", serverDir)
+			s = strings.ReplaceAll(s, "{SERVER_DIR}", serverDir)
+			s = strings.ReplaceAll(s, "{DATA_DIR}", serverDir)
+
+			parts := strings.SplitN(s, ":", 2)
+			if len(parts) >= 2 {
+				hostPath := filepath.Clean(parts[0])
+				if err := ensureResolvedUnder(a.volumesDir, hostPath); err != nil {
+					fmt.Printf("[security] blocked volume mount outside volumes dir: %s\n", s)
+					continue
+				}
+				containerPath := parseVolumeSpecContainerPath(s)
+				if containerPath != "" && primaryDir == defaultDir {
+					primaryDir = containerPath
+				}
+			}
+			binds = append(binds, s)
+		}
+	}
+
+	if len(binds) == 0 {
+		binds = []string{fmt.Sprintf("%s:%s", serverDir, defaultDir)}
+		primaryDir = defaultDir
+	}
+	return binds, primaryDir
+}
+
+func addPortBinding(portBindings map[string][]dockerPortBinding, exposed map[string]struct{}, hostPort, containerPort int, protocols []string) {
+	if hostPort <= 0 || containerPort <= 0 {
+		return
+	}
+	cleanProtocols := normalizePortProtocolSlice(protocols)
+	if len(cleanProtocols) == 0 {
+		cleanProtocols = []string{"tcp"}
+	}
+	for _, protocol := range cleanProtocols {
+		key := fmt.Sprintf("%d/%s", containerPort, protocol)
+		exposed[key] = struct{}{}
+		duplicate := false
+		for _, binding := range portBindings[key] {
+			if binding.HostPort == fmt.Sprint(hostPort) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		portBindings[key] = append(portBindings[key], dockerPortBinding{
+			HostIP:   "0.0.0.0",
+			HostPort: fmt.Sprint(hostPort),
+		})
+	}
+}
+
+func (a *Agent) buildStructuredPortBindings(serverDir string, meta map[string]any, hostPort, mainContainerPort int) (map[string][]dockerPortBinding, map[string]struct{}) {
+	portBindings := make(map[string][]dockerPortBinding)
+	exposed := make(map[string]struct{})
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	protocolsByPort := runtimePortProtocolMap(runtimeObj["portProtocols"])
+	addPortBinding(portBindings, exposed, hostPort, mainContainerPort, portProtocolsFor(protocolsByPort, mainContainerPort))
+
+	if metaRes, ok := meta["resources"].(map[string]any); ok {
+		for _, ap := range runtimeIntSlice(metaRes["ports"]) {
+			if ap > 0 && ap != hostPort {
+				addPortBinding(portBindings, exposed, ap, ap, portProtocolsFor(protocolsByPort, ap))
+				fmt.Printf("[port-manage] exposing additional port %d:%d\n", ap, ap)
+			}
+		}
+	}
+
+	for _, pf := range a.loadPortForwards(serverDir) {
+		targetPort := pf.Internal
+		if hostPort > 0 && pf.Internal == hostPort && mainContainerPort > 0 {
+			targetPort = mainContainerPort
+		}
+		addPortBinding(portBindings, exposed, pf.Public, targetPort, portProtocolsFor(protocolsByPort, targetPort))
+	}
+	return portBindings, exposed
+}
+
+func dockerRestartPolicyFromName(name string) dockerRestartPolicy {
+	clean := strings.ToLower(strings.TrimSpace(name))
+	switch clean {
+	case "no", "":
+		return dockerRestartPolicy{Name: "no"}
+	case "always":
+		return dockerRestartPolicy{Name: "always"}
+	case "on-failure":
+		return dockerRestartPolicy{Name: "on-failure"}
+	default:
+		return dockerRestartPolicy{Name: "unless-stopped"}
+	}
+}
+
+func buildStructuredHostConfig(binds []string, portBindings map[string][]dockerPortBinding, resources *resourceLimits, restart string, readOnly bool) dockerHostConfig {
+	pidsLimit := int64(defaultPidsLimit)
+	if resources != nil && resources.PidsLimit != nil && *resources.PidsLimit >= minPidsLimit && *resources.PidsLimit <= maxPidsLimit {
+		pidsLimit = int64(*resources.PidsLimit)
+	}
+
+	hostConfig := dockerHostConfig{
+		Binds:         binds,
+		PortBindings:  portBindings,
+		RestartPolicy: dockerRestartPolicyFromName(restart),
+		CapDrop:       []string{"ALL"},
+		CapAdd: []string{
+			"CHOWN",
+			"DAC_OVERRIDE",
+			"FOWNER",
+			"SETUID",
+			"SETGID",
+			"KILL",
+			"NET_BIND_SERVICE",
+			"NET_RAW",
+			"SYS_CHROOT",
+			"AUDIT_WRITE",
+		},
+		SecurityOpt: []string{"no-new-privileges"},
+		PidsLimit:   pidsLimit,
+	}
+
+	if readOnly {
+		hostConfig.ReadonlyRootfs = true
+		hostConfig.Tmpfs = map[string]string{
+			"/tmp":     "rw,noexec,nosuid,size=256m",
+			"/var/tmp": "rw,noexec,nosuid,size=64m",
+			"/run":     "rw,noexec,nosuid,size=32m",
+		}
 	}
 
 	if resources != nil {
 		if resources.RamMb != nil && *resources.RamMb > 0 {
-			args = append(args, "--memory", fmt.Sprintf("%dm", *resources.RamMb))
-			args = append(args, "--memory-reservation", fmt.Sprintf("%dm", *resources.RamMb*90/100))
-
+			hostConfig.Memory = int64(*resources.RamMb) * 1024 * 1024
+			hostConfig.MemoryReservation = int64(*resources.RamMb*90/100) * 1024 * 1024
 			if resources.SwapMb == nil {
-				args = append(args, "--memory-swap", fmt.Sprintf("%dm", *resources.RamMb))
+				hostConfig.MemorySwap = int64(*resources.RamMb) * 1024 * 1024
 			} else {
 				swapVal := *resources.SwapMb
 				if swapVal == -1 {
-					args = append(args, "--memory-swap", fmt.Sprintf("%dm", *resources.RamMb))
+					hostConfig.MemorySwap = int64(*resources.RamMb) * 1024 * 1024
 				} else if swapVal == 0 {
-					args = append(args, "--memory-swap", "-1")
+					hostConfig.MemorySwap = -1
 				} else {
-					totalSwap := *resources.RamMb + swapVal
-					args = append(args, "--memory-swap", fmt.Sprintf("%dm", totalSwap))
+					hostConfig.MemorySwap = int64(*resources.RamMb+swapVal) * 1024 * 1024
 				}
 			}
 		}
-		if resources.CpuCores != nil && *resources.CpuCores > 0 && *resources.CpuCores <= 128 {
+
+		if resources.CpuCores != nil && *resources.CpuCores > 0 {
 			effCores, _ := computeCpuLimit(*resources.CpuCores)
-			cpuQuota := int64(float64(cpuPeriod) * effCores)
-			args = append(args, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
-			args = append(args, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
-		} else {
-			effCores, _ := computeCpuLimit(0)
-			cpuQuota := int64(float64(cpuPeriod) * effCores)
-			args = append(args, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
-			args = append(args, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
+			hostConfig.CpuPeriod = cpuPeriod
+			hostConfig.CpuQuota = int64(float64(cpuPeriod) * effCores)
+		}
+		if resources.CpuWeight != nil && *resources.CpuWeight >= minCpuWeight && *resources.CpuWeight <= maxCpuWeight {
+			hostConfig.CpuShares = dockerCpuSharesFromWeight(*resources.CpuWeight)
+		}
+		if resources.IoWeight != nil && *resources.IoWeight >= minIoWeight && *resources.IoWeight <= maxIoWeight {
+			hostConfig.BlkioWeight = int64(*resources.IoWeight)
+		}
+		if resources.FileLimit != nil && *resources.FileLimit >= minFileLimit && *resources.FileLimit <= maxFileLimit {
+			limit := int64(*resources.FileLimit)
+			hostConfig.Ulimits = append(hostConfig.Ulimits, dockerUlimit{Name: "nofile", Soft: limit, Hard: limit})
 		}
 	}
 
-	args = append(args, "itzg/minecraft-server:latest")
-	_, errStr, _, err := a.docker.runCollect(ctx, args...)
-	if err != nil {
-		if a.debug {
-			fmt.Printf("[docker] minecraft container error: %s\n", strings.TrimSpace(errStr))
+	return hostConfig
+}
+
+func envMapToList(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(env))
+	for k, v := range env {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
 		}
-		return fmt.Errorf("container start failed")
+		out = append(out, fmt.Sprintf("%s=%s", k, v))
+	}
+	return out
+}
+
+func isBlockedRuntimeShellExecutable(arg string) bool {
+	switch runtimeProcessBaseExecutable(arg) {
+	case "sh", "bash", "ash", "dash", "zsh", "ksh":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRuntimeShellWrapperArgs(args []string, execIndex int) bool {
+	if execIndex < 0 || execIndex >= len(args) {
+		return false
+	}
+	if !isBlockedRuntimeShellExecutable(args[execIndex]) {
+		return false
+	}
+	if execIndex+1 >= len(args) {
+		return false
+	}
+	flags := strings.ToLower(strings.TrimSpace(args[execIndex+1]))
+	return strings.HasPrefix(flags, "-") && strings.Contains(flags, "c")
+}
+
+func isBlockedRuntimeShellToken(arg string) bool {
+	switch strings.TrimSpace(arg) {
+	case "&&", "||", "|", ";", "&", ">", ">>", "<", "<<", "2>", "2>>", "2>&1", "|&":
+		return true
+	default:
+		return false
+	}
+}
+
+func runtimeProcessBaseExecutable(arg string) string {
+	clean := strings.TrimSpace(arg)
+	if clean == "" {
+		return ""
+	}
+	if strings.IndexFunc(clean, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' || r == '\r' }) >= 0 {
+		if nested := parseShellArgs(clean); len(nested) > 0 {
+			clean = strings.TrimSpace(nested[0])
+		}
+	}
+	clean = strings.ToLower(strings.ReplaceAll(clean, "\\", "/"))
+	if slash := strings.LastIndex(clean, "/"); slash >= 0 && slash+1 < len(clean) {
+		return clean[slash+1:]
+	}
+	return clean
+}
+
+func isRuntimeEnvAssignmentToken(arg string) bool {
+	token := strings.TrimSpace(arg)
+	if token == "" || strings.HasPrefix(token, "-") {
+		return false
+	}
+	eqIdx := strings.Index(token, "=")
+	if eqIdx <= 0 {
+		return false
+	}
+	key := token[:eqIdx]
+	for i, r := range key {
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		isDigit := r >= '0' && r <= '9'
+		if i == 0 {
+			if r != '_' && !isLetter {
+				return false
+			}
+			continue
+		}
+		if r != '_' && !isLetter && !isDigit {
+			return false
+		}
+	}
+	return true
+}
+
+func resolveRuntimeProcessExecutable(args []string) (string, int) {
+	if len(args) == 0 {
+		return "", -1
+	}
+	for index := 0; index < len(args); index++ {
+		token := strings.TrimSpace(args[index])
+		if token == "" {
+			continue
+		}
+		execName := runtimeProcessBaseExecutable(token)
+		if execName == "env" {
+			index++
+			for index < len(args) {
+				envToken := strings.TrimSpace(args[index])
+				if envToken == "" {
+					index++
+					continue
+				}
+				if envToken == "--" {
+					index++
+					break
+				}
+				if strings.HasPrefix(envToken, "-") || isRuntimeEnvAssignmentToken(envToken) {
+					index++
+					continue
+				}
+				break
+			}
+			index--
+			continue
+		}
+		return execName, index
+	}
+	return "", -1
+}
+
+func isBlockedContainerRuntimeExecutable(arg string) bool {
+	switch strings.TrimSpace(arg) {
+	case "docker", "docker-compose", "podman", "podman-compose", "nerdctl", "ctr":
+		return true
+	default:
+		return false
+	}
+}
+
+func unwrapRuntimeShellWrapper(cmd string) (string, bool) {
+	args := parseShellArgs(cmd)
+	if len(args) < 3 {
+		return "", false
+	}
+	if !isBlockedRuntimeShellExecutable(args[0]) {
+		return "", false
+	}
+	flags := strings.TrimSpace(args[1])
+	if !strings.HasPrefix(flags, "-") || !strings.Contains(flags, "c") {
+		return "", false
+	}
+	inner := sanitizeRuntimeCommand(args[2])
+	if inner == "" {
+		return "", false
+	}
+	return inner, true
+}
+
+func normalizeLegacyRuntimeProcessCommand(tpl, command, startFile, dataDir string) string {
+	clean := sanitizeRuntimeCommand(command)
+	if clean == "" {
+		return ""
+	}
+	for i := 0; i < 2; i++ {
+		inner, ok := unwrapRuntimeShellWrapper(clean)
+		if !ok {
+			break
+		}
+		clean = sanitizeRuntimeCommand(inner)
+	}
+	switch strings.ToLower(strings.TrimSpace(tpl)) {
+	case "nodejs", "discord-bot":
+		lower := strings.ToLower(clean)
+		nodeIdx := strings.LastIndex(lower, "node ")
+		if nodeIdx >= 0 && (strings.Contains(lower, "&&") || strings.HasPrefix(lower, "npm ") || strings.HasPrefix(lower, "cd ")) {
+			clean = sanitizeRuntimeCommand(clean[nodeIdx:])
+		}
+	}
+	return clean
+}
+
+func looksLikePathOnlyScriptRuntimeCommand(command string) bool {
+	args := parseShellArgs(command)
+	if len(args) != 1 {
+		return false
+	}
+	token := strings.ToLower(strings.TrimSpace(args[0]))
+	if !strings.HasPrefix(token, "/") {
+		return false
+	}
+	return strings.Contains(token, "entrypoint") || strings.HasSuffix(token, ".sh") || strings.HasSuffix(token, ".bash")
+}
+
+func looksLikeImageDefaultWrapperRuntimeCommand(command string, imgCfg imageConfig) bool {
+	clean := strings.ToLower(strings.TrimSpace(command))
+	if clean == "" {
+		return false
+	}
+	if looksLikePathOnlyScriptRuntimeCommand(command) {
+		return true
+	}
+	entrypoint := trimRuntimeProcessArgs(imgCfg.Entrypoint)
+	cmd := trimRuntimeProcessArgs(imgCfg.Cmd)
+	if len(entrypoint) == 2 && isRuntimeShellName(entrypoint[0]) {
+		script := strings.ToLower(strings.TrimSpace(entrypoint[1]))
+		if strings.HasPrefix(script, "/") && (strings.Contains(script, "entrypoint") || strings.HasSuffix(script, ".sh") || strings.HasSuffix(script, ".bash")) {
+			return true
+		}
+	}
+	if len(cmd) == 1 {
+		script := strings.ToLower(strings.TrimSpace(cmd[0]))
+		if strings.HasPrefix(script, "/") && (strings.Contains(script, "entrypoint") || strings.HasSuffix(script, ".sh") || strings.HasSuffix(script, ".bash")) {
+			return true
+		}
+	}
+	if strings.Contains(clean, "entrypoint") && strings.Contains(clean, "/") {
+		return true
+	}
+	return false
+}
+
+func shouldPreferImageDefaultRuntimeCommand(command string, imgCfg imageConfig) bool {
+	if !imageConfigHasRuntimeDefault(imgCfg) {
+		return false
+	}
+	return looksLikeImageDefaultWrapperRuntimeCommand(command, imgCfg)
+}
+
+func validateRuntimeProcessCommand(command string) string {
+	clean := sanitizeRuntimeCommand(command)
+	if clean == "" {
+		return ""
+	}
+	if len(clean) > 4000 {
+		return "process command is too long"
+	}
+	if strings.Contains(clean, "\n") {
+		return "process command must be a single line"
+	}
+	if strings.Contains(clean, "`") || strings.Contains(clean, "$(") {
+		return "shell expansions are not allowed in process commands"
+	}
+	args := parseShellArgs(clean)
+	if len(args) == 0 {
+		return "process command is empty"
+	}
+	execName, execIndex := resolveRuntimeProcessExecutable(args)
+	if isBlockedContainerRuntimeExecutable(execName) {
+		return `container runtime CLI commands like "docker run" are not allowed; configure image, ports, volumes, env, and the in-container process separately`
+	}
+	if isBlockedRuntimeShellExecutable(execName) && isRuntimeShellWrapperArgs(args, execIndex) {
+		return "shell wrappers like sh -c or bash -lc are not allowed; provide the executable and arguments directly"
+	}
+	for _, arg := range args {
+		if isBlockedRuntimeShellToken(arg) {
+			return fmt.Sprintf("shell control operator %q is not allowed in process commands", strings.TrimSpace(arg))
+		}
+	}
+	return ""
+}
+
+func buildProcessCommandArgs(command string) ([]string, error) {
+	clean := sanitizeRuntimeCommand(command)
+	if clean == "" {
+		return nil, nil
+	}
+	if reason := validateRuntimeProcessCommand(clean); reason != "" {
+		return nil, fmt.Errorf("%s", reason)
+	}
+	args := parseShellArgs(clean)
+	if len(args) == 0 {
+		return nil, fmt.Errorf("process command is empty")
+	}
+	return args, nil
+}
+
+func normalizeContainerWorkdir(value any) string {
+	workdir := strings.TrimSpace(fmt.Sprint(value))
+	if workdir == "" || workdir == "<nil>" {
+		return ""
+	}
+	workdir = strings.ReplaceAll(workdir, "\\", "/")
+	if !strings.HasPrefix(workdir, "/") {
+		return ""
+	}
+	workdir = path.Clean(workdir)
+	if workdir == "" || workdir == "." {
+		return ""
+	}
+	if !strings.HasPrefix(workdir, "/") {
+		workdir = "/" + workdir
+	}
+	return workdir
+}
+
+func buildRenderedRuntimeProcessArgs(tpl, command, dataDir, startFile, imageRef string, hostPort int, resources *resourceLimits, meta map[string]any) ([]string, error) {
+	rendered := renderRuntimeCommandTemplate(command, dataDir, startFile, imageRef, hostPort, resources, meta)
+	rendered = normalizeLegacyRuntimeProcessCommand(tpl, rendered, startFile, dataDir)
+	return buildProcessCommandArgs(rendered)
+}
+
+func (a *Agent) recentContainerLogs(ctx context.Context, name string, tail int) string {
+	tailN := tail
+	if tailN <= 0 {
+		tailN = 50
+	}
+	out, _, _, _ := a.docker.runCollect(ctx, "logs", "--tail", fmt.Sprint(tailN), name)
+	return out
+}
+
+func isImmediateStartupPermissionIssue(logs string) bool {
+	lower := strings.ToLower(strings.TrimSpace(logs))
+	if lower == "" {
+		return false
+	}
+
+	hasPermissionFailure := strings.Contains(lower, "permission denied") ||
+		strings.Contains(lower, "operation not permitted") ||
+		strings.Contains(lower, "cannot execute")
+	if !hasPermissionFailure {
+		return false
+	}
+
+	startupHints := []string{
+		"start.sh",
+		"entrypoint",
+		"docker-entrypoint",
+		"/opt/",
+		"/bin/bash",
+		"/bin/sh",
+		"/usr/local/bin",
+		"exec /",
+	}
+	for _, hint := range startupHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+
+	return true
+}
+
+func isMissingRuntimeExecutableStartError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	if !strings.Contains(lower, "exec:") {
+		return false
+	}
+	return strings.Contains(lower, "no such file or directory") ||
+		strings.Contains(lower, "executable file not found") ||
+		strings.Contains(lower, "stat ") ||
+		strings.Contains(lower, "not found")
+}
+
+func (a *Agent) preferredStructuredContainerUser(ctx context.Context, imageRef string, uid, gid int) string {
+	if uid < 0 || gid < 0 {
+		return ""
+	}
+
+	cleanImageRef := strings.TrimSpace(imageRef)
+	if cleanImageRef != "" {
+		if !a.docker.imageExistsLocally(ctx, cleanImageRef) {
+			a.docker.pull(ctx, cleanImageRef)
+		}
+		imgCfg := a.docker.inspectImageConfig(ctx, cleanImageRef)
+		if strings.TrimSpace(imgCfg.User) != "" {
+			if a.debug {
+				fmt.Printf("[docker] honoring image-defined user %q for %s\n", imgCfg.User, cleanImageRef)
+			}
+			return ""
+		}
+	}
+
+	return fmt.Sprintf("%d:%d", uid, gid)
+}
+
+func hostConfigMemoryLimitMb(cfg dockerHostConfig) float64 {
+	if cfg.Memory <= 0 {
+		return 0
+	}
+	return float64(cfg.Memory) / (1024 * 1024)
+}
+
+func hostConfigCpuLimitPercent(cfg dockerHostConfig) float64 {
+	if cfg.CpuPeriod <= 0 || cfg.CpuQuota <= 0 {
+		return 0
+	}
+	return (float64(cfg.CpuQuota) / float64(cfg.CpuPeriod)) * 100
+}
+
+func almostEqualFloat64(a, b, tolerance float64) bool {
+	diff := a - b
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff <= tolerance
+}
+
+func (a *Agent) inspectContainerHostConfig(ctx context.Context, name string) (dockerHostConfig, error) {
+	inspected, err := a.docker.inspectContainerAPI(ctx, dockerContainerName(name))
+	if err != nil {
+		return dockerHostConfig{}, err
+	}
+	return inspected.HostConfig, nil
+}
+
+func (a *Agent) inspectContainerAppliedLimits(ctx context.Context, name string) (memoryLimitMb float64, cpuLimitPercent float64, err error) {
+	hostConfig, err := a.inspectContainerHostConfig(ctx, name)
+	if err != nil {
+		return 0, 0, err
+	}
+	return hostConfigMemoryLimitMb(hostConfig), hostConfigCpuLimitPercent(hostConfig), nil
+}
+
+type dockerContainerStateForStats struct {
+	Status    string `json:"Status"`
+	Running   bool   `json:"Running"`
+	StartedAt string `json:"StartedAt"`
+}
+
+type dockerContainerInspectForStats struct {
+	ID         string                       `json:"Id"`
+	Name       string                       `json:"Name"`
+	State      dockerContainerStateForStats `json:"State"`
+	HostConfig dockerHostConfig             `json:"HostConfig"`
+}
+
+type dockerStatsCPUUsage struct {
+	TotalUsage  uint64   `json:"total_usage"`
+	PercpuUsage []uint64 `json:"percpu_usage"`
+}
+
+type dockerStatsCPU struct {
+	CPUUsage       dockerStatsCPUUsage `json:"cpu_usage"`
+	SystemCPUUsage uint64              `json:"system_cpu_usage"`
+	OnlineCPUs     uint32              `json:"online_cpus"`
+}
+
+type dockerStatsMemory struct {
+	Usage uint64            `json:"usage"`
+	Limit uint64            `json:"limit"`
+	Stats map[string]uint64 `json:"stats"`
+}
+
+type dockerStatsNetwork struct {
+	RxBytes uint64 `json:"rx_bytes"`
+	TxBytes uint64 `json:"tx_bytes"`
+}
+
+type dockerContainerStatsResponse struct {
+	CPUStats    dockerStatsCPU                `json:"cpu_stats"`
+	PreCPUStats dockerStatsCPU                `json:"precpu_stats"`
+	MemoryStats dockerStatsMemory             `json:"memory_stats"`
+	Networks    map[string]dockerStatsNetwork `json:"networks"`
+}
+
+func (a *Agent) inspectContainerForStats(ctx context.Context, name string) (dockerContainerInspectForStats, bool, error) {
+	dockerName := dockerContainerName(name)
+	body, status, err := a.docker.engineRequest(ctx, http.MethodGet, "/containers/"+url.PathEscape(dockerName)+"/json", nil, nil)
+	if err != nil {
+		return dockerContainerInspectForStats{}, false, err
+	}
+	if status == http.StatusNotFound {
+		return dockerContainerInspectForStats{}, false, nil
+	}
+	if status < 200 || status >= 300 {
+		return dockerContainerInspectForStats{}, false, fmt.Errorf("failed to inspect container %s: %s", name, decodeDockerAPIError(body))
+	}
+
+	var payload dockerContainerInspectForStats
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return dockerContainerInspectForStats{}, false, err
+	}
+	if strings.TrimPrefix(payload.Name, "/") != dockerName {
+		return dockerContainerInspectForStats{}, false, fmt.Errorf("container name mismatch")
+	}
+	return payload, true, nil
+}
+
+func (a *Agent) readContainerStatsForServer(ctx context.Context, name string) (dockerContainerStatsResponse, error) {
+	query := url.Values{}
+	query.Set("stream", "false")
+	dockerName := dockerContainerName(name)
+	body, status, err := a.docker.engineRequest(ctx, http.MethodGet, "/containers/"+url.PathEscape(dockerName)+"/stats", query, nil)
+	if err != nil {
+		return dockerContainerStatsResponse{}, err
+	}
+	if status < 200 || status >= 300 {
+		return dockerContainerStatsResponse{}, fmt.Errorf("failed to read container stats %s: %s", name, decodeDockerAPIError(body))
+	}
+	var payload dockerContainerStatsResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return dockerContainerStatsResponse{}, err
+	}
+	return payload, nil
+}
+
+func dockerCPUPercent(stats dockerContainerStatsResponse) float64 {
+	cpuTotal := stats.CPUStats.CPUUsage.TotalUsage
+	preCPUTime := stats.PreCPUStats.CPUUsage.TotalUsage
+	systemTotal := stats.CPUStats.SystemCPUUsage
+	preSystemTotal := stats.PreCPUStats.SystemCPUUsage
+	if cpuTotal <= preCPUTime || systemTotal <= preSystemTotal {
+		return 0
+	}
+
+	cpuDelta := float64(cpuTotal - preCPUTime)
+	systemDelta := float64(systemTotal - preSystemTotal)
+	if cpuDelta <= 0 || systemDelta <= 0 {
+		return 0
+	}
+
+	onlineCPUs := float64(stats.CPUStats.OnlineCPUs)
+	if onlineCPUs <= 0 {
+		onlineCPUs = float64(len(stats.CPUStats.CPUUsage.PercpuUsage))
+	}
+	if onlineCPUs <= 0 {
+		onlineCPUs = 1
+	}
+	return (cpuDelta / systemDelta) * onlineCPUs * 100
+}
+
+func dockerMemoryUsedBytes(mem dockerStatsMemory) uint64 {
+	usage := mem.Usage
+	if usage == 0 {
+		return 0
+	}
+	if inactiveFile, ok := mem.Stats["inactive_file"]; ok && inactiveFile < usage {
+		return usage - inactiveFile
+	}
+	if cache, ok := mem.Stats["cache"]; ok && cache < usage {
+		return usage - cache
+	}
+	return usage
+}
+
+func sumDockerNetworkBytes(networks map[string]dockerStatsNetwork) (uint64, uint64) {
+	var rx, tx uint64
+	for _, counters := range networks {
+		rx = addUint64Saturating(rx, counters.RxBytes)
+		tx = addUint64Saturating(tx, counters.TxBytes)
+	}
+	return rx, tx
+}
+
+func (a *Agent) verifyContainerResourceLimitsApplied(ctx context.Context, name string, expected dockerHostConfig) error {
+	actual, err := a.inspectContainerHostConfig(ctx, name)
+	if err != nil {
+		return fmt.Errorf("failed to verify container resource limits: %w", err)
+	}
+
+	if expected.Memory > 0 && actual.Memory != expected.Memory {
+		return fmt.Errorf(
+			"container memory limit mismatch: expected %d MB, got %.0f MB",
+			expected.Memory/(1024*1024),
+			hostConfigMemoryLimitMb(actual),
+		)
+	}
+
+	if expected.CpuPeriod > 0 && expected.CpuQuota > 0 {
+		expectedPercent := hostConfigCpuLimitPercent(expected)
+		actualPercent := hostConfigCpuLimitPercent(actual)
+		if !almostEqualFloat64(actualPercent, expectedPercent, 0.05) {
+			return fmt.Errorf(
+				"container cpu limit mismatch: expected %.2f cores, got %.2f cores",
+				expectedPercent/100.0,
+				actualPercent/100.0,
+			)
+		}
+	}
+
+	return nil
+}
+
+func (a *Agent) runStructuredContainerWithCompatUser(ctx context.Context, name string, req dockerContainerCreateRequest) error {
+	dockerName := dockerContainerName(name)
+	cleanupFailedContainer := func(err error) error {
+		return err
+	}
+
+	if err := a.docker.runContainerAPI(ctx, dockerName, req); err != nil {
+		if len(req.Cmd) > 0 && isMissingRuntimeExecutableStartError(err) {
+			imgCfg := a.inspectRuntimeImageConfig(ctx, req.Image)
+			if imageConfigHasRuntimeDefault(imgCfg) {
+				fmt.Printf("[docker] startup command failed for %s (%v); retrying with image default entrypoint/cmd\n", name, err)
+				retryReq := req
+				retryReq.Cmd = nil
+				retryReq.Entrypoint = nil
+				if workdir := normalizeContainerWorkdir(imgCfg.Workdir); workdir != "" {
+					retryReq.WorkingDir = workdir
+				}
+				if retryErr := a.docker.runContainerAPI(ctx, dockerName, retryReq); retryErr != nil {
+					return retryErr
+				}
+				if healthErr := a.verifyContainerHealthyAfterStart(ctx, name); healthErr != nil {
+					return cleanupFailedContainer(healthErr)
+				}
+				if limitErr := a.verifyContainerResourceLimitsApplied(ctx, name, retryReq.HostConfig); limitErr != nil {
+					return limitErr
+				}
+				return nil
+			}
+		}
+		return err
+	}
+	if err := a.verifyContainerHealthyAfterStart(ctx, name); err != nil {
+		forcedUser := strings.TrimSpace(req.User)
+		if forcedUser == "" {
+			return cleanupFailedContainer(err)
+		}
+
+		logCtx, logCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		logsOut := a.recentContainerLogs(logCtx, name, 80)
+		logCancel()
+		if !isImmediateStartupPermissionIssue(logsOut) {
+			return cleanupFailedContainer(err)
+		}
+
+		fmt.Printf("[docker] startup failed under forced user %s for %s; retrying with image default user\n", forcedUser, name)
+		a.docker.rmForce(ctx, name)
+
+		retryReq := req
+		retryReq.User = ""
+		if err := a.docker.runContainerAPI(ctx, dockerName, retryReq); err != nil {
+			return err
+		}
+		if err := a.verifyContainerHealthyAfterStart(ctx, name); err != nil {
+			return cleanupFailedContainer(err)
+		}
+		if err := a.verifyContainerResourceLimitsApplied(ctx, name, retryReq.HostConfig); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := a.verifyContainerResourceLimitsApplied(ctx, name, req.HostConfig); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *Agent) verifyContainerHealthyAfterStart(ctx context.Context, name string) error {
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		time.Sleep(500 * time.Millisecond)
+
+		statusOut, _, _, _ := a.docker.runCollect(ctx, "inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", name)
+		statusParts := strings.Fields(strings.TrimSpace(statusOut))
+		if len(statusParts) == 0 {
+			if time.Now().Before(deadline) {
+				continue
+			}
+			return nil
+		}
+
+		status := statusParts[0]
+		exitStr := "0"
+		if len(statusParts) >= 2 {
+			exitStr = statusParts[1]
+		}
+
+		switch status {
+		case "running":
+			return nil
+		case "created":
+			if time.Now().Before(deadline) {
+				continue
+			}
+			return nil
+		case "restarting":
+			logsOut := a.recentContainerLogs(ctx, name, 50)
+			fmt.Printf("[docker] container %s is restarting after startup; leaving restart policy active and not blocking start. Last logs:\n%s\n", name, logsOut)
+			return nil
+		case "exited", "dead":
+			logsOut := a.recentContainerLogs(ctx, name, 50)
+			fmt.Printf("[docker] container exited after startup. Last logs:\n%s\n", logsOut)
+			logSummary := strings.TrimSpace(logsOut)
+			if len(logSummary) > 1800 {
+				logSummary = logSummary[len(logSummary)-1800:]
+			}
+			if logSummary != "" {
+				logSummary = "; last logs: " + logSummary
+			}
+			return fmt.Errorf("container exited immediately with code %s%s", exitStr, logSummary)
+		default:
+			if time.Now().Before(deadline) {
+				continue
+			}
+			return nil
+		}
+	}
+}
+
+func customBootstrapFailureReason(logs string) string {
+	lower := strings.ToLower(strings.TrimSpace(logs))
+	if lower == "" {
+		return ""
+	}
+
+	if strings.Contains(lower, "state is 0x202 after update job") &&
+		(strings.Contains(lower, "srcds_run: no such file or directory") ||
+			strings.Contains(lower, "tar:") ||
+			strings.Contains(lower, "server.cfg: no such file or directory")) {
+		return "SteamCMD/app install failed and the expected server files are missing"
+	}
+
+	fatalPatterns := []string{
+		"executable file not found",
+		"error during container init",
+		"stat ",
+		"no such file or directory",
+		"permission denied",
+		"error is not recoverable",
+		"cannot open: no such file or directory",
+		"is not a directory",
+		"srcds_run: no such file or directory",
+		"server.cfg: no such file or directory",
+	}
+	score := 0
+	primary := ""
+	for _, line := range strings.Split(lower, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		for _, pattern := range fatalPatterns {
+			if strings.Contains(line, pattern) {
+				score++
+				if primary == "" {
+					primary = strings.TrimSpace(line)
+				}
+				break
+			}
+		}
+	}
+	if score >= 4 {
+		if primary != "" {
+			return primary
+		}
+		return "repeated fatal startup errors detected"
+	}
+	return ""
+}
+
+func logsSuggestBootstrapInProgress(logs string) bool {
+	lower := strings.ToLower(strings.TrimSpace(logs))
+	if lower == "" {
+		return false
+	}
+	patterns := []string{
+		"downloading update",
+		"installing update",
+		"extracting package",
+		"steam console client",
+		"steamcmd",
+		"app_update",
+		"installing",
+		"extracting",
+		"downloading",
+		"npm install",
+		"pip install",
+		"apt-get",
+		"apk add",
+		"composer install",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func summarizeStartupLogs(logs string, maxLen int) string {
+	clean := strings.TrimSpace(logs)
+	if clean == "" {
+		return ""
+	}
+	if maxLen <= 0 {
+		maxLen = 1800
+	}
+	if len(clean) > maxLen {
+		clean = clean[len(clean)-maxLen:]
+	}
+	return clean
+}
+
+type boundedLogWriter struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func newBoundedLogWriter(max int) *boundedLogWriter {
+	if max <= 0 {
+		max = 64 * 1024
+	}
+	return &boundedLogWriter{max: max}
+}
+
+func (w *boundedLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	if len(w.buf) > w.max {
+		w.buf = append([]byte(nil), w.buf[len(w.buf)-w.max:]...)
+	}
+	return len(p), nil
+}
+
+func (w *boundedLogWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(append([]byte(nil), w.buf...))
+}
+
+type setupConsoleWriter struct {
+	agent   *Agent
+	name    string
+	prefix  string
+	mu      sync.Mutex
+	partial string
+}
+
+func newSetupConsoleWriter(agent *Agent, name, prefix string) *setupConsoleWriter {
+	prefix = strings.TrimSuffix(strings.TrimSpace(prefix), ":")
+	if prefix != "stderr" {
+		prefix = "stdout"
+	}
+	return &setupConsoleWriter{agent: agent, name: name, prefix: prefix}
+}
+
+func (w *setupConsoleWriter) Write(p []byte) (int, error) {
+	if w == nil || w.agent == nil || w.name == "" {
+		return len(p), nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	data := w.partial + string(p)
+	data = strings.ReplaceAll(data, "\r\n", "\n")
+	data = strings.ReplaceAll(data, "\r", "\n")
+	parts := strings.Split(data, "\n")
+	if strings.HasSuffix(data, "\n") {
+		w.partial = ""
+	} else {
+		w.partial = parts[len(parts)-1]
+		parts = parts[:len(parts)-1]
+	}
+	for _, line := range parts {
+		w.agent.emitSetupLog(w.name, w.prefix, line)
+	}
+	return len(p), nil
+}
+
+func (w *setupConsoleWriter) Flush() {
+	if w == nil || w.agent == nil || w.name == "" {
+		return
+	}
+	w.mu.Lock()
+	line := w.partial
+	w.partial = ""
+	w.mu.Unlock()
+	if strings.TrimSpace(line) != "" {
+		w.agent.emitSetupLog(w.name, w.prefix, line)
+	}
+}
+
+func normalizeTemplateInstallConfig(raw *templateInstallConfig) *templateInstallConfig {
+	if raw == nil {
+		return nil
+	}
+	script := strings.TrimSpace(strings.ReplaceAll(raw.Script, "\r\n", "\n"))
+	script = strings.ReplaceAll(script, "\r", "\n")
+	if script == "" {
+		return nil
+	}
+	if len(script) > 262144 {
+		script = script[:262144]
+	}
+
+	image := strings.TrimSpace(raw.Image)
+	if image == "" {
+		image = strings.TrimSpace(raw.Container)
+	}
+	if image == "" {
+		image = "ghcr.io/pterodactyl/installers:debian"
+	}
+	if strings.ContainsAny(image, " \t\r\n\x00") {
+		return nil
+	}
+
+	mountPath := normalizeContainerWorkdir(raw.MountPath)
+	if mountPath == "" {
+		mountPath = normalizeContainerWorkdir(raw.ContainerPath)
+	}
+	if mountPath == "" {
+		mountPath = "/mnt/server"
+	}
+	runtimePath := normalizeContainerWorkdir(raw.RuntimePath)
+	if runtimePath == "" {
+		runtimePath = "/home/container"
+	}
+	minimumStorageMb := raw.MinimumStorageMb
+	if minimumStorageMb < 0 {
+		minimumStorageMb = 0
+	}
+
+	env := map[string]string{}
+	for key, value := range raw.Env {
+		envKey := strings.TrimSpace(key)
+		if envKey == "" || strings.ContainsAny(envKey, "\x00=\r\n") {
+			continue
+		}
+		env[envKey] = value
+	}
+
+	clean := &templateInstallConfig{
+		Image:            image,
+		Script:           script,
+		MountPath:        mountPath,
+		RuntimePath:      runtimePath,
+		TimeoutSeconds:   1800,
+		MinimumStorageMb: minimumStorageMb,
+		AllowEmpty:       raw.AllowEmpty || raw.AllowEmptyResult,
+	}
+	if len(env) > 0 {
+		clean.Env = env
+	}
+	return clean
+}
+
+func dockerTemplateInstall(cfg *dockerTemplateConfig) *templateInstallConfig {
+	if cfg == nil {
+		return nil
+	}
+	if install := normalizeTemplateInstallConfig(cfg.Install); install != nil {
+		return install
+	}
+	return normalizeTemplateInstallConfig(cfg.Installation)
+}
+
+func installConfigFromRuntime(runtimeObj map[string]any) *templateInstallConfig {
+	if runtimeObj == nil {
+		return nil
+	}
+	raw, ok := runtimeObj["install"]
+	if !ok || raw == nil {
+		return nil
+	}
+	if install, ok := raw.(*templateInstallConfig); ok {
+		return normalizeTemplateInstallConfig(install)
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var install templateInstallConfig
+	if err := json.Unmarshal(b, &install); err != nil {
+		return nil
+	}
+	return normalizeTemplateInstallConfig(&install)
+}
+
+func runtimeImageRef(runtimeObj map[string]any) string {
+	if runtimeObj == nil {
+		return ""
+	}
+	image := strings.TrimSpace(fmt.Sprint(runtimeObj["image"]))
+	if image == "" || image == "<nil>" {
+		return ""
+	}
+	tag := strings.TrimSpace(fmt.Sprint(runtimeObj["tag"]))
+	if tag == "" || tag == "<nil>" {
+		tag = "latest"
+	}
+	return image + ":" + tag
+}
+
+func safeInstallerContainerName(serverName string) string {
+	base := sanitizeName(serverName)
+	if base == "" {
+		base = "server"
+	}
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	name := "adpanel-install-" + base + "-" + suffix
+	if len(name) > 120 {
+		name = name[:120]
+	}
+	return name
+}
+
+func adpanelStartupDefaultEnv(name string, hostPort int, resources *resourceLimits, startup string) map[string]string {
+	env := map[string]string{
+		"TZ":                        "Etc/UTC",
+		"SERVER_IP":                 "0.0.0.0",
+		"P_SERVER_LOCATION":         "ADPanel",
+		"P_SERVER_ALLOCATION_LIMIT": "0",
+		"P_SERVER_UUID":             name,
+		"P_SERVER_UUID_SHORT":       name,
+	}
+	if hostPort > 0 {
+		env["SERVER_PORT"] = fmt.Sprint(hostPort)
+		env["PORT"] = fmt.Sprint(hostPort)
+	}
+	if resources != nil && resources.RamMb != nil && *resources.RamMb > 0 {
+		env["SERVER_MEMORY"] = fmt.Sprint(*resources.RamMb)
+	}
+	if strings.TrimSpace(startup) != "" {
+		env["STARTUP"] = startup
+	}
+	return env
+}
+
+func mergeStringEnv(dst map[string]string, src map[string]string) map[string]string {
+	if dst == nil {
+		dst = map[string]string{}
+	}
+	for key, value := range src {
+		envKey := strings.TrimSpace(key)
+		if envKey == "" || strings.ContainsAny(envKey, "\x00=\r\n") {
+			continue
+		}
+		dst[envKey] = value
+	}
+	return dst
+}
+
+func startupTemplateFromRuntime(runtimeObj map[string]any) string {
+	if runtimeObj == nil {
+		return ""
+	}
+	for _, key := range []string{"adpanelStartup", "adpanel_startup", "pterodactylStartup", "pterodactyl_startup"} {
+		value := strings.TrimSpace(fmt.Sprint(runtimeObj[key]))
+		if value != "" && value != "<nil>" {
+			return value
+		}
+	}
+	return ""
+}
+
+func startupTemplateFromDockerConfig(cfg *dockerTemplateConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	if startup := strings.TrimSpace(cfg.ADPanelStartup); startup != "" {
+		return startup
+	}
+	return strings.TrimSpace(cfg.LegacyStartup)
+}
+
+func freeDiskMb(path string) int64 {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0
+	}
+	return int64(stat.Bavail) * int64(stat.Bsize) / (1024 * 1024)
+}
+
+func renderADPanelStartupTemplate(startup string, env map[string]string, hostPort int) string {
+	rendered := strings.TrimSpace(startup)
+	if rendered == "" {
+		return ""
+	}
+	values := map[string]string{}
+	for key, value := range env {
+		values[strings.TrimSpace(key)] = value
+	}
+	if hostPort > 0 {
+		values["SERVER_PORT"] = fmt.Sprint(hostPort)
+		values["PORT"] = fmt.Sprint(hostPort)
+	}
+
+	replacer := regexp.MustCompile(`\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}`)
+	rendered = replacer.ReplaceAllStringFunc(rendered, func(token string) string {
+		match := replacer.FindStringSubmatch(token)
+		if len(match) != 2 {
+			return token
+		}
+		key := strings.TrimSpace(match[1])
+		switch key {
+		case "server.build.default.port":
+			if hostPort > 0 {
+				return fmt.Sprint(hostPort)
+			}
+			return token
+		}
+		if strings.HasPrefix(key, "env.") {
+			key = strings.TrimPrefix(key, "env.")
+		}
+		if value, ok := values[key]; ok {
+			return value
+		}
+		return token
+	})
+	return rendered
+}
+
+func (a *Agent) emitSetupLog(name, prefix, message string) {
+	if a == nil || a.logs == nil {
+		return
+	}
+	name = sanitizeName(name)
+	if name == "" {
+		return
+	}
+	prefix = strings.TrimSuffix(strings.TrimSpace(prefix), ":")
+	if prefix != "stderr" {
+		prefix = "stdout"
+	}
+	message = strings.ReplaceAll(message, "\r\n", "\n")
+	message = strings.ReplaceAll(message, "\r", "\n")
+	t := a.logs.getOrCreate(name)
+	for _, line := range strings.Split(message, "\n") {
+		line = strings.TrimRight(line, " \t")
+		plain := strings.TrimSpace(ansiSGRRE.ReplaceAllString(line, ""))
+		if plain == "" {
+			continue
+		}
+		a.logs.sendToClients(t, prefix+":[ADPanel Setup] "+line)
+	}
+}
+
+func (a *Agent) checkTemplateInstallPreflight(name, serverDir string, install *templateInstallConfig) error {
+	install = normalizeTemplateInstallConfig(install)
+	if install == nil {
+		return nil
+	}
+	if err := ensureDir(serverDir); err != nil {
+		return err
+	}
+	ensureVolumeWritable(serverDir)
+	if install.MinimumStorageMb > 0 {
+		freeMb := freeDiskMb(serverDir)
+		if freeMb > 0 && freeMb < int64(install.MinimumStorageMb) {
+			return fmt.Errorf("not enough free disk for installer: template requires at least %d MB, host has %d MB free", install.MinimumStorageMb, freeMb)
+		}
+	}
+	return nil
+}
+
+func (a *Agent) pullSetupImage(name, serverDir, imageRef, label string, timeout time.Duration) error {
+	imageRef = strings.TrimSpace(imageRef)
+	if imageRef == "" {
+		return nil
+	}
+	label = strings.TrimSpace(label)
+	if label == "" {
+		label = "Docker"
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	a.updateSetupState(name, serverDir, "pulling", fmt.Sprintf("Pulling %s image %s", label, imageRef))
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	err := a.docker.pullImageAPI(ctx, imageRef)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("%s image pull failed: %w", label, err)
+	}
+	a.emitSetupLog(name, "stdout", fmt.Sprintf("%s image ready: %s", label, imageRef))
+	return nil
+}
+
+func installerScriptPreferredShell(script string) string {
+	clean := strings.TrimSpace(strings.ReplaceAll(script, "\r\n", "\n"))
+	if clean == "" {
+		return "sh"
+	}
+
+	if strings.HasPrefix(clean, "#!") {
+		firstLine := strings.TrimSpace(strings.SplitN(clean, "\n", 2)[0])
+		firstLine = strings.TrimSpace(strings.TrimPrefix(firstLine, "#!"))
+		for _, token := range strings.Fields(firstLine) {
+			base := strings.ToLower(path.Base(strings.TrimSpace(token)))
+			switch base {
+			case "bash", "zsh", "ksh":
+				return base
+			case "sh", "ash", "dash":
+				return "sh"
+			}
+		}
+	}
+
+	lower := strings.ToLower(clean)
+	if strings.Contains(lower, "[[") ||
+		strings.Contains(lower, "function ") ||
+		strings.Contains(lower, "source ") ||
+		strings.Contains(lower, "set -o pipefail") {
+		return "bash"
+	}
+	return "sh"
+}
+
+func installerShellCommandFlag(shell string) string {
+	switch strings.ToLower(path.Base(strings.TrimSpace(shell))) {
+	case "bash", "zsh", "ksh":
+		return "-lc"
+	default:
+		return "-c"
+	}
+}
+
+func installerDefaultCommandArgs(entrypoint []string, script string) []string {
+	ep := trimRuntimeProcessArgs(entrypoint)
+	if len(ep) == 0 {
+		shell := installerScriptPreferredShell(script)
+		return []string{shell, installerShellCommandFlag(shell), script}
+	}
+	execIndex := 0
+	if strings.EqualFold(path.Base(ep[0]), "env") && len(ep) > 1 {
+		execIndex = 1
+	}
+	base := strings.ToLower(path.Base(ep[execIndex]))
+	if base == "bash" || base == "zsh" || base == "ksh" || base == "sh" || base == "ash" || base == "dash" {
+		if len(ep) > execIndex+1 && strings.HasPrefix(ep[execIndex+1], "-") && strings.Contains(ep[execIndex+1], "c") {
+			return []string{script}
+		}
+		return []string{installerShellCommandFlag(base), script}
+	}
+	return []string{script}
+}
+
+func (a *Agent) runTemplateInstall(name, serverDir string, install *templateInstallConfig, runtimeObj map[string]any, hostPort int, resources *resourceLimits) error {
+	install = normalizeTemplateInstallConfig(install)
+	if install == nil {
+		return nil
+	}
+	if err := ensureDir(serverDir); err != nil {
+		return err
+	}
+	ensureVolumeWritable(serverDir)
+
+	startup := startupTemplateFromRuntime(runtimeObj)
+	env := adpanelStartupDefaultEnv(name, hostPort, resources, startup)
+	env = mergeStringEnv(env, runtimeEnvMap(runtimeObj["env"]))
+	env = mergeStringEnv(env, install.Env)
+	if startup != "" {
+		env["STARTUP"] = renderADPanelStartupTemplate(startup, env, hostPort)
+	}
+	if err := a.checkTemplateInstallPreflight(name, serverDir, install); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(install.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	a.emitSetupLog(name, "stdout", "Preparing template installer")
+	if err := a.docker.pullImageAPI(ctx, install.Image); err != nil {
+		return fmt.Errorf("installer image pull failed: %w", err)
+	}
+	a.emitSetupLog(name, "stdout", "Running template installer in "+install.Image)
+	imgCfg := a.inspectRuntimeImageConfig(ctx, install.Image)
+	installerCmdArgs := installerDefaultCommandArgs(imgCfg.Entrypoint, install.Script)
+
+	containerName := safeInstallerContainerName(name)
+	defer a.docker.rmForce(context.Background(), containerName)
+
+	args := []string{
+		"run", "--rm",
+		"--name", containerName,
+		"-v", fmt.Sprintf("%s:%s", serverDir, install.MountPath),
+		"-w", install.MountPath,
+	}
+	for key, value := range env {
+		args = append(args, "-e", fmt.Sprintf("%s=%s", key, value))
+	}
+	args = append(args, install.Image)
+	args = append(args, installerCmdArgs...)
+
+	logs := newBoundedLogWriter(96 * 1024)
+	stdoutLog := newSetupConsoleWriter(a, name, "stdout")
+	stderrLog := newSetupConsoleWriter(a, name, "stderr")
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Stdout = io.MultiWriter(logs, stdoutLog)
+	cmd.Stderr = io.MultiWriter(logs, stderrLog)
+	err := cmd.Run()
+	stdoutLog.Flush()
+	stderrLog.Flush()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("template installer timed out after %ds; last logs: %s", install.TimeoutSeconds, summarizeStartupLogs(logs.String(), 2400))
+		}
+		return fmt.Errorf("template installer failed: %w; last logs: %s", err, summarizeStartupLogs(logs.String(), 2400))
+	}
+
+	ensureVolumeWritable(serverDir)
+	if count := serverDirVisibleFileCount(serverDir); count == 0 && !install.AllowEmpty {
+		return fmt.Errorf("template installer completed but did not create any visible server files in %s; last logs: %s", install.MountPath, summarizeStartupLogs(logs.String(), 2400))
+	} else if count == 0 {
+		a.emitSetupLog(name, "stdout", "Installer completed without visible files; continuing because allowEmpty is enabled")
+	}
+	a.emitSetupLog(name, "stdout", "Template installer completed")
+	fmt.Printf("[installer] template install completed for %s using %s into %s\n", name, install.Image, install.MountPath)
+	return nil
+}
+
+func (a *Agent) updateSetupState(name, serverDir, status, message string) {
+	meta := a.loadMeta(serverDir)
+	if meta == nil {
+		meta = map[string]any{}
+	}
+	status = strings.TrimSpace(status)
+	message = strings.TrimSpace(message)
+	if status == "" {
+		delete(meta, "setupStatus")
+	} else {
+		meta["setupStatus"] = status
+	}
+	if message == "" {
+		delete(meta, "setupMessage")
+	} else {
+		meta["setupMessage"] = message
+	}
+	meta["setupUpdatedAt"] = time.Now().UnixMilli()
+	if err := a.saveMeta(serverDir, meta); err != nil {
+		fmt.Printf("[setup] failed to update setup state for %s: %v\n", name, err)
+	}
+	if status != "" {
+		line := status
+		if message != "" {
+			line += ": " + message
+		}
+		prefix := "stdout"
+		if strings.EqualFold(status, "failed") {
+			prefix = "stderr"
+		}
+		a.emitSetupLog(name, prefix, line)
+	}
+}
+
+func (a *Agent) prepareMinecraftCreateSetup(req createReq, name, serverDir string, meta map[string]any) bool {
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	imageRef := runtimeImageRef(runtimeObj)
+	if imageRef != "" {
+		if err := a.pullSetupImage(name, serverDir, imageRef, "runtime", 10*time.Minute); err != nil {
+			a.updateSetupState(name, serverDir, "failed", err.Error())
+			fmt.Printf("[setup] Minecraft runtime image pull failed for %s: %v\n", name, err)
+			return false
+		}
+	}
+	a.updateSetupState(name, serverDir, "queued", "Docker image ready; Minecraft setup will continue in the background")
+	return true
+}
+
+func (a *Agent) prepareCustomCreateSetup(req createReq, name, serverDir string, meta map[string]any) bool {
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	if runtimeObj == nil {
+		runtimeObj = map[string]any{}
+	}
+	a.updateSetupState(name, serverDir, "preparing", "Preparing Docker template")
+	if install := installConfigFromRuntime(runtimeObj); install != nil {
+		if err := a.checkTemplateInstallPreflight(name, serverDir, install); err != nil {
+			a.updateSetupState(name, serverDir, "failed", err.Error())
+			fmt.Printf("[setup] Template preflight failed for %s: %v\n", name, err)
+			return false
+		}
+		if err := a.pullSetupImage(name, serverDir, install.Image, "installer", 10*time.Minute); err != nil {
+			a.updateSetupState(name, serverDir, "failed", err.Error())
+			fmt.Printf("[setup] Template installer image pull failed for %s: %v\n", name, err)
+			return false
+		}
+	}
+	if imageRef := runtimeImageRef(runtimeObj); imageRef != "" {
+		if err := a.pullSetupImage(name, serverDir, imageRef, "runtime", 10*time.Minute); err != nil {
+			a.updateSetupState(name, serverDir, "failed", err.Error())
+			fmt.Printf("[setup] Runtime image pull failed for %s: %v\n", name, err)
+			return false
+		}
+	}
+	a.updateSetupState(name, serverDir, "queued", "Docker images ready; setup will continue in the background")
+	return true
+}
+
+func (a *Agent) finishMinecraftCreateSetup(req createReq, name, serverDir string, meta map[string]any, hostPort int) {
+	fork := strings.TrimSpace(req.MCFork)
+	if fork == "" {
+		fork = "paper"
+	}
+	ver := strings.TrimSpace(req.MCVersion)
+	if ver == "" {
+		ver = "1.21.8"
+	}
+
+	a.updateSetupState(name, serverDir, "downloading", "Downloading Minecraft server files")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	jarURL := getMinecraftJarURL(ctx, a.dl, fork, ver, a.debug)
+	cancel()
+
+	ctxD, cancelD := context.WithTimeout(context.Background(), 30*time.Minute)
+	if err := a.dl.downloadToFile(ctxD, jarURL, filepath.Join(serverDir, "server.jar")); err != nil {
+		cancelD()
+		a.updateSetupState(name, serverDir, "failed", err.Error())
+		fmt.Printf("[setup] Minecraft download failed for %s: %v\n", name, err)
+		return
+	}
+	cancelD()
+
+	enforceServerProps(serverDir)
+
+	if req.ImportUrl != "" {
+		a.updateSetupState(name, serverDir, "importing", "Importing archive")
+		if err := a.downloadAndExtractArchiveSync(name, serverDir, req.ImportUrl); err != nil {
+			a.updateSetupState(name, serverDir, "failed", "archive import failed: "+err.Error())
+			fmt.Printf("[setup] Minecraft archive import failed for %s: %v\n", name, err)
+			return
+		}
+	}
+
+	if req.AutoStart {
+		a.updateSetupState(name, serverDir, "starting", "Starting container")
+		ctxStart, cancelStart := context.WithTimeout(context.Background(), 240*time.Second)
+		err := a.startMinecraftContainer(ctxStart, name, serverDir, hostPort, req.Resources, nil)
+		cancelStart()
+		if err != nil {
+			a.updateSetupState(name, serverDir, "failed", err.Error())
+			fmt.Printf("[setup] Minecraft startup failed for %s: %v\n", name, err)
+			return
+		}
+		a.ensureLiveLogs(name)
+	}
+
+	a.updateSetupState(name, serverDir, "ready", "Server setup complete")
+	auditLog.Log("server_setup", "127.0.0.1", "", name, "setup", "success", map[string]any{"template": req.Template})
+}
+
+func (a *Agent) finishCustomCreateSetup(req createReq, name, serverDir string, meta map[string]any, hostPort int) {
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	if runtimeObj == nil {
+		runtimeObj = map[string]any{}
+	}
+	if install := installConfigFromRuntime(runtimeObj); install != nil {
+		a.updateSetupState(name, serverDir, "installing", "Installing server files")
+		if err := a.runTemplateInstall(name, serverDir, install, runtimeObj, hostPort, req.Resources); err != nil {
+			a.updateSetupState(name, serverDir, "failed", err.Error())
+			fmt.Printf("[setup] Template install failed for %s: %v\n", name, err)
+			return
+		}
+	}
+
+	if req.ImportUrl != "" {
+		a.updateSetupState(name, serverDir, "importing", "Importing archive")
+		if err := a.downloadAndExtractArchiveSync(name, serverDir, req.ImportUrl); err != nil {
+			a.updateSetupState(name, serverDir, "failed", "archive import failed: "+err.Error())
+			fmt.Printf("[setup] Archive import failed for %s: %v\n", name, err)
+			return
+		}
+	}
+
+	template := strings.ToLower(strings.TrimSpace(req.Template))
+	switch template {
+	case "python":
+		scaffoldPython(serverDir, defaultStartFileForType(template))
+	case "nodejs", "discord-bot":
+		scaffoldNode(serverDir, defaultStartFileForType(template), hostPort)
+	}
+
+	hasImage := req.Docker != nil && strings.TrimSpace(req.Docker.Image) != ""
+	if req.AutoStart && hasImage {
+		a.updateSetupState(name, serverDir, "starting", "Starting container")
+		ctxStart, cancelStart := context.WithTimeout(context.Background(), 240*time.Second)
+		var err error
+		if isManagedProcessRuntime(template) {
+			err = a.startRuntimeContainer(ctxStart, name, serverDir, meta, hostPort, req.Resources, nil)
+		} else {
+			err = a.startCustomDockerContainer(ctxStart, name, serverDir, meta, hostPort, req.Resources)
+		}
+		cancelStart()
+		if err != nil {
+			a.updateSetupState(name, serverDir, "failed", err.Error())
+			fmt.Printf("[setup] Container startup failed for %s: %v\n", name, err)
+			return
+		}
+		a.ensureLiveLogs(name)
+	}
+
+	a.updateSetupState(name, serverDir, "ready", "Server setup complete")
+	auditLog.Log("server_setup", "127.0.0.1", "", name, "setup", "success", map[string]any{"template": req.Template})
+}
+
+func (a *Agent) monitorCustomContainerBootstrap(ctx context.Context, name, imageRef string) error {
+	started := time.Now()
+	defaultWindow := 18 * time.Second
+	bootstrapWindow := 115 * time.Second
+	if isGameServerDockerImage(imageRef) {
+		bootstrapWindow = 150 * time.Second
+	}
+
+	seenBootstrap := false
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+			logsOut := a.recentContainerLogs(logCtx, name, 160)
+			cancel()
+			return fmt.Errorf("container bootstrap did not become stable before timeout; last logs: %s", summarizeStartupLogs(logsOut, 1800))
+		case <-ticker.C:
+		}
+
+		statusOut, _, _, _ := a.docker.runCollect(ctx, "inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", name)
+		statusParts := strings.Fields(strings.TrimSpace(statusOut))
+		status := ""
+		exitStr := "0"
+		if len(statusParts) > 0 {
+			status = statusParts[0]
+		}
+		if len(statusParts) > 1 {
+			exitStr = statusParts[1]
+		}
+
+		logsOut := a.recentContainerLogs(ctx, name, 160)
+		if logsSuggestBootstrapInProgress(logsOut) {
+			seenBootstrap = true
+		}
+		if reason := customBootstrapFailureReason(logsOut); reason != "" {
+			return fmt.Errorf("container bootstrap failed: %s; last logs: %s", reason, summarizeStartupLogs(logsOut, 1800))
+		}
+
+		switch status {
+		case "restarting":
+			if time.Since(started) >= defaultWindow {
+				fmt.Printf("[docker] %s is restarting during bootstrap; not blocking startup.\n", name)
+				return nil
+			}
+			continue
+		case "exited", "dead":
+			if status == "" {
+				status = "unknown"
+			}
+			return fmt.Errorf("container stopped during bootstrap (%s, exit code %s); last logs: %s", status, exitStr, summarizeStartupLogs(logsOut, 1800))
+		case "running":
+			elapsed := time.Since(started)
+			if seenBootstrap {
+				if elapsed >= bootstrapWindow {
+					return nil
+				}
+				continue
+			}
+			if elapsed >= defaultWindow {
+				return nil
+			}
+		case "created", "":
+			if time.Since(started) > defaultWindow {
+				return nil
+			}
+		default:
+			if time.Since(started) > defaultWindow {
+				return nil
+			}
+		}
+	}
+}
+
+func (a *Agent) startMinecraftContainer(ctx context.Context, name, serverDir string, hostPort int, resources *resourceLimits, extraEnv map[string]string) error {
+	a.docker.rmForce(ctx, name)
+	meta := a.loadMeta(serverDir)
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	if runtimeObj == nil {
+		runtimeObj = make(map[string]any)
+	}
+
+	ensureVolumeWritable(serverDir)
+	uid, gid := statUIDGID(serverDir)
+
+	commandTemplate := sanitizeRuntimeCommand(runtimeObj["command"])
+	image := strings.TrimSpace(fmt.Sprint(runtimeObj["image"]))
+	tag := strings.TrimSpace(fmt.Sprint(runtimeObj["tag"]))
+	rawJavaVersion := strings.TrimSpace(fmt.Sprint(runtimeObj["javaVersion"]))
+	selectedJavaVersion := normalizeMinecraftJavaVersion(rawJavaVersion)
+	if rawJavaVersion != "" && rawJavaVersion != "<nil>" && selectedJavaVersion == "" {
+		return fmt.Errorf("unsupported minecraft java version: %s", rawJavaVersion)
+	}
+	if selectedJavaVersion != "" {
+		image = defaultMinecraftProcessImage
+		tag = minecraftJavaTag(selectedJavaVersion)
+		runtimeObj["image"] = image
+		runtimeObj["tag"] = tag
+		runtimeObj["javaVersion"] = selectedJavaVersion
+	}
+	useLegacyImageMode := false
+
+	if image == "" || image == "<nil>" {
+		if commandTemplate == "" {
+			image = "itzg/minecraft-server"
+			tag = "latest"
+			useLegacyImageMode = true
+		} else {
+			image = defaultMinecraftProcessImage
+			tag = defaultMinecraftProcessTag
+		}
+	}
+	if tag == "" || tag == "<nil>" {
+		if strings.EqualFold(image, "itzg/minecraft-server") && commandTemplate == "" {
+			tag = "latest"
+			useLegacyImageMode = true
+		} else {
+			tag = defaultMinecraftProcessTag
+		}
+	}
+	if strings.EqualFold(image, "itzg/minecraft-server") && commandTemplate == "" {
+		useLegacyImageMode = true
+	}
+
+	imageRef := image + ":" + tag
+	binds, dataDir := a.resolveStructuredBinds("minecraft", runtimeObj, serverDir)
+	workdir := normalizeContainerWorkdir(runtimeObj["workdir"])
+	if workdir == "" {
+		workdir = dataDir
+	}
+	startFile := strings.TrimSpace(fmt.Sprint(meta["start"]))
+	if startFile == "" || startFile == "<nil>" {
+		startFile = "server.jar"
+	}
+
+	env := runtimeEnvMap(runtimeObj["env"])
+	if env == nil {
+		env = map[string]string{}
+	}
+	for k, v := range extraEnv {
+		env[strings.TrimSpace(k)] = v
+	}
+
+	req := dockerContainerCreateRequest{
+		Image:        imageRef,
+		Tty:          true,
+		OpenStdin:    true,
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+		WorkingDir:   workdir,
+	}
+
+	if useLegacyImageMode {
+		if _, ok := env["EULA"]; !ok {
+			env["EULA"] = "TRUE"
+		}
+		if _, ok := env["TYPE"]; !ok {
+			env["TYPE"] = "CUSTOM"
+		}
+		if _, ok := env["CUSTOM_SERVER"]; !ok {
+			env["CUSTOM_SERVER"] = "/data/server.jar"
+		}
+		if _, ok := env["ENABLE_RCON"]; !ok {
+			env["ENABLE_RCON"] = "false"
+		}
+		if _, ok := env["CREATE_CONSOLE_IN_PIPE"]; !ok {
+			env["CREATE_CONSOLE_IN_PIPE"] = "true"
+		}
+		if _, ok := env["UID"]; !ok {
+			env["UID"] = fmt.Sprint(uid)
+		}
+		if _, ok := env["GID"]; !ok {
+			env["GID"] = fmt.Sprint(gid)
+		}
+	} else {
+		if commandTemplate == "" {
+			commandTemplate = defaultRuntimeCommandForType("minecraft", startFile, dataDir)
+		}
+		cmdArgs, err := buildRenderedRuntimeProcessArgs("minecraft", commandTemplate, dataDir, startFile, imageRef, hostPort, resources, meta)
+		if err != nil {
+			return err
+		}
+		req.User = a.preferredStructuredContainerUser(ctx, imageRef, uid, gid)
+		req.Cmd = cmdArgs
+	}
+
+	portBindings, exposedPorts := a.buildStructuredPortBindings(serverDir, meta, hostPort, 25565)
+	req.ExposedPorts = exposedPorts
+	req.HostConfig = buildStructuredHostConfig(
+		binds,
+		portBindings,
+		resources,
+		strings.TrimSpace(fmt.Sprint(runtimeObj["restart"])),
+		false,
+	)
+	req.Env = envMapToList(env)
+
+	if err := a.runStructuredContainerWithCompatUser(ctx, name, req); err != nil {
+		return err
 	}
 	return nil
 }
@@ -2374,7 +6840,6 @@ func (a *Agent) startRuntimeContainer(ctx context.Context, name, serverDir strin
 		tpl = strings.ToLower(fmt.Sprint(runtimeObj["providerId"]))
 	}
 	isPython := tpl == "python"
-	isNode := tpl == "nodejs" || tpl == "discord-bot"
 
 	image := strings.TrimSpace(fmt.Sprint(runtimeObj["image"]))
 	tag := strings.TrimSpace(fmt.Sprint(runtimeObj["tag"]))
@@ -2396,7 +6861,6 @@ func (a *Agent) startRuntimeContainer(ctx context.Context, name, serverDir strin
 	if tag != "" {
 		imageRef = image + ":" + tag
 	}
-	a.docker.pull(ctx, imageRef)
 	ensureVolumeWritable(serverDir)
 
 	effectivePort := 0
@@ -2404,143 +6868,64 @@ func (a *Agent) startRuntimeContainer(ctx context.Context, name, serverDir strin
 		effectivePort = hostPort
 	}
 
-	vols := []string{fmt.Sprintf("%s:/app", serverDir)}
-	if vv, ok := runtimeObj["volumes"].([]any); ok && len(vv) > 0 {
-		vols = vols[:0]
-		for _, v := range vv {
-			s := strings.TrimSpace(fmt.Sprint(v))
-			if s == "" {
-				continue
-			}
-			parts := strings.SplitN(s, ":", 2)
-			if len(parts) >= 2 {
-				hostPath := filepath.Clean(parts[0])
-				if err := ensureResolvedUnder(a.volumesDir, hostPath); err != nil {
-					fmt.Printf("[security] blocked volume mount outside volumes dir: %s\n", s)
-					continue
-				}
-			}
-			vols = append(vols, s)
-		}
-		if len(vols) == 0 {
-			vols = []string{fmt.Sprintf("%s:/app", serverDir)}
-		}
+	binds, dataDir := a.resolveStructuredBinds(tpl, runtimeObj, serverDir)
+	workdir := normalizeContainerWorkdir(runtimeObj["workdir"])
+	if workdir == "" {
+		workdir = dataDir
 	}
 
-	env := map[string]string{}
-	if ev, ok := runtimeObj["env"].(map[string]any); ok {
-		for k, v := range ev {
-			env[k] = fmt.Sprint(v)
-		}
+	env := runtimeEnvMap(runtimeObj["env"])
+	if env == nil {
+		env = map[string]string{}
 	}
 	for k, v := range extraEnv {
-		env[k] = v
+		env[strings.TrimSpace(k)] = v
 	}
 	if effectivePort > 0 {
 		if _, ok := env["PORT"]; !ok {
 			env["PORT"] = fmt.Sprint(effectivePort)
 		}
 	}
-	uid, gid := statUIDGID(serverDir)
-	if _, ok := env["UID"]; !ok {
-		env["UID"] = fmt.Sprint(uid)
-	}
-	if _, ok := env["GID"]; !ok {
-		env["GID"] = fmt.Sprint(gid)
-	}
-
-	args := []string{"run", "-d", "-t", "--name", name, "--restart", "unless-stopped"}
-	args = append(args, containerSecurityArgs(uid, gid, false)...)
-
-	if resources != nil {
-		if resources.RamMb != nil && *resources.RamMb > 0 {
-			args = append(args, "--memory", fmt.Sprintf("%dm", *resources.RamMb))
-			args = append(args, "--memory-reservation", fmt.Sprintf("%dm", *resources.RamMb*90/100))
-
-			if resources.SwapMb == nil {
-				args = append(args, "--memory-swap", fmt.Sprintf("%dm", *resources.RamMb))
-			} else {
-				swapVal := *resources.SwapMb
-				if swapVal == -1 {
-					args = append(args, "--memory-swap", fmt.Sprintf("%dm", *resources.RamMb))
-				} else if swapVal == 0 {
-					args = append(args, "--memory-swap", "-1")
-				} else {
-					totalSwap := *resources.RamMb + swapVal
-					args = append(args, "--memory-swap", fmt.Sprintf("%dm", totalSwap))
-				}
-			}
-		}
-		if resources.CpuCores != nil && *resources.CpuCores > 0 && *resources.CpuCores <= 128 {
-			effCores, _ := computeCpuLimit(*resources.CpuCores)
-			cpuQuota := int64(float64(cpuPeriod) * effCores)
-			args = append(args, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
-			args = append(args, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
-		} else {
-			effCores, _ := computeCpuLimit(0)
-			cpuQuota := int64(float64(cpuPeriod) * effCores)
-			args = append(args, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
-			args = append(args, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
-		}
-	}
-
-	if effectivePort > 0 {
-		args = append(args, "-p", fmt.Sprintf("%d:%d", effectivePort, effectivePort))
-	}
-	portForwards := a.loadPortForwards(serverDir)
-	for _, pf := range portForwards {
-		args = append(args, "-p", fmt.Sprintf("%d:%d", pf.Public, pf.Internal))
-	}
-	if resources != nil {
-		if metaRes, ok := meta["resources"].(map[string]any); ok {
-			if ports, ok := metaRes["ports"].([]any); ok {
-				for _, p := range ports {
-					ap := anyToInt(p)
-					if ap > 0 && ap != effectivePort {
-						args = append(args, "-p", fmt.Sprintf("%d:%d", ap, ap))
-						fmt.Printf("[port-manage] %s: exposing additional port %d:%d\n", name, ap, ap)
-					}
-				}
-			}
-		}
-	}
-	for _, v := range vols {
-		args = append(args, "-v", v)
-	}
-	for k, v := range env {
-		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
-	}
-	args = append(args, imageRef)
 
 	startFile := strings.TrimSpace(fmt.Sprint(meta["start"]))
-	if startFile == "" {
-		if isPython {
-			startFile = "main.py"
-		} else {
-			startFile = "index.js"
-		}
+	if startFile == "" || startFile == "<nil>" {
+		startFile = defaultStartFileForType(tpl)
 	}
 
-	defaultCmd := ""
-	if isPython {
-		defaultCmd = fmt.Sprintf("python /app/%s", startFile)
-	} else if isNode {
-		defaultCmd = fmt.Sprintf(`sh -c "cd /app && npm install && node /app/%s"`, startFile)
+	commandTemplate := sanitizeRuntimeCommand(runtimeObj["command"])
+	if commandTemplate == "" {
+		commandTemplate = defaultRuntimeCommandForType(tpl, startFile, dataDir)
 	}
-	cmd := strings.TrimSpace(fmt.Sprint(runtimeObj["command"]))
-	if cmd == "" {
-		cmd = defaultCmd
-	}
-	if cmd != "" {
-		args = append(args, "sh", "-lc", cmd)
-	}
-
-	_, errStr, _, err := a.docker.runCollect(ctx, args...)
+	ensureRuntimeEntrypointScaffold(serverDir, tpl, commandTemplate, dataDir, workdir, startFile, effectivePort)
+	cmdArgs, err := buildRenderedRuntimeProcessArgs(tpl, commandTemplate, dataDir, startFile, imageRef, effectivePort, resources, meta)
 	if err != nil {
-		if a.debug {
-			fmt.Printf("[docker] runtime container error: %s\n", strings.TrimSpace(errStr))
-		}
-		return fmt.Errorf("container start failed")
+		return err
+	}
+	uid, gid := statUIDGID(serverDir)
+	req := dockerContainerCreateRequest{
+		Image:        imageRef,
+		Env:          envMapToList(env),
+		Cmd:          cmdArgs,
+		WorkingDir:   workdir,
+		User:         a.preferredStructuredContainerUser(ctx, imageRef, uid, gid),
+		Tty:          true,
+		OpenStdin:    true,
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+	}
+	portBindings, exposedPorts := a.buildStructuredPortBindings(serverDir, meta, effectivePort, effectivePort)
+	req.ExposedPorts = exposedPorts
+	req.HostConfig = buildStructuredHostConfig(
+		binds,
+		portBindings,
+		resources,
+		strings.TrimSpace(fmt.Sprint(runtimeObj["restart"])),
+		false,
+	)
+
+	if err := a.runStructuredContainerWithCompatUser(ctx, name, req); err != nil {
+		return err
 	}
 	return nil
 }
@@ -2557,7 +6942,13 @@ func matchesBlockedFlag(flag string, denylist map[string]bool) (bool, string) {
 	return false, ""
 }
 
+var legacyRawDockerStartupCommandsDisabled = true
+
 func (a *Agent) executeStartupCommand(ctx context.Context, name, serverDir string, hostPort int, startupCmd string, resources *resourceLimits, meta map[string]any) error {
+	if legacyRawDockerStartupCommandsDisabled {
+		fmt.Printf("[security] blocked legacy raw docker startup command path for %s\n", name)
+		return fmt.Errorf("raw docker startup commands are disabled; configure image, ports, volumes, env, and the in-container process separately")
+	}
 	if a.debug {
 		fmt.Printf("[docker] executeStartupCommand called for %s\n", name)
 		fmt.Printf("[docker] serverDir: %s\n", serverDir)
@@ -2606,7 +6997,32 @@ func (a *Agent) executeStartupCommand(ctx context.Context, name, serverDir strin
 	imageRef := image + ":" + tag
 	cmd = strings.ReplaceAll(cmd, "{IMAGE}", imageRef)
 
+	allowedHostPorts := make([]int, 0, 8)
+	if port, ok := parseStrictPortValue(hostPort); ok {
+		allowedHostPorts = append(allowedHostPorts, port)
+	}
+	if metaRes, ok := meta["resources"].(map[string]any); ok {
+		for _, port := range runtimeIntSlice(metaRes["ports"]) {
+			if port > 0 {
+				allowedHostPorts = append(allowedHostPorts, port)
+			}
+		}
+	}
+	reservedHostPorts := make([]int, 0, 4)
+	for _, pf := range a.loadPortForwards(serverDir) {
+		if port, ok := parseStrictPortValue(pf.Public); ok {
+			reservedHostPorts = append(reservedHostPorts, port)
+		}
+	}
+	expectedImageRef := ""
+	if image != "" {
+		expectedImageRef = imageRef
+	}
+
 	cmd = strings.TrimSpace(cmd)
+	if safetyViolation := validateDockerRunCommandSafety(cmd, allowedHostPorts, reservedHostPorts, expectedImageRef); safetyViolation != "" {
+		return errors.New(safetyViolation)
+	}
 	cmdLower := strings.ToLower(cmd)
 	if !strings.HasPrefix(cmdLower, "docker run") {
 		return fmt.Errorf("startup command must start with 'docker run'")
@@ -2623,7 +7039,7 @@ func (a *Agent) executeStartupCommand(ctx context.Context, name, serverDir strin
 		"-e": true, "--env": true, "-v": true, "--volume": true,
 		"-p": true, "--publish": true, "-w": true, "--workdir": true,
 		"--name": true, "-m": true, "--memory": true, "--cpus": true,
-		"--memory-swap": true, "--cpu-period": true, "--cpu-quota": true,
+		"--memory-swap": true, "--memory-reservation": true, "--cpu-period": true, "--cpu-quota": true,
 		"-u": true, "--user": true, "-h": true, "--hostname": true,
 		"--network": true, "--net": true, "--restart": true,
 		"-l": true, "--label": true, "--entrypoint": true,
@@ -2989,8 +7405,12 @@ func (a *Agent) executeStartupCommand(ctx context.Context, name, serverDir strin
 		filteredArgs = append(filteredArgs, arg)
 	}
 
+	pidsLimit := defaultPidsLimit
+	if resources != nil && resources.PidsLimit != nil && *resources.PidsLimit >= minPidsLimit && *resources.PidsLimit <= maxPidsLimit {
+		pidsLimit = *resources.PidsLimit
+	}
 	finalArgs := []string{"run", "-d", "-t", "--restart", "unless-stopped", "--name", name}
-	finalArgs = append(finalArgs, "--cap-drop=ALL", "--pids-limit=512")
+	finalArgs = append(finalArgs, "--cap-drop=ALL", fmt.Sprintf("--pids-limit=%d", pidsLimit))
 	finalArgs = append(finalArgs, panelSafeCaps()...)
 	if resources != nil {
 		if resources.RamMb != nil && *resources.RamMb > 0 {
@@ -3015,11 +7435,15 @@ func (a *Agent) executeStartupCommand(ctx context.Context, name, serverDir strin
 			cpuQuota := int64(float64(cpuPeriod) * effCores)
 			finalArgs = append(finalArgs, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
 			finalArgs = append(finalArgs, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
-		} else {
-			effCores, _ := computeCpuLimit(0)
-			cpuQuota := int64(float64(cpuPeriod) * effCores)
-			finalArgs = append(finalArgs, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
-			finalArgs = append(finalArgs, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
+		}
+		if resources.CpuWeight != nil && *resources.CpuWeight >= minCpuWeight && *resources.CpuWeight <= maxCpuWeight {
+			finalArgs = append(finalArgs, "--cpu-shares", fmt.Sprintf("%d", dockerCpuSharesFromWeight(*resources.CpuWeight)))
+		}
+		if resources.IoWeight != nil && *resources.IoWeight >= minIoWeight && *resources.IoWeight <= maxIoWeight {
+			finalArgs = append(finalArgs, "--blkio-weight", fmt.Sprintf("%d", *resources.IoWeight))
+		}
+		if resources.FileLimit != nil && *resources.FileLimit >= minFileLimit && *resources.FileLimit <= maxFileLimit {
+			finalArgs = append(finalArgs, "--ulimit", fmt.Sprintf("nofile=%d:%d", *resources.FileLimit, *resources.FileLimit))
 		}
 	}
 
@@ -3035,13 +7459,10 @@ func (a *Agent) executeStartupCommand(ctx context.Context, name, serverDir strin
 		effContainerPort = firstContainerPort
 	}
 	if metaRes, ok := meta["resources"].(map[string]any); ok {
-		if ports, ok := metaRes["ports"].([]any); ok {
-			for _, p := range ports {
-				ap := anyToInt(p)
-				if ap > 0 && ap != hostPort {
-					finalArgs = append(finalArgs, "-p", fmt.Sprintf("%d:%d", ap, ap))
-					fmt.Printf("[port-manage] %s: exposing additional port %d:%d\n", name, ap, ap)
-				}
+		for _, ap := range runtimeIntSlice(metaRes["ports"]) {
+			if ap > 0 && ap != hostPort {
+				finalArgs = append(finalArgs, "-p", fmt.Sprintf("%d:%d", ap, ap))
+				fmt.Printf("[port-manage] %s: exposing additional port %d:%d\n", name, ap, ap)
 			}
 		}
 	}
@@ -3173,94 +7594,16 @@ func extractHostPortFromMapping(mapping string) int {
 }
 
 func validateStartupCommandPorts(startupCmd string, allocatedPort int, additionalAllocatedPorts []int, reservedPorts ...int) string {
-	allowedSet := make(map[int]bool)
+	allowedPorts := make([]int, 0, 1+len(additionalAllocatedPorts))
 	if allocatedPort > 0 {
-		allowedSet[allocatedPort] = true
+		allowedPorts = append(allowedPorts, allocatedPort)
 	}
 	for _, p := range additionalAllocatedPorts {
 		if p > 0 {
-			allowedSet[p] = true
+			allowedPorts = append(allowedPorts, p)
 		}
 	}
-	reservedSet := make(map[int]bool, len(reservedPorts))
-	for _, p := range reservedPorts {
-		if p > 0 {
-			reservedSet[p] = true
-		}
-	}
-	cmd := strings.TrimSpace(startupCmd)
-	cmdLower := strings.ToLower(cmd)
-	if !strings.HasPrefix(cmdLower, "docker run") {
-		return ""
-	}
-	argsStr := strings.TrimSpace(cmd[len("docker run"):])
-	args := parseShellArgs(argsStr)
-
-	skipNext := false
-	for i := 0; i < len(args); i++ {
-		if skipNext {
-			skipNext = false
-			continue
-		}
-		arg := args[i]
-		argLower := strings.ToLower(strings.TrimSpace(arg))
-
-		if (arg == "-p" || arg == "--publish") && i+1 < len(args) {
-			portMapping := args[i+1]
-			skipNext = true
-			if strings.Contains(portMapping, "{PORT}") {
-				continue
-			}
-			hp := extractHostPortFromMapping(portMapping)
-			if hp > 0 && !allowedSet[hp] {
-				return "Port config through docker edit command is not allowed. Add or remove a port for this server by the category 'Port Management'"
-			}
-			if hp > 0 && reservedSet[hp] {
-				return fmt.Sprintf("Port %d in the docker command conflicts with a port forwarding rule.", hp)
-			}
-			continue
-		}
-
-		if strings.HasPrefix(arg, "-p=") || strings.HasPrefix(arg, "--publish=") {
-			portVal := ""
-			if strings.HasPrefix(arg, "-p=") {
-				portVal = strings.TrimPrefix(arg, "-p=")
-			} else {
-				portVal = strings.TrimPrefix(arg, "--publish=")
-			}
-			if strings.Contains(portVal, "{PORT}") {
-				continue
-			}
-			hp := extractHostPortFromMapping(portVal)
-			if hp > 0 && !allowedSet[hp] {
-				return "Port config through docker edit command is not allowed. Add or remove a port for this server by the category 'Port Management'"
-			}
-			if hp > 0 && reservedSet[hp] {
-				return fmt.Sprintf("Port %d in the docker command conflicts with a port forwarding rule.", hp)
-			}
-			continue
-		}
-
-		if strings.HasPrefix(argLower, "-") {
-			if strings.Contains(argLower, "=") {
-				continue
-			}
-			portFlagsWithValue := map[string]bool{
-				"-e": true, "--env": true, "-v": true, "--volume": true,
-				"-p": true, "--publish": true, "-w": true, "--workdir": true,
-				"--name": true, "-m": true, "--memory": true, "--cpus": true,
-				"--restart": true, "-u": true, "--user": true, "-h": true, "--hostname": true,
-				"--network": true, "--net": true, "-l": true, "--label": true,
-				"--entrypoint": true,
-			}
-			if portFlagsWithValue[argLower] {
-				skipNext = true
-			}
-			continue
-		}
-		break
-	}
-	return ""
+	return validateDockerRunCommandSafety(startupCmd, allowedPorts, reservedPorts, "")
 }
 
 func extractDockerImageFromCommand(cmdStr string) string {
@@ -3276,7 +7619,7 @@ func extractDockerImageFromCommand(cmdStr string) string {
 		"-e": true, "--env": true, "-v": true, "--volume": true,
 		"-p": true, "--publish": true, "-w": true, "--workdir": true,
 		"--name": true, "-m": true, "--memory": true, "--cpus": true,
-		"--memory-swap": true, "--cpu-period": true, "--cpu-quota": true,
+		"--memory-swap": true, "--memory-reservation": true, "--cpu-period": true, "--cpu-quota": true,
 		"-u": true, "--user": true, "-h": true, "--hostname": true,
 		"--network": true, "--net": true, "--restart": true,
 		"-l": true, "--label": true, "--entrypoint": true,
@@ -3393,272 +7736,195 @@ func (a *Agent) startCustomDockerContainer(ctx context.Context, name, serverDir 
 	a.docker.rmForce(ctx, name)
 
 	runtimeObj, _ := meta["runtime"].(map[string]any)
+	if runtimeObj == nil {
+		runtimeObj = make(map[string]any)
+	}
 	if a.debug {
 		fmt.Printf("[docker] startCustomDockerContainer for %s\n", name)
 	}
 
-	startupCmd := ""
-	if cmd, ok := runtimeObj["startupCommand"].(string); ok && strings.TrimSpace(cmd) != "" {
-		startupCmd = cmd
-	} else if cmd, ok := meta["startupCommand"].(string); ok && strings.TrimSpace(cmd) != "" {
-		startupCmd = cmd
-	}
-
-	if strings.TrimSpace(startupCmd) != "" {
-		fmt.Printf("[docker] Found startupCommand: %s\n", startupCmd)
-		return a.executeStartupCommand(ctx, name, serverDir, hostPort, startupCmd, resources, meta)
-	}
-
-	fmt.Printf("[docker] No startupCommand found, using image-based start\n")
-
 	image := strings.TrimSpace(fmt.Sprint(runtimeObj["image"]))
 	tag := strings.TrimSpace(fmt.Sprint(runtimeObj["tag"]))
-	if image == "" {
+	if image == "" || image == "<nil>" {
 		return fmt.Errorf("no docker image specified")
 	}
-	if tag == "" {
+	if tag == "" || tag == "<nil>" {
 		tag = "latest"
 	}
 	imageRef := image + ":" + tag
-	if !a.docker.imageExistsLocally(ctx, imageRef) {
-		a.docker.pull(ctx, imageRef)
-	}
-
-	currentDigest := a.docker.getImageDigest(ctx, imageRef)
-	lastDigest, _ := meta["lastImageDigest"].(string)
-
-	volumeContainerPaths := []string{}
-	if vv, ok := runtimeObj["volumes"].([]any); ok {
-		for _, v := range vv {
-			s := strings.TrimSpace(fmt.Sprint(v))
-			parts := strings.Split(s, ":")
-			if len(parts) >= 2 {
-				containerPath := parts[1]
-				if idx := strings.Index(containerPath, ":"); idx > 0 {
-					containerPath = containerPath[:idx]
-				}
-				volumeContainerPaths = append(volumeContainerPaths, containerPath)
-			}
-		}
-	}
-
-	isGameServer := isGameServerDockerImage(image)
+	imgCfg := a.inspectRuntimeImageConfig(ctx, imageRef)
 
 	ensureVolumeWritable(serverDir)
-
-	if isGameServer {
-		fmt.Printf("[docker] game server image detected (%s), skipping file extraction - container will download files\n", image)
+	hasCustomVolumes := len(runtimeStringSlice(runtimeObj["volumes"])) > 0
+	explicitCommandTemplate := sanitizeRuntimeCommand(runtimeObj["command"])
+	adpanelStartup := startupTemplateFromRuntime(runtimeObj)
+	installCfg := installConfigFromRuntime(runtimeObj)
+	runtimeInstallPath := ""
+	if installCfg != nil {
+		runtimeInstallPath = normalizeContainerWorkdir(installCfg.RuntimePath)
+	}
+	if runtimeInstallPath == "" && adpanelStartup != "" {
+		runtimeInstallPath = "/home/container"
 	}
 
-
-	if currentDigest != "" && currentDigest != lastDigest {
-		_ = a.modifyMeta(serverDir, func(m map[string]any) {
-			m["lastImageDigest"] = currentDigest
-		})
+	tpl := strings.ToLower(fmt.Sprint(meta["type"]))
+	if tpl == "" || tpl == "<nil>" {
+		tpl = strings.ToLower(fmt.Sprint(runtimeObj["providerId"]))
 	}
 
-
-	vols := []string{}
-	hasCustomVolumes := false
-	if vv, ok := runtimeObj["volumes"].([]any); ok && len(vv) > 0 {
-		for _, v := range vv {
-			s := strings.TrimSpace(fmt.Sprint(v))
-			if s != "" {
-				s = strings.ReplaceAll(s, "{BOT_DIR}", serverDir)
-				s = strings.ReplaceAll(s, "{SERVER_DIR}", serverDir)
-
-
-				parts := strings.SplitN(s, ":", 2)
-				if len(parts) >= 2 {
-					hostPath := filepath.Clean(parts[0])
-					if err := ensureResolvedUnder(a.volumesDir, hostPath); err != nil {
-						fmt.Printf("[security] blocked volume mount outside volumes dir: %s\n", s)
-						continue
-					}
-				}
-
-				vols = append(vols, s)
-				hasCustomVolumes = true
-			}
-		}
-	}
-
+	binds, dataDir := a.resolveStructuredBinds(tpl, runtimeObj, serverDir)
+	workdir := normalizeContainerWorkdir(runtimeObj["workdir"])
 	if !hasCustomVolumes {
-		imageRef := image + ":" + tag
-		imgCfg := a.docker.inspectImageConfig(ctx, imageRef)
-		if len(imgCfg.Volumes) > 0 {
-			for _, p := range imgCfg.Volumes {
-				vols = append(vols, fmt.Sprintf("%s:%s", serverDir, p))
-				fmt.Printf("[docker] auto-detected image VOLUME: %s -> %s\n", serverDir, p)
+		inferredDataPath := false
+		if runtimeInstallPath != "" {
+			dataDir = runtimeInstallPath
+			binds = []string{fmt.Sprintf("%s:%s", serverDir, dataDir)}
+			inferredDataPath = true
+			if workdir == "" {
+				workdir = runtimeInstallPath
 			}
+		} else if len(imgCfg.Volumes) > 0 {
+			dataDir = imgCfg.Volumes[0]
+			binds = []string{fmt.Sprintf("%s:%s", serverDir, dataDir)}
+			inferredDataPath = true
 		} else if envPaths := getDataPathsFromEnv(imgCfg.Env); len(envPaths) > 0 {
-			vols = append(vols, fmt.Sprintf("%s:%s", serverDir, envPaths[0]))
-			fmt.Printf("[docker] auto-detected data path from image ENV: %s -> %s\n", serverDir, envPaths[0])
-		} else if imgCfg.Workdir != "" && imgCfg.Workdir != "/" {
-			vols = append(vols, fmt.Sprintf("%s:%s", serverDir, imgCfg.Workdir))
-			fmt.Printf("[docker] auto-detected image WORKDIR: %s -> %s\n", serverDir, imgCfg.Workdir)
-		} else {
-			if isGameServer {
-				vols = append(vols, fmt.Sprintf("%s:/data", serverDir))
-				fmt.Printf("[docker] no VOLUME/WORKDIR/ENV detected for game server, falling back to /data\n")
-			} else {
-				vols = append(vols, fmt.Sprintf("%s:/app", serverDir))
+			dataDir = envPaths[0]
+			binds = []string{fmt.Sprintf("%s:%s", serverDir, dataDir)}
+			inferredDataPath = true
+		} else if imgCfg.Workdir != "" && imgCfg.Workdir != "/" && (explicitCommandTemplate != "" || hasManagedRuntimeDefaults(tpl)) {
+			dataDir = imgCfg.Workdir
+			binds = []string{fmt.Sprintf("%s:%s", serverDir, dataDir)}
+			inferredDataPath = true
+			if workdir == "" {
+				workdir = imgCfg.Workdir
 			}
 		}
-	}
-
-	env := map[string]string{}
-	if ev, ok := runtimeObj["env"].(map[string]any); ok {
-		for k, v := range ev {
-			env[k] = fmt.Sprint(v)
+		if !inferredDataPath && explicitCommandTemplate == "" && !hasManagedRuntimeDefaults(tpl) {
+			dataDir = ""
+			binds = nil
 		}
+	} else if explicitCommandTemplate == "" || shouldPreferImageDefaultRuntimeCommand(explicitCommandTemplate, imgCfg) {
+		binds, dataDir = sanitizeCustomImageDefaultBinds(imageRef, imgCfg, binds, dataDir)
 	}
 
-	if !isGameServer {
-		if hostPort > 0 {
-			if _, ok := env["PORT"]; !ok {
-				env["PORT"] = fmt.Sprint(hostPort)
-			}
+	preparePaths := []string{dataDir, workdir, imgCfg.Workdir}
+	for _, bind := range binds {
+		preparePaths = append(preparePaths, parseVolumeSpecContainerPath(bind))
+	}
+	if explicitCommandTemplate != "" {
+		preparePaths = append(preparePaths, commandReferencedContainerPaths(explicitCommandTemplate, workdir, dataDir)...)
+	}
+	preparedPath := a.prepareServerDirFromImage(ctx, imageRef, serverDir, imgCfg, preparePaths)
+	if preparedPath != "" && len(binds) == 0 && !hasManagedRuntimeDefaults(tpl) {
+		dataDir = preparedPath
+		binds = []string{fmt.Sprintf("%s:%s", serverDir, dataDir)}
+		if workdir == "" {
+			workdir = dataDir
 		}
-		uid, gid := statUIDGID(serverDir)
-		if _, ok := env["UID"]; !ok {
-			env["UID"] = fmt.Sprint(uid)
-		}
-		if _, ok := env["GID"]; !ok {
-			env["GID"] = fmt.Sprint(gid)
-		}
+		fmt.Printf("[docker] mounted prepared image path for %s: %s -> %s\n", imageRef, serverDir, dataDir)
 	}
 
-	args := []string{"run", "-d"}
-	if isGameServer {
-		args = append(args, "-i", "-t")
-	} else {
-		args = append(args, "-t")
+	env := runtimeEnvMap(runtimeObj["env"])
+	if env == nil {
+		env = map[string]string{}
 	}
-	args = append(args, "--name", name)
-
-	if isGameServer {
-		args = append(args, "--restart", "on-failure:3")
-	} else {
-		args = append(args, "--restart", "unless-stopped")
-	}
-
-	args = append(args, "--cap-drop=ALL", "--pids-limit=512")
-	args = append(args, panelSafeCaps()...)
-
-	if !isGameServer {
-		args = append(args, "-w", "/app")
-	}
-
-	if resources != nil {
-		if resources.RamMb != nil && *resources.RamMb > 0 {
-			args = append(args, "--memory", fmt.Sprintf("%dm", *resources.RamMb))
-			args = append(args, "--memory-reservation", fmt.Sprintf("%dm", *resources.RamMb*90/100))
-			if resources.SwapMb == nil {
-				args = append(args, "--memory-swap", fmt.Sprintf("%dm", *resources.RamMb))
-			} else {
-				swapVal := *resources.SwapMb
-				if swapVal == -1 {
-					args = append(args, "--memory-swap", fmt.Sprintf("%dm", *resources.RamMb))
-				} else if swapVal == 0 {
-					args = append(args, "--memory-swap", "-1")
-				} else {
-					totalSwap := *resources.RamMb + swapVal
-					args = append(args, "--memory-swap", fmt.Sprintf("%dm", totalSwap))
-				}
-			}
-		}
-		if resources.CpuCores != nil && *resources.CpuCores > 0 && *resources.CpuCores <= 128 {
-			cpuQuota := int64(float64(cpuPeriod) * *resources.CpuCores)
-			args = append(args, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
-			args = append(args, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
-		}
-	}
-
-	defaultContainerPort := hostPort
-	if ports, ok := runtimeObj["ports"].([]any); ok && len(ports) > 0 {
-		switch v := ports[0].(type) {
-		case float64:
-			if int(v) > 0 {
-				defaultContainerPort = int(v)
-			}
-		case int:
-			if v > 0 {
-				defaultContainerPort = v
-			}
-		case string:
-			if p, _ := strconv.Atoi(v); p > 0 {
-				defaultContainerPort = p
-			}
-		}
-	}
-
 	if hostPort > 0 {
-		args = append(args, "-p", fmt.Sprintf("%d:%d", hostPort, defaultContainerPort))
-		fmt.Printf("[port-enforce] %s: only exposing allocated port %d -> container %d (template secondary ports stripped)\n", name, hostPort, defaultContainerPort)
-	}
-	portForwards := a.loadPortForwards(serverDir)
-	for _, pf := range portForwards {
-		containerPort := defaultContainerPort
-		if containerPort <= 0 {
-			containerPort = pf.Internal
-		}
-		args = append(args, "-p", fmt.Sprintf("%d:%d", pf.Public, containerPort))
-		fmt.Printf("[port-forwards] %s: forwarding public %d -> container %d\n", name, pf.Public, containerPort)
-	}
-
-	for _, v := range vols {
-		args = append(args, "-v", v)
-	}
-
-	for k, v := range env {
-		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
-	}
-
-	args = append(args, imageRef)
-
-	cmd := ""
-	if cmdVal := runtimeObj["command"]; cmdVal != nil {
-		cmd = strings.TrimSpace(fmt.Sprint(cmdVal))
-		if cmd == "<nil>" {
-			cmd = ""
+		if _, ok := env["PORT"]; !ok {
+			env["PORT"] = fmt.Sprint(hostPort)
 		}
 	}
-
-	isGameServerImage := isGameServerDockerImage(image)
-
-	if cmd == "" && !isGameServerImage {
-		cmd = guessStartupCommand(serverDir, image)
-	}
-
-	if cmd != "" && cmd != "<nil>" {
-		if strings.ContainsAny(cmd, "&|;$`") || strings.Contains(cmd, "&&") || strings.Contains(cmd, "||") {
-			args = append(args, "sh", "-c", cmd)
-		} else {
-			parts := strings.Fields(cmd)
-			if len(parts) > 0 {
-				args = append(args, parts...)
+	if adpanelStartup != "" {
+		for key, value := range adpanelStartupDefaultEnv(name, hostPort, resources, adpanelStartup) {
+			if _, exists := env[key]; !exists {
+				env[key] = value
 			}
 		}
-	} else if isGameServerImage {
-		fmt.Printf("[docker] using image's default CMD for game server image: %s\n", image)
+		env["STARTUP"] = renderADPanelStartupTemplate(adpanelStartup, env, hostPort)
 	}
 
-	if a.debug {
-		fmt.Printf("[docker] running: docker %s\n", strings.Join(args, " "))
-	}
-	_, errStr, exitCode, err := a.docker.runCollect(ctx, args...)
-	if err != nil || exitCode != 0 {
-		errMsg := strings.TrimSpace(errStr)
-		fmt.Printf("[docker] custom container error (exit %d): %s (go err: %v)\n", exitCode, errMsg, err)
-		if errMsg == "" && err != nil {
-			errMsg = err.Error()
+	mainContainerPort := hostPort
+	if ports := runtimeIntSlice(runtimeObj["ports"]); len(ports) > 0 {
+		if p := ports[0]; p > 0 {
+			mainContainerPort = p
 		}
-		return fmt.Errorf("container start failed: %s", errMsg)
+	}
+	if mainContainerPort <= 0 {
+		mainContainerPort = hostPort
 	}
 
-	go a.recoverMisplacedFiles(name, serverDir)
+	startFile := strings.TrimSpace(fmt.Sprint(meta["start"]))
+	if startFile == "" || startFile == "<nil>" {
+		startFile = defaultStartFileForType(tpl)
+	}
+	commandTemplate := explicitCommandTemplate
+	if adpanelStartup != "" {
+		commandTemplate = ""
+	} else if commandTemplate == "" {
+		commandTemplate = defaultRuntimeCommandForType(tpl, startFile, dataDir)
+	}
+	if commandTemplate == "" && !imageConfigHasRuntimeDefault(imgCfg) {
+		if adpanelStartup != "" && strings.TrimSpace(env["STARTUP"]) != "" {
+			commandTemplate = ""
+		} else {
+			commandTemplate = "sleep infinity"
+		}
+	}
+	if commandTemplate != "" && shouldPreferImageDefaultRuntimeCommand(commandTemplate, imgCfg) {
+		fmt.Printf("[docker] ignoring path-only template command for %s and using image default entrypoint/cmd: %s\n", imageRef, commandTemplate)
+		commandTemplate = ""
+		if imageWorkdir := normalizeContainerWorkdir(imgCfg.Workdir); imageWorkdir != "" {
+			workdir = imageWorkdir
+		}
+	}
+	var cmdArgs []string
+	if adpanelStartup != "" && !imageConfigHasRuntimeDefault(imgCfg) && strings.TrimSpace(env["STARTUP"]) != "" {
+		cmdArgs = []string{"sh", "-lc", env["STARTUP"]}
+	} else if commandTemplate != "" {
+		ensureRuntimeEntrypointScaffold(serverDir, tpl, commandTemplate, dataDir, workdir, startFile, hostPort)
+		var err error
+		cmdArgs, err = buildRenderedRuntimeProcessArgs(tpl, commandTemplate, dataDir, startFile, imageRef, hostPort, resources, meta)
+		if err != nil {
+			return err
+		}
+	}
 
+	uid, gid := statUIDGID(serverDir)
+	req := dockerContainerCreateRequest{
+		Image:        imageRef,
+		Env:          envMapToList(env),
+		Cmd:          cmdArgs,
+		WorkingDir:   workdir,
+		User:         a.preferredStructuredContainerUser(ctx, imageRef, uid, gid),
+		Tty:          true,
+		OpenStdin:    true,
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+	}
+	portBindings, exposedPorts := a.buildStructuredPortBindings(serverDir, meta, hostPort, mainContainerPort)
+	req.ExposedPorts = exposedPorts
+	desiredRestart := strings.TrimSpace(fmt.Sprint(runtimeObj["restart"]))
+	if desiredRestart == "<nil>" {
+		desiredRestart = ""
+	}
+	req.HostConfig = buildStructuredHostConfig(
+		binds,
+		portBindings,
+		resources,
+		"no",
+		false,
+	)
+
+	if err := a.runStructuredContainerWithCompatUser(ctx, name, req); err != nil {
+		return err
+	}
+	if err := a.monitorCustomContainerBootstrap(ctx, name, imageRef); err != nil {
+		return err
+	}
+	if desiredRestart != "" && strings.ToLower(desiredRestart) != "no" {
+		a.docker.updateRestartPolicy(ctx, name, desiredRestart)
+	}
+	go a.recoverMisplacedFiles(name, serverDir)
 	return nil
 }
 
@@ -3824,7 +8090,6 @@ func fixGameServerVolumePermissions(serverDir string, image string) error {
 func guessStartupCommand(serverDir string, image string) string {
 	imageLower := strings.ToLower(image)
 
-
 	if _, err := os.Stat(filepath.Join(serverDir, "package.json")); err == nil {
 		return "cd /app && npm install --production && npm start"
 	}
@@ -3854,12 +8119,12 @@ func guessStartupCommand(serverDir string, image string) string {
 
 	if strings.Contains(imageLower, "node") {
 		if _, err := os.Stat(filepath.Join(serverDir, "index.js")); err == nil {
-			return "cd /app && npm install && node index.js"
+			return "node /app/index.js"
 		}
 		if _, err := os.Stat(filepath.Join(serverDir, "app.js")); err == nil {
-			return "cd /app && npm install && node app.js"
+			return "node /app/app.js"
 		}
-		return "cd /app && npm install && node index.js"
+		return "node /app/index.js"
 	}
 
 	if strings.Contains(imageLower, "go") || strings.Contains(imageLower, "golang") {
@@ -3904,31 +8169,160 @@ func guessStartupCommand(serverDir string, image string) string {
 	return ""
 }
 
-
 type logTail struct {
-	name   string
-	closed bool
+	name                 string
+	closed               bool
+	dockerSnapshotPrimed bool
 
 	mu      sync.Mutex
 	clients map[chan string]struct{}
+	recent  []string
+	recentN int
 
 	stopCh chan struct{}
 	cmd    *exec.Cmd
 }
+
+type logSnapshotCall struct {
+	done  chan struct{}
+	lines []string
+}
+
+const logTailRecentMaxLines = 1200
 
 type logManager struct {
 	mu    sync.Mutex
 	tails map[string]*logTail
 	d     Docker
 	debug bool
+
+	snapshotMu       sync.Mutex
+	snapshotInFlight map[string]*logSnapshotCall
 }
 
 func newLogManager(d Docker, debug bool) *logManager {
 	return &logManager{
-		tails: map[string]*logTail{},
-		d:     d,
-		debug: debug,
+		tails:            map[string]*logTail{},
+		d:                d,
+		debug:            debug,
+		snapshotInFlight: map[string]*logSnapshotCall{},
 	}
+}
+
+func normalizeStreamedLogLine(raw string) string {
+	line := strings.TrimRight(raw, "\r\n")
+	if strings.HasPrefix(line, "stdout:") {
+		line = strings.TrimPrefix(line, "stdout:")
+	} else if strings.HasPrefix(line, "stderr:") {
+		line = strings.TrimPrefix(line, "stderr:")
+	}
+	return cleanLogLine(line)
+}
+
+func (t *logTail) appendRecentLocked(line string) {
+	if line == "" {
+		return
+	}
+	limit := t.recentN
+	if limit <= 0 {
+		limit = logTailRecentMaxLines
+	}
+	for _, part := range strings.Split(line, "\n") {
+		part = strings.TrimRight(part, "\r")
+		if part == "" {
+			continue
+		}
+		t.recent = append(t.recent, part)
+	}
+	if overflow := len(t.recent) - limit; overflow > 0 {
+		copy(t.recent, t.recent[overflow:])
+		t.recent = t.recent[:limit]
+	}
+}
+
+func (t *logTail) appendRecentBatch(lines []string) {
+	if len(lines) == 0 {
+		return
+	}
+	t.mu.Lock()
+	for _, line := range lines {
+		t.appendRecentLocked(cleanLogLine(line))
+	}
+	t.mu.Unlock()
+}
+
+func (t *logTail) snapshotRecent(tail int) []string {
+	if tail <= 0 {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.recent) == 0 {
+		return nil
+	}
+	if tail > len(t.recent) {
+		tail = len(t.recent)
+	}
+	out := make([]string, tail)
+	copy(out, t.recent[len(t.recent)-tail:])
+	return out
+}
+
+func (t *logTail) markDockerSnapshotPrimed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.dockerSnapshotPrimed {
+		return false
+	}
+	t.dockerSnapshotPrimed = true
+	return true
+}
+
+func parseDockerLogSnapshot(raw string, tail int) []string {
+	cleaned := cleanLogLine(raw)
+	if cleaned == "" {
+		return nil
+	}
+	parts := strings.Split(cleaned, "\n")
+	lines := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimRight(part, "\r")
+		if part == "" {
+			continue
+		}
+		lines = append(lines, part)
+	}
+	if tail > 0 && len(lines) > tail {
+		lines = lines[len(lines)-tail:]
+	}
+	return lines
+}
+
+func (lm *logManager) fetchTailSnapshotSingleflight(name string, tail int, fetch func() []string) []string {
+	if tail <= 0 || fetch == nil {
+		return nil
+	}
+	key := fmt.Sprintf("%s:%d", name, tail)
+
+	lm.snapshotMu.Lock()
+	if call, ok := lm.snapshotInFlight[key]; ok {
+		lm.snapshotMu.Unlock()
+		<-call.done
+		return append([]string(nil), call.lines...)
+	}
+	call := &logSnapshotCall{done: make(chan struct{})}
+	lm.snapshotInFlight[key] = call
+	lm.snapshotMu.Unlock()
+
+	lines := fetch()
+
+	lm.snapshotMu.Lock()
+	call.lines = append([]string(nil), lines...)
+	close(call.done)
+	delete(lm.snapshotInFlight, key)
+	lm.snapshotMu.Unlock()
+
+	return append([]string(nil), lines...)
 }
 
 func (lm *logManager) getOrCreate(name string) *logTail {
@@ -3940,6 +8334,7 @@ func (lm *logManager) getOrCreate(name string) *logTail {
 	t := &logTail{
 		name:    name,
 		clients: map[chan string]struct{}{},
+		recentN: logTailRecentMaxLines,
 		stopCh:  make(chan struct{}),
 	}
 	lm.tails[name] = t
@@ -3973,9 +8368,30 @@ func (lm *logManager) removeIfEmpty(t *logTail) {
 	}
 }
 
+func (lm *logManager) primeDockerLogSnapshot(t *logTail, tail int) {
+	if t == nil || tail <= 0 || !t.markDockerSnapshotPrimed() {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	stdout, stderr, _, _ := lm.d.runCollect(ctx, "logs", "--tail", fmt.Sprint(tail), t.name)
+	cancel()
+
+	for _, line := range parseDockerLogSnapshot(stdout, tail) {
+		lm.sendToClients(t, "stdout:"+line)
+	}
+	for _, line := range parseDockerLogSnapshot(stderr, tail) {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "no such container") || strings.Contains(lower, "can not get logs from container which is dead") {
+			continue
+		}
+		lm.sendToClients(t, "stderr:"+line)
+	}
+}
+
 func (lm *logManager) followLoop(t *logTail) {
 	backoff := 1 * time.Second
-	lastExists := false
+	lastState := ""
 	fmt.Printf("[logs] starting follow loop for container: %s\n", t.name)
 	for {
 		select {
@@ -3986,13 +8402,13 @@ func (lm *logManager) followLoop(t *logTail) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		exists := lm.d.containerExists(ctx, t.name)
+		state := lm.d.containerState(ctx, t.name)
 		cancel()
-		if !exists {
-			if lastExists {
+		if state == "" {
+			if lastState != "" && lastState != "missing" {
 				fmt.Printf("[logs] container %s no longer exists, waiting...\n", t.name)
 			}
-			lastExists = false
+			lastState = "missing"
 			time.Sleep(backoff)
 			if backoff < 5*time.Second {
 				backoff += 500 * time.Millisecond
@@ -4000,13 +8416,26 @@ func (lm *logManager) followLoop(t *logTail) {
 			continue
 		}
 
-		if !lastExists {
-			fmt.Printf("[logs] container %s found, attaching to logs\n", t.name)
+		if state != "running" {
+			if state != lastState {
+				fmt.Printf("[logs] container %s is %s, waiting for running state before attaching logs\n", t.name, state)
+			}
+			lastState = state
+			time.Sleep(backoff)
+			if backoff < 5*time.Second {
+				backoff += 500 * time.Millisecond
+			}
+			continue
 		}
-		lastExists = true
+
+		if lastState != "running" {
+			fmt.Printf("[logs] container %s running, attaching to live logs\n", t.name)
+			lm.primeDockerLogSnapshot(t, 200)
+		}
+		lastState = "running"
 		backoff = 1 * time.Second
 
-		cmd := exec.Command("docker", "logs", "--tail", "200", "-f", t.name)
+		cmd := exec.Command("docker", "logs", "--tail", "0", "-f", dockerContainerName(t.name))
 		stdout, _ := cmd.StdoutPipe()
 		stderr, _ := cmd.StderrPipe()
 		if err := cmd.Start(); err != nil {
@@ -4063,13 +8492,28 @@ func (lm *logManager) followLoop(t *logTail) {
 
 func (lm *logManager) sendToClients(t *logTail, s string) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.appendRecentLocked(normalizeStreamedLogLine(s))
 	for ch := range t.clients {
 		select {
 		case ch <- s:
 		default:
 		}
 	}
+	t.mu.Unlock()
+}
+
+func (lm *logManager) resetRecent(name string) {
+	lm.mu.Lock()
+	t, ok := lm.tails[name]
+	lm.mu.Unlock()
+	if !ok || t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	t.recent = nil
+	t.dockerSnapshotPrimed = false
+	t.mu.Unlock()
 }
 
 func (lm *logManager) killTail(name string) {
@@ -4097,6 +8541,12 @@ func (lm *logManager) killTail(name string) {
 	delete(lm.tails, name)
 }
 
+func (a *Agent) ensureLiveLogs(name string) {
+	if a == nil || a.logs == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	a.logs.getOrCreate(name)
+}
 
 func getDirSizeBytes(dir string) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -4231,7 +8681,6 @@ func (dm *diskMonitor) checkAllServers() {
 			}
 		}
 
-
 		if limitBytes <= 0 {
 			continue
 		}
@@ -4284,6 +8733,262 @@ func (dm *diskMonitor) handleOverLimit(serverName string, usedBytes, limitBytes 
 	} else {
 		fmt.Printf("[disk-monitor] Container %s stopped due to disk limit exceeded\n", serverName)
 	}
+}
+
+type networkAbuseMonitor struct {
+	agent    *Agent
+	interval time.Duration
+	workers  int
+	stopCh   chan struct{}
+	debug    bool
+}
+
+func newNetworkAbuseMonitor(agent *Agent, interval time.Duration, debug bool) *networkAbuseMonitor {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	if v := os.Getenv("NETWORK_ABUSE_MONITOR_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1000 && n <= 60000 {
+			interval = time.Duration(n) * time.Millisecond
+		}
+	}
+
+	workers := runtime.NumCPU() * 2
+	if workers < 4 {
+		workers = 4
+	}
+	if workers > 16 {
+		workers = 16
+	}
+	if v := os.Getenv("NETWORK_ABUSE_MONITOR_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 64 {
+			workers = n
+		}
+	}
+
+	return &networkAbuseMonitor{
+		agent:    agent,
+		interval: interval,
+		workers:  workers,
+		stopCh:   make(chan struct{}),
+		debug:    debug,
+	}
+}
+
+func (nm *networkAbuseMonitor) start() {
+	go nm.monitorLoop()
+}
+
+func (nm *networkAbuseMonitor) stop() {
+	close(nm.stopCh)
+}
+
+func (nm *networkAbuseMonitor) monitorLoop() {
+	time.Sleep(12 * time.Second)
+
+	ticker := time.NewTicker(nm.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-nm.stopCh:
+			return
+		default:
+			nm.checkAllServers()
+		}
+
+		select {
+		case <-nm.stopCh:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (nm *networkAbuseMonitor) checkAllServers() {
+	entries, err := os.ReadDir(nm.agent.volumesDir)
+	if err != nil {
+		if nm.debug {
+			fmt.Fprintf(os.Stderr, "[network-abuse] error reading volumes dir: %v\n", err)
+		}
+		return
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	if len(names) == 0 {
+		return
+	}
+
+	workers := nm.workers
+	if workers > len(names) {
+		workers = len(names)
+	}
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for name := range jobs {
+				nm.checkServer(name)
+			}
+		}()
+	}
+
+	for _, name := range names {
+		select {
+		case <-nm.stopCh:
+			close(jobs)
+			wg.Wait()
+			return
+		case jobs <- name:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func (nm *networkAbuseMonitor) checkServer(serverName string) {
+	if !isValidContainerName(serverName) || nm.agent == nil {
+		return
+	}
+
+	serverDir := nm.agent.serverDir(serverName)
+	meta := nm.agent.loadMeta(serverDir)
+	rule := networkAntiAbuseRuleFromMeta(meta)
+	if !rule.enabled {
+		return
+	}
+
+	inspectCtx, inspectCancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
+	inspected, exists, err := nm.agent.inspectContainerForStats(inspectCtx, serverName)
+	inspectCancel()
+	if err != nil || !exists || !inspected.State.Running {
+		if nm.debug && err != nil {
+			fmt.Fprintf(os.Stderr, "[network-abuse] inspect %s failed: %v\n", serverName, err)
+		}
+		return
+	}
+
+	statsCtx, statsCancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
+	stats, err := nm.agent.readContainerStatsForServer(statsCtx, serverName)
+	statsCancel()
+	if err != nil {
+		if nm.debug {
+			fmt.Fprintf(os.Stderr, "[network-abuse] stats %s failed: %v\n", serverName, err)
+		}
+		return
+	}
+	if len(stats.Networks) == 0 {
+		return
+	}
+
+	rawRx, rawTx := sumDockerNetworkBytes(stats.Networks)
+	if nm.agent.resourceStats == nil {
+		return
+	}
+	entry := nm.agent.resourceStats.get(serverName)
+	now := time.Now()
+	entry.mu.Lock()
+	entry.touchedAt = now
+	_, _, windowRx, windowTx, _ := entry.updateNetworkCounters(inspected.ID, rawRx, rawTx, now, rule.resetEvery)
+	entry.mu.Unlock()
+
+	inboundExceeded := rule.inboundLimitBytes > 0 && windowRx >= rule.inboundLimitBytes
+	outboundExceeded := rule.outboundLimitBytes > 0 && windowTx >= rule.outboundLimitBytes
+	if !inboundExceeded && !outboundExceeded {
+		return
+	}
+
+	reason := "network limit reached"
+	if inboundExceeded && outboundExceeded {
+		reason = "inbound and outbound network limits reached"
+	} else if inboundExceeded {
+		reason = "inbound network limit reached"
+	} else if outboundExceeded {
+		reason = "outbound network limit reached"
+	}
+	if nm.debug {
+		fmt.Printf("[network-abuse] %s exceeded limit: inbound=%d/%d outbound=%d/%d\n",
+			serverName, windowRx, rule.inboundLimitBytes, windowTx, rule.outboundLimitBytes)
+	}
+	if err := nm.agent.stopServerForPolicy(serverName, reason); err != nil && nm.debug {
+		fmt.Fprintf(os.Stderr, "[network-abuse] stop %s failed: %v\n", serverName, err)
+	}
+}
+
+func (a *Agent) stopServerForPolicy(name, reason string) error {
+	if !isValidContainerName(name) {
+		return fmt.Errorf("invalid container name")
+	}
+
+	opMu := a.getServerOpLock(name)
+	opMu.Lock()
+	defer opMu.Unlock()
+
+	a.stopMu.Lock()
+	if lastStop, ok := a.stoppingNow[name]; ok && time.Since(lastStop) < 5*time.Second {
+		a.stopMu.Unlock()
+		return nil
+	}
+	a.stoppingNow[name] = time.Now()
+	a.stopMu.Unlock()
+	defer func() {
+		a.stopMu.Lock()
+		delete(a.stoppingNow, name)
+		a.stopMu.Unlock()
+	}()
+
+	inspectCtx, inspectCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	inspected, exists, err := a.inspectContainerForStats(inspectCtx, name)
+	inspectCancel()
+	if err != nil {
+		return err
+	}
+	if !exists || !inspected.State.Running {
+		return nil
+	}
+
+	updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	a.docker.updateRestartNo(updateCtx, name)
+	updateCancel()
+
+	if a.stdinMgr != nil {
+		a.stdinMgr.remove(name)
+	}
+
+	serverDir := a.serverDir(name)
+	meta := a.loadMeta(serverDir)
+	serverType := strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["type"])))
+	templateType := strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["template"])))
+	isMinecraft := serverType == "" || serverType == "minecraft" || templateType == "minecraft"
+
+	if isMinecraft {
+		commandCtx, commandCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = a.docker.sendCommand(commandCtx, a.stdinMgr, name, "stop", true)
+		commandCancel()
+	}
+
+	a.broadcastContainerEvent(name, "stopping")
+	time.Sleep(a.stopGrace)
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	a.docker.stop(stopCtx, name)
+	stopCancel()
+	if a.stdinMgr != nil {
+		a.stdinMgr.remove(name)
+	}
+
+	a.broadcastContainerEvent(name, "stopped")
+	fmt.Printf("[network-abuse] Container %s stopped safely: %s\n", name, reason)
+	auditLog.Log("server_stop", "node-agent", "", name, "network-abuse-stop", "success", map[string]any{"reason": reason})
+	return nil
 }
 
 func (a *Agent) getServerDiskUsage(serverDir string) int64 {
@@ -4341,12 +9046,12 @@ func (a *Agent) checkDiskLimit(serverDir string, extraBytes int64) map[string]an
 		usedMb := float64(usedBytes) / (1024 * 1024)
 		limitMb := float64(limitBytes) / (1024 * 1024)
 		return map[string]any{
-			"error":     "disk_limit_exceeded",
-			"message":   fmt.Sprintf("This server has exceeded its disk space limit. Used: %.1f MB / %.1f MB", usedMb, limitMb),
-			"usedBytes": usedBytes,
+			"error":      "disk_limit_exceeded",
+			"message":    fmt.Sprintf("This server has exceeded its disk space limit. Used: %.1f MB / %.1f MB", usedMb, limitMb),
+			"usedBytes":  usedBytes,
 			"limitBytes": limitBytes,
-			"usedMb":    usedMb,
-			"limitMb":   limitMb,
+			"usedMb":     usedMb,
+			"limitMb":    limitMb,
 		}
 	}
 	return nil
@@ -4373,6 +9078,112 @@ func (a *Agent) checkDiskLimitForPath(absPath string, extraBytes int64) map[stri
 	return a.checkDiskLimit(serverDir, extraBytes)
 }
 
+func (a *Agent) checkDiskLimitForPathAfterReplacing(absPath string, replacedBytes int64) map[string]any {
+	serverName := a.serverNameFromPath(absPath)
+	if serverName == "" || serverName == ".adpanel_meta" {
+		return nil
+	}
+	serverDir := a.serverDir(serverName)
+	limitBytes := a.getServerDiskLimitBytes(serverDir)
+	if limitBytes <= 0 {
+		return nil
+	}
+	usedBytes := a.getServerDiskUsage(serverDir)
+	finalUsedBytes := usedBytes - replacedBytes
+	if finalUsedBytes < 0 {
+		finalUsedBytes = 0
+	}
+	if finalUsedBytes > limitBytes {
+		usedMb := float64(finalUsedBytes) / (1024 * 1024)
+		limitMb := float64(limitBytes) / (1024 * 1024)
+		return map[string]any{
+			"error":      "disk_limit_exceeded",
+			"message":    fmt.Sprintf("This server has exceeded its disk space limit. Used: %.1f MB / %.1f MB", usedMb, limitMb),
+			"usedBytes":  finalUsedBytes,
+			"limitBytes": limitBytes,
+			"usedMb":     usedMb,
+			"limitMb":    limitMb,
+		}
+	}
+	return nil
+}
+
+func diskLimitUploadPayload(usedBytes, limitBytes, incomingBytes int64) map[string]any {
+	if usedBytes < 0 {
+		usedBytes = 0
+	}
+	if incomingBytes < 0 {
+		incomingBytes = 0
+	}
+	remainingBytes := limitBytes - usedBytes
+	if remainingBytes < 0 {
+		remainingBytes = 0
+	}
+	usedMb := float64(usedBytes) / (1024 * 1024)
+	limitMb := float64(limitBytes) / (1024 * 1024)
+	return map[string]any{
+		"error":          "disk_limit_exceeded",
+		"message":        fmt.Sprintf("Upload would exceed this server's disk space limit. Used: %.1f MB / %.1f MB", usedMb, limitMb),
+		"usedBytes":      usedBytes,
+		"limitBytes":     limitBytes,
+		"remainingBytes": remainingBytes,
+		"incomingBytes":  incomingBytes,
+		"usedMb":         usedMb,
+		"limitMb":        limitMb,
+	}
+}
+
+func (a *Agent) uploadDiskAllowanceForPath(absPath string, replacedBytes int64) (allowedBytes, baseUsedBytes, limitBytes int64, limited bool, diskErr map[string]any) {
+	serverName := a.serverNameFromPath(absPath)
+	if serverName == "" || serverName == ".adpanel_meta" {
+		return 0, 0, 0, false, nil
+	}
+	serverDir := a.serverDir(serverName)
+	limitBytes = a.getServerDiskLimitBytes(serverDir)
+	if limitBytes <= 0 {
+		return 0, 0, 0, false, nil
+	}
+	usedBytes := a.getServerDiskUsage(serverDir)
+	baseUsedBytes = usedBytes - replacedBytes
+	if baseUsedBytes < 0 {
+		baseUsedBytes = 0
+	}
+	if baseUsedBytes > limitBytes {
+		return 0, baseUsedBytes, limitBytes, true, diskLimitUploadPayload(baseUsedBytes, limitBytes, 0)
+	}
+	return limitBytes - baseUsedBytes, baseUsedBytes, limitBytes, true, nil
+}
+
+func copyUploadWithLimits(dst io.Writer, src io.Reader, maxBytes int64, diskAllowedBytes int64) (int64, string, error) {
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if maxBytes <= 0 {
+		maxBytes = maxInt64
+	}
+	buf := make([]byte, 64*1024)
+	var written int64
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			next := written + int64(n)
+			if next > maxBytes {
+				return written, "upload", nil
+			}
+			if diskAllowedBytes >= 0 && next > diskAllowedBytes {
+				return written, "disk", nil
+			}
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return written, "", writeErr
+			}
+			written = next
+		}
+		if readErr == io.EOF {
+			return written, "", nil
+		}
+		if readErr != nil {
+			return written, "", readErr
+		}
+	}
+}
 
 func protectNodeProcess() {
 	pid := os.Getpid()
@@ -4524,7 +9335,6 @@ func (mm *memoryMonitor) tick() {
 				containerName, containerUsedPct,
 				usageBytes/(1024*1024), limitLabel)
 		}
-
 
 		if containerUsedPct >= 99.0 {
 			idShort := containerID
@@ -4714,7 +9524,6 @@ func (mm *memoryMonitor) killContainer(containerID, containerName string) {
 	mm.recentKillsMu.Unlock()
 }
 
-
 func (mm *memoryMonitor) getContainerState(containerID string) *containerMemState {
 	mm.statesMu.Lock()
 	defer mm.statesMu.Unlock()
@@ -4759,7 +9568,6 @@ func (mm *memoryMonitor) pruneRecentKills() {
 		}
 	}
 }
-
 
 type rateLimiter struct {
 	mu       sync.Mutex
@@ -4932,10 +9740,27 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"node": map[string]any{
 				"uuid":       a.uuid,
 				"version":    NodeVersion,
+				"autoUpdate": a.readNodeInformation().NodeAutoUpdate,
 				"dataRoot":   a.dataRoot,
 				"volumesDir": a.volumesDir,
 			},
 		})
+		return
+
+	case method == "GET" && path == "/v1/ports/check":
+		a.handlePortCheck(w, r)
+		return
+
+	case method == "GET" && path == "/v1/update/info":
+		a.handleNodeUpdateInfo(w, r)
+		return
+
+	case method == "POST" && path == "/v1/update/auto":
+		a.handleNodeUpdateAuto(w, r)
+		return
+
+	case method == "POST" && path == "/v1/update/install":
+		a.handleNodeUpdateInstall(w, r)
 		return
 
 	case method == "GET" && path == "/v1/ws":
@@ -4948,6 +9773,10 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	case method == "POST" && (path == "/v1/servers" || path == "/v1/servers/create"):
 		a.handleCreateServer(w, r)
+		return
+
+	case method == "POST" && path == "/v1/runtime/startup-command":
+		a.handleTemplateStartupCommand(w, r)
 		return
 
 	case method == "POST" && path == "/v1/fs/list":
@@ -4979,6 +9808,9 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case method == "POST" && path == "/v1/fs/upload":
 		a.handleFSUploadStream(w, r)
+		return
+	case method == "POST" && path == "/v1/fs/uploadUrl":
+		a.handleFSUploadURL(w, r)
 		return
 
 	case method == "POST" && path == "/v1/server/command":
@@ -5166,6 +9998,48 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, 404, map[string]any{"error": "not found"})
 }
 
+func (a *Agent) handlePortCheck(w http.ResponseWriter, r *http.Request) {
+	port, ok := parseStrictPortValue(r.URL.Query().Get("port"))
+	if !ok {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid port"})
+		return
+	}
+	exclude := sanitizeName(r.URL.Query().Get("exclude"))
+	rawProtocols := strings.TrimSpace(r.URL.Query().Get("protocols"))
+	if rawProtocols == "" {
+		rawProtocols = strings.TrimSpace(r.URL.Query().Get("protocol"))
+	}
+	protocols := []string{"tcp"}
+	if rawProtocols != "" {
+		protocols = nil
+		for _, part := range strings.Split(rawProtocols, ",") {
+			if protocol := normalizePortProtocolName(part); protocol != "" {
+				protocols = append(protocols, protocol)
+			}
+		}
+		if len(protocols) == 0 {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid protocol"})
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	available, owner, reason := a.hostPortAvailabilityForProtocols(ctx, port, protocols, exclude)
+	cancel()
+
+	payload := map[string]any{
+		"ok":        true,
+		"port":      port,
+		"protocols": protocols,
+		"available": available,
+	}
+	if owner != "" {
+		payload["owner"] = owner
+	}
+	if reason != "" {
+		payload["reason"] = reason
+	}
+	jsonWrite(w, 200, payload)
+}
 
 func (a *Agent) handleSystemStats(w http.ResponseWriter, r *http.Request) {
 	var memStats runtime.MemStats
@@ -5432,26 +10306,126 @@ func (a *Agent) handleListServers(w http.ResponseWriter, r *http.Request) {
 }
 
 type resourceLimits struct {
-	RamMb        *int     `json:"ramMb"`
-	CpuCores     *float64 `json:"cpuCores"`
-	StorageMb    *int     `json:"storageMb"`
-	StorageGb    *int     `json:"storageGb"`
-	SwapMb       *int     `json:"swapMb"`
-	BackupsMax   *int     `json:"backupsMax"`
-	MaxSchedules *int     `json:"maxSchedules"`
+	RamMb                  *int     `json:"ramMb"`
+	CpuCores               *float64 `json:"cpuCores"`
+	StorageMb              *int     `json:"storageMb"`
+	StorageGb              *int     `json:"storageGb"`
+	SwapMb                 *int     `json:"swapMb"`
+	BackupsMax             *int     `json:"backupsMax"`
+	MaxSchedules           *int     `json:"maxSchedules"`
+	IoWeight               *int     `json:"ioWeight"`
+	CpuWeight              *int     `json:"cpuWeight"`
+	PidsLimit              *int     `json:"pidsLimit"`
+	FileLimit              *int     `json:"fileLimit"`
+	NetworkInboundLimitMb  *int64   `json:"networkInboundLimitMb"`
+	NetworkOutboundLimitMb *int64   `json:"networkOutboundLimitMb"`
+	NetworkResetMinutes    *int     `json:"networkResetMinutes"`
 }
 
 type dockerTemplateConfig struct {
-	Image          string            `json:"image"`
-	Tag            string            `json:"tag"`
-	Command        string            `json:"command"`
-	Ports          []int             `json:"ports"`
-	Volumes        []string          `json:"volumes"`
-	Env            map[string]string `json:"env"`
-	Restart        string            `json:"restart"`
-	RestartPolicy  string            `json:"restartPolicy"`
-	StartupCommand string            `json:"startupCommand"`
-	Console        any               `json:"console"`
+	Image          string                 `json:"image"`
+	Tag            string                 `json:"tag"`
+	Command        string                 `json:"command"`
+	ADPanelStartup string                 `json:"adpanelStartup"`
+	LegacyStartup  string                 `json:"pterodactylStartup"`
+	Ports          []int                  `json:"ports"`
+	PortProtocols  map[string][]string    `json:"portProtocols"`
+	Volumes        []string               `json:"volumes"`
+	Workdir        string                 `json:"workdir"`
+	WorkingDir     string                 `json:"workingDir"`
+	Env            map[string]string      `json:"env"`
+	Restart        string                 `json:"restart"`
+	RestartPolicy  string                 `json:"restartPolicy"`
+	StartupCommand string                 `json:"startupCommand"`
+	Install        *templateInstallConfig `json:"install"`
+	Installation   *templateInstallConfig `json:"installation"`
+	Console        any                    `json:"console"`
+}
+
+type templateInstallConfig struct {
+	Image            string            `json:"image"`
+	Container        string            `json:"container"`
+	Script           string            `json:"script"`
+	Entrypoint       string            `json:"entrypoint"`
+	MountPath        string            `json:"mountPath"`
+	ContainerPath    string            `json:"containerPath"`
+	RuntimePath      string            `json:"runtimePath"`
+	TimeoutSeconds   int               `json:"timeoutSeconds"`
+	Timeout          int               `json:"timeout"`
+	MinimumStorageMb int               `json:"minimumStorageMb"`
+	AllowEmpty       bool              `json:"allowEmpty"`
+	AllowEmptyResult bool              `json:"allowEmptyResult"`
+	Env              map[string]string `json:"env"`
+}
+
+type templateStartupCommandReq struct {
+	TemplateId      string `json:"templateId"`
+	Image           string `json:"image"`
+	Tag             string `json:"tag"`
+	StartFile       string `json:"startFile"`
+	DataDir         string `json:"dataDir"`
+	FallbackCommand string `json:"fallbackCommand"`
+}
+
+func (a *Agent) handleTemplateStartupCommand(w http.ResponseWriter, r *http.Request) {
+	var req templateStartupCommandReq
+	if err := readJSON(w, r, 1<<20, &req); err != nil {
+		jsonWrite(w, 400, map[string]any{"error": "invalid request body"})
+		return
+	}
+
+	templateType := strings.ToLower(strings.TrimSpace(req.TemplateId))
+	image := strings.TrimSpace(req.Image)
+	tag := strings.TrimSpace(req.Tag)
+	if image == "" {
+		jsonWrite(w, 400, map[string]any{"error": "missing image"})
+		return
+	}
+	if strings.ContainsAny(image, " \t\r\n") {
+		jsonWrite(w, 400, map[string]any{"error": "invalid image"})
+		return
+	}
+	if tag == "" {
+		tag = "latest"
+	}
+	if strings.ContainsAny(tag, " \t\r\n") {
+		jsonWrite(w, 400, map[string]any{"error": "invalid tag"})
+		return
+	}
+
+	startFile := strings.TrimSpace(req.StartFile)
+	if startFile == "" {
+		startFile = defaultStartFileForType(templateType)
+	}
+	dataDir := strings.TrimSpace(req.DataDir)
+	if dataDir == "" {
+		dataDir = defaultDataDirForType(templateType)
+	}
+
+	imageRef := image + ":" + tag
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	command, source, inspected, err := a.inferRuntimeProcessCommandFromImage(ctx, templateType, imageRef, startFile, dataDir, req.FallbackCommand)
+	if err != nil {
+		jsonWrite(w, 502, map[string]any{"ok": false, "error": "failed to infer startup command", "detail": err.Error()})
+		return
+	}
+	workingDir := strings.TrimSpace(inspected.Workdir)
+	if workingDir == "" {
+		workingDir = "/"
+	}
+
+	jsonWrite(w, 200, map[string]any{
+		"ok":         true,
+		"command":    command,
+		"source":     source,
+		"imageRef":   imageRef,
+		"entrypoint": inspected.Entrypoint,
+		"cmd":        inspected.Cmd,
+		"workingDir": workingDir,
+		"env":        inspected.Env,
+	})
 }
 
 type createReq struct {
@@ -5461,9 +10435,11 @@ type createReq struct {
 	MCVersion      string                `json:"mcVersion"`
 	HostPort       int                   `json:"hostPort"`
 	AutoStart      bool                  `json:"autoStart"`
+	AsyncSetup     bool                  `json:"asyncSetup"`
 	Resources      *resourceLimits       `json:"resources"`
 	Docker         *dockerTemplateConfig `json:"docker"`
 	StartupCommand string                `json:"startupCommand"`
+	JavaVersion    string                `json:"javaVersion"`
 	ImportUrl      string                `json:"importUrl"`
 }
 
@@ -5486,6 +10462,67 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.Template) == "" {
 		jsonWrite(w, 400, map[string]any{"error": "missing templateId"})
 		return
+	}
+	if req.HostPort != 0 {
+		if _, ok := parseStrictPortValue(req.HostPort); !ok {
+			jsonWrite(w, 400, map[string]any{"error": "invalid hostPort"})
+			return
+		}
+	}
+	if req.Docker != nil {
+		for _, p := range req.Docker.Ports {
+			if _, ok := parseStrictPortValue(p); !ok {
+				jsonWrite(w, 400, map[string]any{"error": fmt.Sprintf("invalid docker port: %d", p)})
+				return
+			}
+		}
+		if cleanPortProtocols := sanitizeDockerPortProtocols(req.Docker.PortProtocols, req.Docker.Ports); len(req.Docker.PortProtocols) > 0 && len(cleanPortProtocols) == 0 {
+			jsonWrite(w, 400, map[string]any{"error": "invalid docker port protocols"})
+			return
+		}
+	}
+	if strings.TrimSpace(req.StartupCommand) != "" || (req.Docker != nil && strings.TrimSpace(req.Docker.StartupCommand) != "") {
+		jsonWrite(w, 400, map[string]any{"error": "raw docker startup commands are no longer supported"})
+		return
+	}
+	if reason := validateResourcePerformanceLimits(req.Resources); reason != "" {
+		jsonWrite(w, 400, map[string]any{"error": reason})
+		return
+	}
+
+	templateForPort := strings.ToLower(strings.TrimSpace(req.Template))
+	hostPortForCheck := req.HostPort
+	if hostPortForCheck == 0 {
+		if templateForPort == "minecraft" {
+			hostPortForCheck = 25565
+		} else if req.Docker != nil && len(req.Docker.Ports) > 0 && req.Docker.Ports[0] > 0 {
+			hostPortForCheck = req.Docker.Ports[0]
+		} else {
+			hostPortForCheck = 8080
+		}
+	}
+	protocolsForMainPort := []string{"tcp"}
+	if req.Docker != nil {
+		portProtocols := runtimePortProtocolMap(sanitizeDockerPortProtocols(req.Docker.PortProtocols, req.Docker.Ports))
+		if len(req.Docker.Ports) > 0 {
+			protocolsForMainPort = portProtocolsFor(portProtocols, req.Docker.Ports[0])
+		}
+	}
+
+	if hostPortForCheck > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		available, owner, reason := a.hostPortAvailabilityForProtocols(ctx, hostPortForCheck, protocolsForMainPort, "")
+		cancel()
+		if !available {
+			msg := fmt.Sprintf("port %d is already in use", hostPortForCheck)
+			if owner != "" {
+				msg = fmt.Sprintf("port %d is already used by container %s", hostPortForCheck, owner)
+			} else if reason != "" {
+				msg = fmt.Sprintf("port %d is unavailable (%s)", hostPortForCheck, reason)
+			}
+			jsonWrite(w, 409, map[string]any{"error": msg, "code": "port_in_use", "port": hostPortForCheck, "owner": owner})
+			return
+		}
 	}
 
 	opMu := a.getServerOpLock(name)
@@ -5540,6 +10577,27 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 		if req.Resources.MaxSchedules != nil {
 			resourcesMeta["maxSchedules"] = *req.Resources.MaxSchedules
 		}
+		if req.Resources.IoWeight != nil {
+			resourcesMeta["ioWeight"] = *req.Resources.IoWeight
+		}
+		if req.Resources.CpuWeight != nil {
+			resourcesMeta["cpuWeight"] = *req.Resources.CpuWeight
+		}
+		if req.Resources.PidsLimit != nil {
+			resourcesMeta["pidsLimit"] = *req.Resources.PidsLimit
+		}
+		if req.Resources.FileLimit != nil {
+			resourcesMeta["fileLimit"] = *req.Resources.FileLimit
+		}
+		if req.Resources.NetworkInboundLimitMb != nil && *req.Resources.NetworkInboundLimitMb > 0 {
+			resourcesMeta["networkInboundLimitMb"] = *req.Resources.NetworkInboundLimitMb
+		}
+		if req.Resources.NetworkOutboundLimitMb != nil && *req.Resources.NetworkOutboundLimitMb > 0 {
+			resourcesMeta["networkOutboundLimitMb"] = *req.Resources.NetworkOutboundLimitMb
+		}
+		if req.Resources.NetworkResetMinutes != nil && *req.Resources.NetworkResetMinutes > 0 {
+			resourcesMeta["networkResetMinutes"] = *req.Resources.NetworkResetMinutes
+		}
 	}
 
 	if template == "minecraft" {
@@ -5558,6 +10616,90 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 
 		writeMinecraftScaffold(serverDir, name, fork, ver)
 
+		mcImage := defaultMinecraftProcessImage
+		mcTag := defaultMinecraftProcessTag
+		mcCommand := defaultMinecraftProcessCommand
+		mcWorkdir := "/data"
+		mcJavaVersion := normalizeMinecraftJavaVersion(req.JavaVersion)
+		if strings.TrimSpace(req.JavaVersion) != "" && mcJavaVersion == "" {
+			jsonWrite(w, 400, map[string]any{"error": "unsupported minecraft java version"})
+			return
+		}
+		if req.Docker != nil && req.Docker.Image != "" {
+			mcImage = req.Docker.Image
+			if req.Docker.Tag != "" {
+				mcTag = req.Docker.Tag
+			}
+			reqWorkdir := strings.TrimSpace(req.Docker.Workdir)
+			if reqWorkdir == "" {
+				reqWorkdir = strings.TrimSpace(req.Docker.WorkingDir)
+			}
+			if reqWorkdir != "" {
+				cleanWorkdir := normalizeContainerWorkdir(reqWorkdir)
+				if cleanWorkdir == "" {
+					jsonWrite(w, 400, map[string]any{"error": "invalid workdir (must be an absolute path like /data)"})
+					return
+				}
+				mcWorkdir = cleanWorkdir
+			}
+			if cmd := sanitizeRuntimeCommand(req.Docker.Command); cmd != "" {
+				mcCommand = normalizeLegacyRuntimeProcessCommand("minecraft", cmd, "server.jar", "/data")
+				if reason := validateRuntimeProcessCommand(mcCommand); reason != "" {
+					jsonWrite(w, 400, map[string]any{"error": reason})
+					return
+				}
+			}
+		}
+		if mcJavaVersion == "" {
+			mcJavaVersion = minecraftJavaVersionFromTag(mcTag)
+		}
+		if mcJavaVersion != "" {
+			mcImage = defaultMinecraftProcessImage
+			mcTag = minecraftJavaTag(mcJavaVersion)
+		}
+
+		meta = map[string]any{
+			"type":     "minecraft",
+			"fork":     fork,
+			"version":  ver,
+			"start":    "server.jar",
+			"hostPort": hostPort,
+			"runtime": map[string]any{
+				"image":   mcImage,
+				"tag":     mcTag,
+				"command": mcCommand,
+				"workdir": mcWorkdir,
+				"javaVersion": func() any {
+					if mcJavaVersion != "" {
+						return mcJavaVersion
+					}
+					return nil
+				}(),
+			},
+		}
+		if len(resourcesMeta) > 0 {
+			meta["resources"] = resourcesMeta
+		}
+		if req.AsyncSetup {
+			meta["setupStatus"] = "queued"
+			meta["setupMessage"] = "Server setup queued"
+			meta["setupUpdatedAt"] = time.Now().UnixMilli()
+		}
+		_ = a.saveMeta(serverDir, meta)
+
+		if req.AsyncSetup {
+			auditLog.Log("server_create", getClientIP(r), "", name, "create", "accepted", map[string]any{"template": req.Template, "asyncSetup": true})
+			continueSetup := a.prepareMinecraftCreateSetup(req, name, serverDir, meta)
+			if latestMeta := a.loadMeta(serverDir); latestMeta != nil {
+				meta = latestMeta
+			}
+			if continueSetup {
+				go a.finishMinecraftCreateSetup(req, name, serverDir, meta, hostPort)
+			}
+			jsonWrite(w, 200, map[string]any{"ok": true, "name": name, "meta": meta, "asyncSetup": true})
+			return
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		jarURL := getMinecraftJarURL(ctx, a.dl, fork, ver, a.debug)
 		cancel()
@@ -5570,31 +10712,6 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 		}
 		cancelD()
 
-		mcImage := "itzg/minecraft-server"
-		mcTag := "latest"
-		if req.Docker != nil && req.Docker.Image != "" {
-			mcImage = req.Docker.Image
-			if req.Docker.Tag != "" {
-				mcTag = req.Docker.Tag
-			}
-		}
-
-		meta = map[string]any{
-			"type":     "minecraft",
-			"fork":     fork,
-			"version":  ver,
-			"start":    "server.jar",
-			"hostPort": hostPort,
-			"runtime": map[string]any{
-				"image": mcImage,
-				"tag":   mcTag,
-			},
-		}
-		if len(resourcesMeta) > 0 {
-			meta["resources"] = resourcesMeta
-		}
-		_ = a.saveMeta(serverDir, meta)
-
 		enforceServerProps(serverDir)
 
 		if req.ImportUrl != "" {
@@ -5604,60 +10721,26 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		effectiveCmd := a.buildEffectiveDockerCommand(name, serverDir, meta)
-		if effectiveCmd != "" {
-			meta["startupCommand"] = effectiveCmd
-			runtimeObj, _ := meta["runtime"].(map[string]any)
-			if runtimeObj == nil {
-				runtimeObj = make(map[string]any)
-			}
-			runtimeObj["startupCommand"] = effectiveCmd
-			meta["runtime"] = runtimeObj
-			_ = a.saveMeta(serverDir, meta)
-		}
-
 		if req.AutoStart {
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			var err error
-			if effectiveCmd != "" {
-				err = a.executeStartupCommand(ctx, name, serverDir, hostPort, effectiveCmd, req.Resources, meta)
-			} else {
-				err = a.startMinecraftContainer(ctx, name, serverDir, hostPort, req.Resources, nil)
-			}
+			err := a.startMinecraftContainer(ctx, name, serverDir, hostPort, req.Resources, nil)
 			cancel()
 			if err != nil {
 				fmt.Printf("[createServer] Container startup failed, cleaning up: %s - %v\n", name, err)
 				_ = os.RemoveAll(serverDir)
+				_ = os.Remove(a.metaPath(name))
 				jsonWrite(w, 500, map[string]any{"error": "failed to start server", "detail": err.Error()})
 				return
 			}
+			a.ensureLiveLogs(name)
 		}
 	} else {
 		hostPort := req.HostPort
 		if hostPort == 0 {
-			hostPort = 8080
-		}
-
-		startupCmd := ""
-		if req.StartupCommand != "" {
-			startupCmd = req.StartupCommand
-		} else if req.Docker != nil && req.Docker.StartupCommand != "" {
-			startupCmd = req.Docker.StartupCommand
-		}
-
-		if startupCmd != "" && req.Docker != nil && req.Docker.Image != "" {
-			cmdImage := extractDockerImageFromCommand(startupCmd)
-			if cmdImage != "" {
-				normalizedTemplate := normalizeDockerImage(req.Docker.Image)
-				normalizedCmd := normalizeDockerImage(cmdImage)
-				if normalizedTemplate != normalizedCmd {
-					fmt.Printf("[security] BLOCKED startup command image mismatch at creation for %s: template=%q command=%q\n", name, req.Docker.Image, cmdImage)
-					jsonWrite(w, 400, map[string]any{
-						"error":  "image mismatch",
-						"detail": fmt.Sprintf("The Docker image in your startup command (%s) does not match the template image (%s). Please use the correct image or leave the startup command empty to use the default.", cmdImage, req.Docker.Image),
-					})
-					return
-				}
+			if req.Docker != nil && len(req.Docker.Ports) > 0 && req.Docker.Ports[0] > 0 {
+				hostPort = req.Docker.Ports[0]
+			} else {
+				hostPort = 8080
 			}
 		}
 
@@ -5669,11 +10752,19 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 			if req.Docker.Tag != "" {
 				runtimeConfig["tag"] = req.Docker.Tag
 			}
-			if req.Docker.Command != "" {
-				runtimeConfig["command"] = req.Docker.Command
+			if cmd := sanitizeRuntimeCommand(req.Docker.Command); cmd != "" {
+				cleanCmd := normalizeLegacyRuntimeProcessCommand(template, cmd, defaultStartFileForType(template), defaultDataDirForType(template))
+				if reason := validateRuntimeProcessCommand(cleanCmd); reason != "" {
+					jsonWrite(w, 400, map[string]any{"error": reason})
+					return
+				}
+				runtimeConfig["command"] = cleanCmd
 			}
 			if len(req.Docker.Ports) > 0 {
 				runtimeConfig["ports"] = req.Docker.Ports
+			}
+			if portProtocols := sanitizeDockerPortProtocols(req.Docker.PortProtocols, req.Docker.Ports); len(portProtocols) > 0 {
+				runtimeConfig["portProtocols"] = portProtocols
 			}
 			if len(req.Docker.Volumes) > 0 {
 				runtimeConfig["volumes"] = req.Docker.Volumes
@@ -5681,12 +10772,34 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 			if len(req.Docker.Env) > 0 {
 				runtimeConfig["env"] = req.Docker.Env
 			}
+			if startup := startupTemplateFromDockerConfig(req.Docker); startup != "" {
+				runtimeConfig["adpanelStartup"] = startup
+				delete(runtimeConfig, "command")
+			}
+			if install := dockerTemplateInstall(req.Docker); install != nil {
+				runtimeConfig["install"] = install
+			}
+			reqWorkdir := strings.TrimSpace(req.Docker.Workdir)
+			if reqWorkdir == "" {
+				reqWorkdir = strings.TrimSpace(req.Docker.WorkingDir)
+			}
+			if reqWorkdir != "" {
+				cleanWorkdir := normalizeContainerWorkdir(reqWorkdir)
+				if cleanWorkdir == "" {
+					jsonWrite(w, 400, map[string]any{"error": "invalid workdir (must be an absolute path like /app)"})
+					return
+				}
+				runtimeConfig["workdir"] = cleanWorkdir
+			}
 			runtimeConfig["providerId"] = "custom"
 		}
-
-		if startupCmd != "" {
-			runtimeConfig["startupCommand"] = startupCmd
-			fmt.Printf("[createServer] Storing startupCommand in runtimeConfig: %q\n", startupCmd)
+		if _, ok := runtimeConfig["command"]; !ok {
+			if defaultCmd := defaultRuntimeCommandForType(template, defaultStartFileForType(template), defaultDataDirForType(template)); defaultCmd != "" {
+				runtimeConfig["command"] = defaultCmd
+			}
+		}
+		if _, ok := runtimeConfig["workdir"]; !ok && hasManagedRuntimeDefaults(template) {
+			runtimeConfig["workdir"] = defaultDataDirForType(template)
 		}
 
 		meta = map[string]any{
@@ -5695,36 +10808,42 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 			"hostPort":  hostPort,
 			"createdAt": time.Now().UnixMilli(),
 		}
-		if startupCmd != "" {
-			meta["startupCommand"] = startupCmd
-			fmt.Printf("[createServer] Storing startupCommand at top level: %q\n", startupCmd)
-		}
 		if len(runtimeConfig) > 0 {
 			meta["runtime"] = runtimeConfig
 		}
 		if len(resourcesMeta) > 0 {
 			meta["resources"] = resourcesMeta
 		}
+		if req.AsyncSetup {
+			meta["setupStatus"] = "queued"
+			meta["setupMessage"] = "Server setup queued"
+			meta["setupUpdatedAt"] = time.Now().UnixMilli()
+		}
 
 		fmt.Printf("[createServer] Final meta to save: %+v\n", meta)
 		_ = a.saveMeta(serverDir, meta)
 
-		if req.Docker != nil && req.Docker.Image != "" {
-			imageRef := req.Docker.Image
-			if req.Docker.Tag != "" {
-				imageRef += ":" + req.Docker.Tag
-			} else {
-				imageRef += ":latest"
+		if req.AsyncSetup {
+			auditLog.Log("server_create", getClientIP(r), "", name, "create", "accepted", map[string]any{"template": req.Template, "asyncSetup": true})
+			continueSetup := a.prepareCustomCreateSetup(req, name, serverDir, meta)
+			if latestMeta := a.loadMeta(serverDir); latestMeta != nil {
+				meta = latestMeta
 			}
+			if continueSetup {
+				go a.finishCustomCreateSetup(req, name, serverDir, meta, hostPort)
+			}
+			jsonWrite(w, 200, map[string]any{"ok": true, "name": name, "meta": meta, "asyncSetup": true})
+			return
+		}
 
-			fmt.Printf("[createServer] Pulling Docker image: %s \n", imageRef)
-			pullCtx, pullCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			a.docker.pull(pullCtx, imageRef)
-			pullCancel()
-			fmt.Printf("[createServer] Docker image pulled successfully: %s\n", imageRef)
-
-			ensureVolumeWritable(serverDir)
-
+		if install := installConfigFromRuntime(runtimeConfig); install != nil {
+			if err := a.runTemplateInstall(name, serverDir, install, runtimeConfig, hostPort, req.Resources); err != nil {
+				fmt.Printf("[createServer] Template install failed, cleaning up: %s - %v\n", name, err)
+				_ = os.RemoveAll(serverDir)
+				_ = os.Remove(a.metaPath(name))
+				jsonWrite(w, 500, map[string]any{"error": "failed to install server", "detail": err.Error()})
+				return
+			}
 		}
 
 		if req.ImportUrl != "" {
@@ -5733,34 +10852,31 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 				fmt.Printf("[createServer] Warning: archive import failed: %v\n", err)
 			}
 		}
-
-		hasImage := req.Docker != nil && req.Docker.Image != ""
-		hasStartupCmd := startupCmd != ""
-		if !hasStartupCmd && hasImage {
-			effectiveCmd := a.buildEffectiveDockerCommand(name, serverDir, meta)
-			if effectiveCmd != "" {
-				meta["startupCommand"] = effectiveCmd
-				runtimeObj, _ := meta["runtime"].(map[string]any)
-				if runtimeObj == nil {
-					runtimeObj = make(map[string]any)
-				}
-				runtimeObj["startupCommand"] = effectiveCmd
-				meta["runtime"] = runtimeObj
-				_ = a.saveMeta(serverDir, meta)
-				fmt.Printf("[createServer] Generated effective startupCommand: %s\n", effectiveCmd)
-			}
+		switch template {
+		case "python":
+			scaffoldPython(serverDir, defaultStartFileForType(template))
+		case "nodejs", "discord-bot":
+			scaffoldNode(serverDir, defaultStartFileForType(template), hostPort)
 		}
 
-		if req.AutoStart && (hasImage || hasStartupCmd) {
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			err := a.startCustomDockerContainer(ctx, name, serverDir, meta, hostPort, req.Resources)
+		hasImage := req.Docker != nil && req.Docker.Image != ""
+		if req.AutoStart && hasImage {
+			ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
+			var err error
+			if isManagedProcessRuntime(template) {
+				err = a.startRuntimeContainer(ctx, name, serverDir, meta, hostPort, req.Resources, nil)
+			} else {
+				err = a.startCustomDockerContainer(ctx, name, serverDir, meta, hostPort, req.Resources)
+			}
 			cancel()
 			if err != nil {
 				fmt.Printf("[createServer] Container startup failed, cleaning up: %s - %v\n", name, err)
 				_ = os.RemoveAll(serverDir)
+				_ = os.Remove(a.metaPath(name))
 				jsonWrite(w, 500, map[string]any{"error": "failed to start server", "detail": err.Error()})
 				return
 			}
+			a.ensureLiveLogs(name)
 		}
 	}
 
@@ -5768,112 +10884,216 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, 200, map[string]any{"ok": true, "name": name, "meta": meta})
 }
 
-func (a *Agent) handleServerInfo(w http.ResponseWriter, r *http.Request, name string) {
-	serverDir := a.serverDir(name)
-	if st, err := os.Stat(serverDir); err != nil || !st.IsDir() {
-		jsonWrite(w, 404, map[string]any{"error": "not found"})
+func resourceRamLimitMbFromMeta(meta map[string]any) float64 {
+	resources, _ := meta["resources"].(map[string]any)
+	if resources == nil {
+		return 0
+	}
+	return anyToFloat64(resources["ramMb"])
+}
+
+func resourceStorageLimitMbFromMeta(meta map[string]any) float64 {
+	resources, _ := meta["resources"].(map[string]any)
+	if resources == nil {
+		return 0
+	}
+	if v := anyToFloat64(resources["storageMb"]); v > 0 {
+		return v
+	}
+	if v := anyToFloat64(resources["storageGb"]); v > 0 {
+		return v * 1024
+	}
+	return 0
+}
+
+func buildNetworkStatsPayload(inboundBytes, outboundBytes uint64) map[string]any {
+	return map[string]any{
+		"inboundBytes":  inboundBytes,
+		"outboundBytes": outboundBytes,
+		"rxBytes":       inboundBytes,
+		"txBytes":       outboundBytes,
+	}
+}
+
+type networkAntiAbuseRule struct {
+	inboundLimitBytes  uint64
+	outboundLimitBytes uint64
+	resetEvery         time.Duration
+	enabled            bool
+}
+
+func networkLimitMbToBytes(mb int64) uint64 {
+	if mb <= 0 {
+		return 0
+	}
+	maxMb := int64(^uint64(0) / (1024 * 1024))
+	if mb > maxMb {
+		return ^uint64(0)
+	}
+	return uint64(mb) * 1024 * 1024
+}
+
+func networkAntiAbuseRuleFromMeta(meta map[string]any) networkAntiAbuseRule {
+	resources, _ := meta["resources"].(map[string]any)
+	if resources == nil {
+		return networkAntiAbuseRule{}
+	}
+	inboundMb := anyToInt64(resources["networkInboundLimitMb"])
+	outboundMb := anyToInt64(resources["networkOutboundLimitMb"])
+	if inboundMb <= 0 && outboundMb <= 0 {
+		return networkAntiAbuseRule{}
+	}
+	resetMinutes := anyToInt(resources["networkResetMinutes"])
+	if resetMinutes <= 0 {
+		resetMinutes = defaultNetworkResetMins
+	}
+	if resetMinutes < minNetworkResetMins || resetMinutes > maxNetworkResetMins {
+		resetMinutes = defaultNetworkResetMins
+	}
+	return networkAntiAbuseRule{
+		inboundLimitBytes:  networkLimitMbToBytes(inboundMb),
+		outboundLimitBytes: networkLimitMbToBytes(outboundMb),
+		resetEvery:         time.Duration(resetMinutes) * time.Minute,
+		enabled:            inboundMb > 0 || outboundMb > 0,
+	}
+}
+
+func uint64Remaining(limit, used uint64) uint64 {
+	if limit == 0 || used >= limit {
+		return 0
+	}
+	return limit - used
+}
+
+func attachNetworkAntiAbusePayload(payload map[string]any, rule networkAntiAbuseRule, windowRx, windowTx uint64, windowStartedAt time.Time) {
+	if payload == nil || !rule.enabled {
 		return
 	}
-	meta := a.loadMeta(serverDir)
+	payload["windowInboundBytes"] = windowRx
+	payload["windowOutboundBytes"] = windowTx
+	payload["inboundLimitBytes"] = rule.inboundLimitBytes
+	payload["outboundLimitBytes"] = rule.outboundLimitBytes
+	payload["inboundRemainingBytes"] = uint64Remaining(rule.inboundLimitBytes, windowRx)
+	payload["outboundRemainingBytes"] = uint64Remaining(rule.outboundLimitBytes, windowTx)
+	payload["resetEveryMinutes"] = int(rule.resetEvery / time.Minute)
+	if !windowStartedAt.IsZero() && rule.resetEvery > 0 {
+		payload["windowStartedAt"] = windowStartedAt.UTC().Format(time.RFC3339)
+		payload["windowResetsAt"] = windowStartedAt.Add(rule.resetEvery).UTC().Format(time.RFC3339)
+	}
+}
 
-	status := "stopped"
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+func normalizeDockerContainerStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "running":
+		return "running"
+	case "created", "exited", "dead", "removing", "paused":
+		return "stopped"
+	case "":
+		return "stopped"
+	default:
+		return strings.ToLower(strings.TrimSpace(status))
+	}
+}
 
-	var cpuPercent float64 = 0
-	var memoryUsedMb float64 = 0
-	var memoryLimitMb float64 = 0
-	var memoryPercent float64 = 0
-	var uptimeSeconds int64 = 0
-
-	if resources, ok := meta["resources"].(map[string]any); ok {
-		if ramMb, ok := resources["ramMb"]; ok {
-			switch v := ramMb.(type) {
-			case float64:
-				memoryLimitMb = v
-			case int:
-				memoryLimitMb = float64(v)
-			case int64:
-				memoryLimitMb = float64(v)
-			}
-		}
+func (a *Agent) getServerResourcePayload(ctx context.Context, name string) (map[string]any, error) {
+	serverDir := a.serverDir(name)
+	if st, err := os.Stat(serverDir); err != nil || !st.IsDir() {
+		return nil, os.ErrNotExist
 	}
 
-	if a.docker.containerExists(ctx, name) {
-		out, _, _, err := a.docker.runCollect(ctx, "inspect", "-f", "{{.State.Running}}", name)
-		if err == nil && strings.TrimSpace(out) == "true" {
+	if a.resourceStats == nil {
+		return a.collectServerResourcePayload(ctx, name, serverDir, nil), nil
+	}
+
+	entry := a.resourceStats.get(name)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	now := time.Now()
+	entry.touchedAt = now
+	if entry.payload != nil && now.Before(entry.expiresAt) {
+		return entry.payload, nil
+	}
+
+	payload := a.collectServerResourcePayload(ctx, name, serverDir, entry)
+	entry.payload = payload
+	entry.expiresAt = now.Add(a.resourceStats.ttl)
+	return payload, nil
+}
+
+func (a *Agent) collectServerResourcePayload(ctx context.Context, name, serverDir string, entry *serverResourceStatsCacheEntry) map[string]any {
+	meta := a.loadMeta(serverDir)
+	status := "stopped"
+	now := time.Now()
+
+	memoryUsedMb := float64(0)
+	memoryLimitMb := resourceRamLimitMbFromMeta(meta)
+	memoryPercent := float64(0)
+	uptimeSeconds := int64(0)
+
+	cpuEffCores, cpuMaxPercent := computeCpuLimit(metaCpuCores(meta))
+	cpuPercent := float64(0)
+
+	networkRule := networkAntiAbuseRuleFromMeta(meta)
+	var networkPayload map[string]any
+	if entry != nil && entry.seenNetwork {
+		networkPayload = buildNetworkStatsPayload(entry.totalRx, entry.totalTx)
+		attachNetworkAntiAbusePayload(networkPayload, networkRule, entry.networkWindowRx, entry.networkWindowTx, entry.networkWindowStartedAt)
+	}
+
+	inspected, exists, inspectErr := a.inspectContainerForStats(ctx, name)
+	if inspectErr != nil {
+		status = "unknown"
+	} else if exists {
+		status = normalizeDockerContainerStatus(inspected.State.Status)
+		if inspected.State.Running {
 			status = "running"
 
-			startedAt, _, _, startErr := a.docker.runCollect(ctx, "inspect", "-f", "{{.State.StartedAt}}", name)
-			if startErr == nil && strings.TrimSpace(startedAt) != "" {
-				startTime, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(startedAt))
-				if parseErr == nil {
+			if appliedMemoryMb := hostConfigMemoryLimitMb(inspected.HostConfig); appliedMemoryMb > 0 {
+				memoryLimitMb = appliedMemoryMb
+			}
+			if appliedCPULimit := hostConfigCpuLimitPercent(inspected.HostConfig); appliedCPULimit > 0 {
+				cpuMaxPercent = appliedCPULimit
+				cpuEffCores = appliedCPULimit / 100.0
+			}
+
+			if strings.TrimSpace(inspected.State.StartedAt) != "" {
+				if startTime, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(inspected.State.StartedAt)); err == nil {
 					uptimeSeconds = int64(time.Since(startTime).Seconds())
 				}
 			}
 
-			statsOut, _, _, statsErr := a.docker.runCollect(ctx, "stats", "--no-stream", "--format",
-				"{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}", name)
-			if statsErr == nil && strings.TrimSpace(statsOut) != "" {
-				parts := strings.Split(strings.TrimSpace(statsOut), "|")
-				if len(parts) >= 3 {
-					cpuStr := strings.TrimSuffix(strings.TrimSpace(parts[0]), "%")
-					if cpu, err := strconv.ParseFloat(cpuStr, 64); err == nil {
-						cpuPercent = cpu
-					}
+			if stats, err := a.readContainerStatsForServer(ctx, name); err == nil {
+				cpuPercent = dockerCPUPercent(stats)
+				if cpuMaxPercent > 0 && cpuPercent > cpuMaxPercent {
+					cpuPercent = cpuMaxPercent
+				}
 
-					memParts := strings.Split(parts[1], "/")
-					if len(memParts) >= 2 {
-						memoryUsedMb = parseMemoryString(strings.TrimSpace(memParts[0]))
-						dockerMemLimit := parseMemoryString(strings.TrimSpace(memParts[1]))
-						if dockerMemLimit > 0 {
-							memoryLimitMb = dockerMemLimit
-						}
-					}
+				memoryUsedMb = float64(dockerMemoryUsedBytes(stats.MemoryStats)) / (1024 * 1024)
+				if memoryLimitMb > 0 {
+					memoryPercent = (memoryUsedMb / memoryLimitMb) * 100
+				}
 
-					memPctStr := strings.TrimSuffix(strings.TrimSpace(parts[2]), "%")
-					if memPct, err := strconv.ParseFloat(memPctStr, 64); err == nil {
-						memoryPercent = memPct
-					}
+				if len(stats.Networks) > 0 && entry != nil {
+					rawRx, rawTx := sumDockerNetworkBytes(stats.Networks)
+					totalRx, totalTx, windowRx, windowTx, windowStartedAt := entry.updateNetworkCounters(inspected.ID, rawRx, rawTx, now, networkRule.resetEvery)
+					networkPayload = buildNetworkStatsPayload(totalRx, totalTx)
+					attachNetworkAntiAbusePayload(networkPayload, networkRule, windowRx, windowTx, windowStartedAt)
 				}
 			}
-		} else if err != nil {
-			status = "unknown"
 		}
 	}
 
-	diskUsageBytes := a.getServerDiskUsage(serverDir)
+	var diskUsageBytes int64
+	if entry != nil {
+		diskUsageBytes = entry.cachedDiskUsage(a, serverDir, now, a.resourceStats.diskTTL)
+	} else {
+		diskUsageBytes = a.getServerDiskUsage(serverDir)
+	}
 	diskUsageMb := float64(diskUsageBytes) / (1024 * 1024)
 	diskUsageGb := float64(diskUsageBytes) / (1024 * 1024 * 1024)
 
-	var storageLimitMb float64 = 0
-	var storageLimitGb int64 = 0
-	if resources, ok := meta["resources"].(map[string]any); ok {
-		if limit, ok := resources["storageMb"]; ok {
-			var limitMb int64
-			switch v := limit.(type) {
-			case float64:
-				limitMb = int64(v)
-			case int:
-				limitMb = int64(v)
-			case int64:
-				limitMb = v
-			}
-			storageLimitMb = float64(limitMb)
-			storageLimitGb = int64(storageLimitMb / 1024)
-		} else if limit, ok := resources["storageGb"]; ok {
-			switch v := limit.(type) {
-			case float64:
-				storageLimitGb = int64(v)
-			case int:
-				storageLimitGb = int64(v)
-			case int64:
-				storageLimitGb = v
-			}
-			storageLimitMb = float64(storageLimitGb) * 1024
-		}
-	}
-
+	storageLimitMb := resourceStorageLimitMbFromMeta(meta)
 	diskInfo := map[string]any{
 		"usedBytes": diskUsageBytes,
 		"usedMb":    diskUsageMb,
@@ -5885,14 +11105,10 @@ func (a *Agent) handleServerInfo(w http.ResponseWriter, r *http.Request, name st
 		diskInfo["limitBytes"] = limitBytes
 		diskInfo["limitGb"] = storageLimitMb / 1024
 		diskInfo["limitMb"] = storageLimitMb
-		diskPercent = (float64(diskUsageBytes) / float64(limitBytes)) * 100
+		if limitBytes > 0 {
+			diskPercent = (float64(diskUsageBytes) / float64(limitBytes)) * 100
+		}
 		diskInfo["percentUsed"] = diskPercent
-	}
-
-	cpuCoresConfig := metaCpuCores(meta)
-	cpuEffCores, cpuMaxPercent := computeCpuLimit(cpuCoresConfig)
-	if cpuPercent > cpuMaxPercent {
-		cpuPercent = cpuMaxPercent
 	}
 
 	stats := map[string]any{
@@ -5912,8 +11128,11 @@ func (a *Agent) handleServerInfo(w http.ResponseWriter, r *http.Request, name st
 			"percent": diskPercent,
 		},
 	}
+	if networkPayload != nil {
+		stats["network"] = networkPayload
+	}
 
-	jsonWrite(w, 200, map[string]any{
+	payload := map[string]any{
 		"ok":     true,
 		"name":   name,
 		"status": status,
@@ -5921,7 +11140,27 @@ func (a *Agent) handleServerInfo(w http.ResponseWriter, r *http.Request, name st
 		"disk":   diskInfo,
 		"stats":  stats,
 		"uptime": uptimeSeconds,
-	})
+	}
+	if networkPayload != nil {
+		payload["network"] = networkPayload
+	}
+	return payload
+}
+
+func (a *Agent) handleServerInfo(w http.ResponseWriter, r *http.Request, name string) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3500*time.Millisecond)
+	defer cancel()
+
+	payload, err := a.getServerResourcePayload(ctx, name)
+	if errors.Is(err, os.ErrNotExist) {
+		jsonWrite(w, 404, map[string]any{"error": "not found"})
+		return
+	}
+	if err != nil {
+		jsonWrite(w, 500, map[string]any{"error": "failed to collect resource stats"})
+		return
+	}
+	jsonWrite(w, 200, payload)
 }
 
 func (a *Agent) handleGetResources(w http.ResponseWriter, r *http.Request, name string) {
@@ -5936,7 +11175,6 @@ func (a *Agent) handleGetResources(w http.ResponseWriter, r *http.Request, name 
 	if resources == nil {
 		resources = make(map[string]any)
 	}
-
 
 	if _, hasMb := resources["storageMb"]; !hasMb {
 		if gb, hasGb := resources["storageGb"]; hasGb {
@@ -5954,25 +11192,76 @@ func (a *Agent) handleGetResources(w http.ResponseWriter, r *http.Request, name 
 			}
 		}
 	}
-	startupCommand := ""
-	if sc, ok := meta["startupCommand"].(string); ok && strings.TrimSpace(sc) != "" {
-		startupCommand = sc
-	} else if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
-		if sc, ok := runtimeObj["startupCommand"].(string); ok && strings.TrimSpace(sc) != "" {
-			startupCommand = sc
+	configuredCommand := ""
+	command := ""
+	commandSource := ""
+	imageDefaultCommand := ""
+	imageRef := ""
+	templateType := ""
+	javaVersion := ""
+	if t, ok := meta["template"].(string); ok {
+		templateType = t
+	} else if t, ok := meta["type"].(string); ok {
+		templateType = t
+	}
+	startFile := strings.TrimSpace(fmt.Sprint(meta["start"]))
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	if runtimeObj != nil {
+		configuredCommand = normalizeLegacyRuntimeProcessCommand(templateType, fmt.Sprint(runtimeObj["command"]), startFile, defaultDataDirForType(templateType))
+		adpanelStartup := startupTemplateFromRuntime(runtimeObj)
+		if adpanelStartup != "" {
+			configuredCommand = ""
+			command = adpanelStartup
+			commandSource = "adpanel-startup"
+		}
+		image := strings.TrimSpace(fmt.Sprint(runtimeObj["image"]))
+		tag := strings.TrimSpace(fmt.Sprint(runtimeObj["tag"]))
+		if image != "" && image != "<nil>" {
+			if tag == "" || tag == "<nil>" {
+				tag = "latest"
+			}
+			imageRef = image + ":" + tag
+			javaVersion = normalizeMinecraftJavaVersion(runtimeObj["javaVersion"])
+			if javaVersion == "" {
+				javaVersion = minecraftJavaVersionFromTag(tag)
+			}
 		}
 	}
-
-	if startupCommand == "" {
-		startupCommand = a.buildEffectiveDockerCommand(name, serverDir, meta)
+	if command == "" && configuredCommand != "" {
+		command = configuredCommand
+		commandSource = "configured"
+	}
+	if command == "" {
+		command = defaultRuntimeCommandForType(
+			templateType,
+			startFile,
+			defaultDataDirForType(templateType),
+		)
+		if command != "" {
+			commandSource = "template-default"
+		}
+	}
+	if command == "" && imageRef != "" {
+		inspectCtx, inspectCancel := context.WithTimeout(context.Background(), 8*time.Second)
+		imgCfg := a.inspectRuntimeImageConfig(inspectCtx, imageRef)
+		inspectCancel()
+		imageDefaultCommand = normalizeLegacyRuntimeProcessCommand(
+			templateType,
+			runtimeCommandFromImageConfig(imgCfg),
+			startFile,
+			defaultDataDirForType(templateType),
+		)
+		if imageDefaultCommand != "" && validateRuntimeProcessCommand(imageDefaultCommand) == "" {
+			command = imageDefaultCommand
+			commandSource = "image-default"
+		}
+	}
+	if command == "" && imageRef != "" {
+		command = "sleep infinity"
+		commandSource = "fallback"
 	}
 
-	template := ""
-	if t, ok := meta["template"].(string); ok {
-		template = t
-	} else if t, ok := meta["type"].(string); ok {
-		template = t
-	}
+	template := templateType
 
 	var memoryUsedMb, memoryLimitMb float64
 	if res, ok := resources["ramMb"]; ok {
@@ -5991,16 +11280,15 @@ func (a *Agent) handleGetResources(w http.ResponseWriter, r *http.Request, name 
 	if a.docker.containerExists(ctx, name) {
 		out, _, _, err := a.docker.runCollect(ctx, "inspect", "-f", "{{.State.Running}}", name)
 		if err == nil && strings.TrimSpace(out) == "true" {
+			if inspectedMemoryLimitMb, _, inspectErr := a.inspectContainerAppliedLimits(ctx, name); inspectErr == nil && inspectedMemoryLimitMb > 0 {
+				memoryLimitMb = inspectedMemoryLimitMb
+			}
 			statsOut, _, _, statsErr := a.docker.runCollect(ctx, "stats", "--no-stream", "--format",
 				"{{.MemUsage}}", name)
 			if statsErr == nil && strings.TrimSpace(statsOut) != "" {
 				memParts := strings.Split(strings.TrimSpace(statsOut), "/")
 				if len(memParts) >= 2 {
 					memoryUsedMb = parseMemoryString(strings.TrimSpace(memParts[0]))
-					dockerMemLimit := parseMemoryString(strings.TrimSpace(memParts[1]))
-					if dockerMemLimit > 0 {
-						memoryLimitMb = dockerMemLimit
-					}
 				}
 			}
 		}
@@ -6014,25 +11302,28 @@ func (a *Agent) handleGetResources(w http.ResponseWriter, r *http.Request, name 
 	}
 
 	var hostPort int
-	if hp, ok := meta["hostPort"]; ok {
-		switch v := hp.(type) {
-		case float64:
-			hostPort = int(v)
-		case int:
-			hostPort = v
-		case int64:
-			hostPort = int(v)
-		}
+	if port, ok := parseStrictPortValue(meta["hostPort"]); ok {
+		hostPort = port
 	}
 
-	jsonWrite(w, 200, map[string]any{
-		"ok":             true,
-		"resources":      resources,
-		"startupCommand": startupCommand,
-		"template":       template,
-		"stats":          stats,
-		"hostPort":       hostPort,
-	})
+	payload := map[string]any{
+		"ok":                  true,
+		"resources":           resources,
+		"command":             command,
+		"configuredCommand":   configuredCommand,
+		"effectiveCommand":    command,
+		"commandSource":       commandSource,
+		"imageDefaultCommand": imageDefaultCommand,
+		"imageRef":            imageRef,
+		"template":            template,
+		"stats":               stats,
+		"hostPort":            hostPort,
+	}
+	if strings.EqualFold(strings.TrimSpace(templateType), "minecraft") {
+		payload["javaVersion"] = javaVersion
+		payload["minecraftJava"] = minecraftJavaOptionsPayload(javaVersion)
+	}
+	jsonWrite(w, 200, payload)
 }
 
 func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[string]any) string {
@@ -6042,7 +11333,30 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 		runtimeObj = make(map[string]any)
 	}
 
-	hostPort := anyToInt(meta["hostPort"])
+	hostPort := 0
+	if port, ok := parseStrictPortValue(meta["hostPort"]); ok {
+		hostPort = port
+	}
+
+	resources := resourceLimitsFromMeta(meta)
+	appendPerformancePreviewArgs := func(parts []string) []string {
+		if resources == nil {
+			return parts
+		}
+		if resources.PidsLimit != nil && *resources.PidsLimit >= minPidsLimit && *resources.PidsLimit <= maxPidsLimit {
+			parts = append(parts, "--pids-limit", fmt.Sprintf("%d", *resources.PidsLimit))
+		}
+		if resources.CpuWeight != nil && *resources.CpuWeight >= minCpuWeight && *resources.CpuWeight <= maxCpuWeight {
+			parts = append(parts, "--cpu-shares", fmt.Sprintf("%d", dockerCpuSharesFromWeight(*resources.CpuWeight)))
+		}
+		if resources.IoWeight != nil && *resources.IoWeight >= minIoWeight && *resources.IoWeight <= maxIoWeight {
+			parts = append(parts, "--blkio-weight", fmt.Sprintf("%d", *resources.IoWeight))
+		}
+		if resources.FileLimit != nil && *resources.FileLimit >= minFileLimit && *resources.FileLimit <= maxFileLimit {
+			parts = append(parts, "--ulimit", fmt.Sprintf("nofile=%d:%d", *resources.FileLimit, *resources.FileLimit))
+		}
+		return parts
+	}
 
 	rm, _ := meta["resources"].(map[string]any)
 	var ramMb, cpuCoresVal, swapMb float64
@@ -6103,6 +11417,7 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 			parts = append(parts, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
 			parts = append(parts, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
 		}
+		parts = appendPerformancePreviewArgs(parts)
 		mcImage := strings.TrimSpace(fmt.Sprint(runtimeObj["image"]))
 		mcTag := strings.TrimSpace(fmt.Sprint(runtimeObj["tag"]))
 		if mcImage == "" || mcImage == "<nil>" {
@@ -6152,6 +11467,7 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 			parts = append(parts, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
 			parts = append(parts, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
 		}
+		parts = appendPerformancePreviewArgs(parts)
 		if hostPort > 0 {
 			parts = append(parts, "-p", fmt.Sprintf("%d:%d", hostPort, hostPort))
 		}
@@ -6160,10 +11476,9 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 			parts = append(parts, "-p", fmt.Sprintf("%d:%d", pf.Public, pf.Internal))
 		}
 		vols := []string{fmt.Sprintf("%s:/app", serverDir)}
-		if vv, ok := runtimeObj["volumes"].([]any); ok && len(vv) > 0 {
+		if runtimeVolumes := runtimeStringSlice(runtimeObj["volumes"]); len(runtimeVolumes) > 0 {
 			vols = vols[:0]
-			for _, v := range vv {
-				s := strings.TrimSpace(fmt.Sprint(v))
+			for _, s := range runtimeVolumes {
 				if s != "" {
 					vols = append(vols, s)
 				}
@@ -6175,9 +11490,9 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 		for _, v := range vols {
 			parts = append(parts, "-v", v)
 		}
-		if ev, ok := runtimeObj["env"].(map[string]any); ok {
-			for k, v := range ev {
-				parts = append(parts, "-e", fmt.Sprintf("%s=%s", k, fmt.Sprint(v)))
+		if env := runtimeEnvMap(runtimeObj["env"]); len(env) > 0 {
+			for k, v := range env {
+				parts = append(parts, "-e", fmt.Sprintf("%s=%s", k, v))
 			}
 		}
 		if hostPort > 0 {
@@ -6201,11 +11516,14 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 			if isPython {
 				cmd = fmt.Sprintf("python /app/%s", startFile)
 			} else if isNode {
-				cmd = fmt.Sprintf("cd /app && npm install && node /app/%s", startFile)
+				cmd = fmt.Sprintf("node /app/%s", startFile)
 			}
 		}
 		if cmd != "" {
-			parts = append(parts, "sh", "-lc", fmt.Sprintf("%q", cmd))
+			cmd = normalizeLegacyRuntimeProcessCommand(typ, cmd, startFile, "/app")
+			if args, err := buildProcessCommandArgs(cmd); err == nil {
+				parts = append(parts, args...)
+			}
 		}
 		return strings.Join(parts, " ")
 
@@ -6232,22 +11550,10 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 			parts = append(parts, "--cpu-period", fmt.Sprintf("%d", cpuPeriod))
 			parts = append(parts, "--cpu-quota", fmt.Sprintf("%d", cpuQuota))
 		}
+		parts = appendPerformancePreviewArgs(parts)
 		defaultContainerPort := hostPort
-		if ports, ok := runtimeObj["ports"].([]any); ok && len(ports) > 0 {
-			switch v := ports[0].(type) {
-			case float64:
-				if int(v) > 0 {
-					defaultContainerPort = int(v)
-				}
-			case int:
-				if v > 0 {
-					defaultContainerPort = v
-				}
-			case string:
-				if p, _ := strconv.Atoi(v); p > 0 {
-					defaultContainerPort = p
-				}
-			}
+		if ports := runtimeIntSlice(runtimeObj["ports"]); len(ports) > 0 && ports[0] > 0 {
+			defaultContainerPort = ports[0]
 		}
 		parts = append(parts, "-p", fmt.Sprintf("%d:%d", hostPort, defaultContainerPort))
 		portForwards := a.loadPortForwards(serverDir)
@@ -6260,9 +11566,8 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 		}
 		vols := []string{}
 		hasTemplateVols := false
-		if vv, ok := runtimeObj["volumes"].([]any); ok && len(vv) > 0 {
-			for _, v := range vv {
-				s := strings.TrimSpace(fmt.Sprint(v))
+		if runtimeVolumes := runtimeStringSlice(runtimeObj["volumes"]); len(runtimeVolumes) > 0 {
+			for _, s := range runtimeVolumes {
 				if s != "" {
 					s = strings.ReplaceAll(s, "{BOT_DIR}", serverDir)
 					s = strings.ReplaceAll(s, "{SERVER_DIR}", serverDir)
@@ -6290,9 +11595,9 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 		for _, v := range vols {
 			parts = append(parts, "-v", v)
 		}
-		if ev, ok := runtimeObj["env"].(map[string]any); ok {
-			for k, v := range ev {
-				parts = append(parts, "-e", fmt.Sprintf("%s=%s", k, fmt.Sprint(v)))
+		if env := runtimeEnvMap(runtimeObj["env"]); len(env) > 0 {
+			for k, v := range env {
+				parts = append(parts, "-e", fmt.Sprintf("%s=%s", k, v))
 			}
 		}
 		if hostPort > 0 {
@@ -6316,21 +11621,56 @@ func (a *Agent) handleUpdateResources(w http.ResponseWriter, r *http.Request, na
 
 	var req struct {
 		Resources struct {
-			RamMb          *int     `json:"ramMb"`
-			CpuCores       *float64 `json:"cpuCores"`
-			StorageMb      *int     `json:"storageMb"`
-			StorageGb      *int     `json:"storageGb"`
-			SwapMb         *int     `json:"swapMb"`
-			BackupsMax     *int     `json:"backupsMax"`
-			MaxSchedules   *int     `json:"maxSchedules"`
-			Ports          []int    `json:"ports"`
-			StartupCommand *string  `json:"startupCommand"`
+			RamMb                  *int     `json:"ramMb"`
+			CpuCores               *float64 `json:"cpuCores"`
+			StorageMb              *int     `json:"storageMb"`
+			StorageGb              *int     `json:"storageGb"`
+			SwapMb                 *int     `json:"swapMb"`
+			BackupsMax             *int     `json:"backupsMax"`
+			MaxSchedules           *int     `json:"maxSchedules"`
+			IoWeight               *int     `json:"ioWeight"`
+			CpuWeight              *int     `json:"cpuWeight"`
+			PidsLimit              *int     `json:"pidsLimit"`
+			FileLimit              *int     `json:"fileLimit"`
+			NetworkInboundLimitMb  *int64   `json:"networkInboundLimitMb"`
+			NetworkOutboundLimitMb *int64   `json:"networkOutboundLimitMb"`
+			NetworkResetMinutes    *int     `json:"networkResetMinutes"`
+			Ports                  []int    `json:"ports"`
+			Command                *string  `json:"command"`
+			StartupCommand         *string  `json:"startupCommand"`
+			JavaVersion            *string  `json:"javaVersion"`
 		} `json:"resources"`
+		Command        *string `json:"command"`
+		MainPort       *int    `json:"mainPort"`
 		StartupCommand *string `json:"startupCommand"`
+		JavaVersion    *string `json:"javaVersion"`
 	}
 
 	if err := readJSON(w, r, 1<<20, &req); err != nil {
 		jsonWrite(w, 400, map[string]any{"error": "invalid request body"})
+		return
+	}
+	if (req.StartupCommand != nil && strings.TrimSpace(*req.StartupCommand) != "") ||
+		(req.Resources.StartupCommand != nil && strings.TrimSpace(*req.Resources.StartupCommand) != "") {
+		jsonWrite(w, 400, map[string]any{"error": "raw docker startup commands are no longer supported"})
+		return
+	}
+	if req.MainPort != nil {
+		if _, ok := parseStrictPortValue(*req.MainPort); !ok {
+			jsonWrite(w, 400, map[string]any{"error": "invalid mainPort"})
+			return
+		}
+	}
+	if reason := validateResourcePerformanceLimits(&resourceLimits{
+		IoWeight:               req.Resources.IoWeight,
+		CpuWeight:              req.Resources.CpuWeight,
+		PidsLimit:              req.Resources.PidsLimit,
+		FileLimit:              req.Resources.FileLimit,
+		NetworkInboundLimitMb:  req.Resources.NetworkInboundLimitMb,
+		NetworkOutboundLimitMb: req.Resources.NetworkOutboundLimitMb,
+		NetworkResetMinutes:    req.Resources.NetworkResetMinutes,
+	}); reason != "" {
+		jsonWrite(w, 400, map[string]any{"error": reason})
 		return
 	}
 
@@ -6342,6 +11682,7 @@ func (a *Agent) handleUpdateResources(w http.ResponseWriter, r *http.Request, na
 	if meta == nil {
 		meta = make(map[string]any)
 	}
+	stripLegacyStartupCommandFields(meta)
 
 	resources, ok := meta["resources"].(map[string]any)
 	if !ok {
@@ -6370,107 +11711,129 @@ func (a *Agent) handleUpdateResources(w http.ResponseWriter, r *http.Request, na
 	if req.Resources.MaxSchedules != nil {
 		resources["maxSchedules"] = *req.Resources.MaxSchedules
 	}
+	if req.Resources.IoWeight != nil {
+		resources["ioWeight"] = *req.Resources.IoWeight
+	}
+	if req.Resources.CpuWeight != nil {
+		resources["cpuWeight"] = *req.Resources.CpuWeight
+	}
+	if req.Resources.PidsLimit != nil {
+		resources["pidsLimit"] = *req.Resources.PidsLimit
+	}
+	if req.Resources.FileLimit != nil {
+		resources["fileLimit"] = *req.Resources.FileLimit
+	}
+	if req.Resources.NetworkInboundLimitMb != nil {
+		if *req.Resources.NetworkInboundLimitMb > 0 {
+			resources["networkInboundLimitMb"] = *req.Resources.NetworkInboundLimitMb
+		} else {
+			delete(resources, "networkInboundLimitMb")
+		}
+	}
+	if req.Resources.NetworkOutboundLimitMb != nil {
+		if *req.Resources.NetworkOutboundLimitMb > 0 {
+			resources["networkOutboundLimitMb"] = *req.Resources.NetworkOutboundLimitMb
+		} else {
+			delete(resources, "networkOutboundLimitMb")
+		}
+	}
+	if req.Resources.NetworkResetMinutes != nil {
+		if *req.Resources.NetworkResetMinutes > 0 {
+			resources["networkResetMinutes"] = *req.Resources.NetworkResetMinutes
+		} else {
+			delete(resources, "networkResetMinutes")
+		}
+	}
 	if req.Resources.Ports != nil {
 		validPorts := make([]int, 0, len(req.Resources.Ports))
+		seenPorts := make(map[int]bool, len(req.Resources.Ports))
 		for _, p := range req.Resources.Ports {
-			if p >= 1 && p <= 65535 {
-				validPorts = append(validPorts, p)
+			if _, ok := parseStrictPortValue(p); !ok {
+				jsonWrite(w, 400, map[string]any{"error": fmt.Sprintf("invalid port: %d", p)})
+				return
 			}
+			if seenPorts[p] {
+				continue
+			}
+			seenPorts[p] = true
+			validPorts = append(validPorts, p)
 		}
 		resources["ports"] = validPorts
 	}
 
 	meta["resources"] = resources
-
-	startupCmd := ""
-	if req.StartupCommand != nil {
-		startupCmd = strings.TrimSpace(*req.StartupCommand)
-	} else if req.Resources.StartupCommand != nil {
-		startupCmd = strings.TrimSpace(*req.Resources.StartupCommand)
+	if req.MainPort != nil {
+		meta["hostPort"] = *req.MainPort
 	}
-	if startupCmd != "" {
-		allocatedPort := anyToInt(meta["hostPort"])
-		if allocatedPort > 0 {
-			var reservedPorts []int
-			if pfList, ok := meta["portForwards"].([]any); ok {
-				for _, item := range pfList {
-					if m, ok := item.(map[string]any); ok {
-						if pub := anyToInt(m["publicPort"]); pub > 0 {
-							reservedPorts = append(reservedPorts, pub)
-						}
-					}
-				}
-			}
-			var additionalPorts []int
-			if metaRes, ok := meta["resources"].(map[string]any); ok {
-				if ports, ok := metaRes["ports"].([]any); ok {
-					for _, p := range ports {
-						if v := anyToInt(p); v > 0 {
-							additionalPorts = append(additionalPorts, v)
-						}
-					}
-				}
-			}
-			if req.Resources.Ports != nil {
-				for _, p := range req.Resources.Ports {
-					if p > 0 {
-						additionalPorts = append(additionalPorts, p)
-					}
-				}
-			}
-			portViolation := validateStartupCommandPorts(startupCmd, allocatedPort, additionalPorts, reservedPorts...)
-			if portViolation != "" {
-				fmt.Printf("[port-enforce] BLOCKED port change for %s: %s\n", name, portViolation)
-				jsonWrite(w, 400, map[string]any{"error": portViolation})
-				return
-			}
-		}
 
-		newImage := extractDockerImageFromCommand(startupCmd)
-		if newImage == "" && strings.HasPrefix(strings.ToLower(strings.TrimSpace(startupCmd)), "docker run") {
-			jsonWrite(w, 400, map[string]any{"error": "could not determine Docker image from startup command"})
+	javaVersionProvided := req.JavaVersion != nil || req.Resources.JavaVersion != nil
+	if javaVersionProvided {
+		rawJavaVersion := ""
+		if req.JavaVersion != nil {
+			rawJavaVersion = *req.JavaVersion
+		} else if req.Resources.JavaVersion != nil {
+			rawJavaVersion = *req.Resources.JavaVersion
+		}
+		cleanJavaVersion := normalizeMinecraftJavaVersion(rawJavaVersion)
+		if cleanJavaVersion == "" {
+			jsonWrite(w, 400, map[string]any{"error": "unsupported minecraft java version"})
 			return
 		}
-
+		templateType := strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["template"])))
+		if templateType == "" {
+			templateType = strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["type"])))
+		}
 		runtimeObj, _ := meta["runtime"].(map[string]any)
 		if runtimeObj == nil {
 			runtimeObj = make(map[string]any)
 		}
-
-		currentImage := ""
-		if img, ok := runtimeObj["image"].(string); ok && strings.TrimSpace(img) != "" {
-			tag := "latest"
-			if t, ok := runtimeObj["tag"].(string); ok && strings.TrimSpace(t) != "" {
-				tag = strings.TrimSpace(t)
-			}
-			currentImage = strings.TrimSpace(img) + ":" + tag
+		commandLooksMinecraft := strings.Contains(strings.ToLower(sanitizeRuntimeCommand(runtimeObj["command"])), "server.jar")
+		if templateType != "minecraft" && !strings.Contains(templateType, "minecraft") && !commandLooksMinecraft {
+			jsonWrite(w, 400, map[string]any{"error": "java version selection is only available for minecraft"})
+			return
 		}
-		if currentImage == "" {
-			existingCmd := ""
-			if cmd, ok := runtimeObj["startupCommand"].(string); ok {
-				existingCmd = cmd
-			} else if cmd, ok := meta["startupCommand"].(string); ok {
-				existingCmd = cmd
-			}
-			if existingCmd != "" {
-				currentImage = extractDockerImageFromCommand(existingCmd)
-			}
+		runtimeObj["image"] = defaultMinecraftProcessImage
+		runtimeObj["tag"] = minecraftJavaTag(cleanJavaVersion)
+		runtimeObj["javaVersion"] = cleanJavaVersion
+		if sanitizeRuntimeCommand(runtimeObj["command"]) == "" {
+			runtimeObj["command"] = defaultMinecraftProcessCommand
 		}
+		if normalizeContainerWorkdir(runtimeObj["workdir"]) == "" {
+			runtimeObj["workdir"] = defaultDataDirForType("minecraft")
+		}
+		meta["runtime"] = runtimeObj
+	}
 
-		if currentImage != "" && newImage != "" {
-			normalizedCurrent := normalizeDockerImage(currentImage)
-			normalizedNew := normalizeDockerImage(newImage)
-			if normalizedCurrent != normalizedNew {
-				fmt.Printf("[security] BLOCKED docker image change for %s: %q -> %q\n", name, currentImage, newImage)
-				jsonWrite(w, 403, map[string]any{"error": "changing the Docker image is not allowed; you may only modify command flags and arguments"})
+	commandProvided := req.Command != nil || req.Resources.Command != nil
+	if commandProvided {
+		rawCommand := ""
+		if req.Command != nil {
+			rawCommand = *req.Command
+		} else if req.Resources.Command != nil {
+			rawCommand = *req.Resources.Command
+		}
+		runtimeObj, _ := meta["runtime"].(map[string]any)
+		if runtimeObj == nil {
+			runtimeObj = make(map[string]any)
+		}
+		templateType := strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["template"])))
+		if templateType == "" {
+			templateType = strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["type"])))
+		}
+		startFile := strings.TrimSpace(fmt.Sprint(meta["start"]))
+		cleanCommand := normalizeLegacyRuntimeProcessCommand(templateType, rawCommand, startFile, defaultDataDirForType(templateType))
+		if cleanCommand != "" {
+			if reason := validateRuntimeProcessCommand(cleanCommand); reason != "" {
+				jsonWrite(w, 400, map[string]any{"error": reason})
 				return
 			}
 		}
-
-		runtimeObj["startupCommand"] = startupCmd
+		if cleanCommand == "" {
+			delete(runtimeObj, "command")
+		} else {
+			runtimeObj["command"] = cleanCommand
+		}
 		meta["runtime"] = runtimeObj
-		meta["startupCommand"] = startupCmd
-		fmt.Printf("[resources] Updated startupCommand for %s: %s\n", name, startupCmd)
 	}
 
 	if err := a.saveMeta(serverDir, meta); err != nil {
@@ -6482,7 +11845,23 @@ func (a *Agent) handleUpdateResources(w http.ResponseWriter, r *http.Request, na
 		a.logf("[resources] Updated resources for %s: %+v", name, resources)
 	}
 
-	jsonWrite(w, 200, map[string]any{"ok": true, "resources": resources})
+	jsonWrite(w, 200, map[string]any{
+		"ok":        true,
+		"resources": resources,
+		"command": func() string {
+			if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
+				return sanitizeRuntimeCommand(runtimeObj["command"])
+			}
+			return ""
+		}(),
+		"javaVersion": func() string {
+			if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
+				return normalizeMinecraftJavaVersion(runtimeObj["javaVersion"])
+			}
+			return ""
+		}(),
+		"hostPort": meta["hostPort"],
+	})
 }
 
 func (a *Agent) handleGetPortForwards(w http.ResponseWriter, r *http.Request, name string) {
@@ -6496,9 +11875,9 @@ func (a *Agent) handleGetPortForwards(w http.ResponseWriter, r *http.Request, na
 	if pf, ok := meta["portForwards"].([]any); ok {
 		for _, item := range pf {
 			if m, ok := item.(map[string]any); ok {
-				pub := anyToInt(m["publicPort"])
-				internal := anyToInt(m["internalPort"])
-				if pub > 0 && internal > 0 {
+				pub, pubOk := parseStrictPortValue(m["publicPort"])
+				internal, internalOk := parseStrictPortValue(m["internalPort"])
+				if pubOk && internalOk {
 					portForwards = append(portForwards, map[string]any{
 						"publicPort":   pub,
 						"internalPort": internal,
@@ -6508,18 +11887,18 @@ func (a *Agent) handleGetPortForwards(w http.ResponseWriter, r *http.Request, na
 		}
 	}
 
-	hostPort := anyToInt(meta["hostPort"])
+	hostPort := 0
+	if port, ok := parseStrictPortValue(meta["hostPort"]); ok {
+		hostPort = port
+	}
 	allocatedPorts := []int{}
 	if hostPort > 0 {
 		allocatedPorts = append(allocatedPorts, hostPort)
 	}
 	if resources, ok := meta["resources"].(map[string]any); ok {
-		if ports, ok := resources["ports"].([]any); ok {
-			for _, p := range ports {
-				v := anyToInt(p)
-				if v > 0 {
-					allocatedPorts = append(allocatedPorts, v)
-				}
+		for _, port := range runtimeIntSlice(resources["ports"]) {
+			if port > 0 {
+				allocatedPorts = append(allocatedPorts, port)
 			}
 		}
 	}
@@ -6560,17 +11939,17 @@ func (a *Agent) handleUpdatePortForwards(w http.ResponseWriter, r *http.Request,
 	}
 
 	allocatedSet := make(map[int]bool)
-	hostPort := anyToInt(meta["hostPort"])
+	hostPort := 0
+	if port, ok := parseStrictPortValue(meta["hostPort"]); ok {
+		hostPort = port
+	}
 	if hostPort > 0 {
 		allocatedSet[hostPort] = true
 	}
 	if resources, ok := meta["resources"].(map[string]any); ok {
-		if ports, ok := resources["ports"].([]any); ok {
-			for _, p := range ports {
-				v := anyToInt(p)
-				if v > 0 {
-					allocatedSet[v] = true
-				}
+		for _, port := range runtimeIntSlice(resources["ports"]) {
+			if port > 0 {
+				allocatedSet[port] = true
 			}
 		}
 	}
@@ -6623,9 +12002,9 @@ func (a *Agent) loadPortForwards(serverDir string) []struct{ Public, Internal in
 		if !ok {
 			continue
 		}
-		pub := anyToInt(m["publicPort"])
-		internal := anyToInt(m["internalPort"])
-		if pub > 0 && internal > 0 {
+		pub, pubOk := parseStrictPortValue(m["publicPort"])
+		internal, internalOk := parseStrictPortValue(m["internalPort"])
+		if pubOk && internalOk {
 			result = append(result, struct{ Public, Internal int }{pub, internal})
 		}
 	}
@@ -6761,7 +12140,7 @@ func (a *Agent) handleImportArchive(w http.ResponseWriter, r *http.Request, name
 
 	pathname := strings.ToLower(parsedUrl.Path)
 	validExt := false
-	allowedExts := []string{".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".7z", ".rar"}
+	allowedExts := []string{".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".7z", ".rar"}
 	for _, ext := range allowedExts {
 		if strings.HasSuffix(pathname, ext) {
 			validExt = true
@@ -7073,6 +12452,8 @@ func (a *Agent) downloadAndExtractArchive(name, serverDir, archiveUrl string) {
 		extractErr = a.extractTarGzSafe(tmpPath, serverDir)
 	} else if strings.HasSuffix(pathname, ".tar.bz2") || strings.HasSuffix(pathname, ".tbz2") {
 		extractErr = a.extractTarBz2Safe(tmpPath, serverDir)
+	} else if strings.HasSuffix(pathname, ".tar.xz") || strings.HasSuffix(pathname, ".txz") {
+		extractErr = a.extractTarXzSafe(tmpPath, serverDir)
 	} else if strings.HasSuffix(pathname, ".7z") {
 		extractErr = a.extract7z(tmpPath, serverDir)
 	} else if strings.HasSuffix(pathname, ".rar") {
@@ -7196,6 +12577,21 @@ func (a *Agent) extractTarBz2Safe(archivePath, destDir string) error {
 	return extractTarSafe(tr, destDir)
 }
 
+func (a *Agent) extractTarXzSafe(archivePath, destDir string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	xzr, err := xz.NewReader(f)
+	if err != nil {
+		return err
+	}
+	tr := tar.NewReader(xzr)
+	return extractTarSafe(tr, destDir)
+}
+
 func (a *Agent) extractTar(r io.Reader, destDir string) error {
 	tr := tar.NewReader(r)
 
@@ -7311,7 +12707,7 @@ func (a *Agent) downloadAndExtractArchiveSync(name, serverDir, archiveUrl string
 	parsedUrl, _ := url.Parse(archiveUrl)
 	pathname := strings.ToLower(parsedUrl.Path)
 	validExt := false
-	allowedExts := []string{".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".7z", ".rar"}
+	allowedExts := []string{".zip", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".7z", ".rar"}
 	for _, ext := range allowedExts {
 		if strings.HasSuffix(pathname, ext) {
 			validExt = true
@@ -7319,7 +12715,7 @@ func (a *Agent) downloadAndExtractArchiveSync(name, serverDir, archiveUrl string
 		}
 	}
 	if !validExt {
-		return fmt.Errorf("unsupported archive format (supported: .zip, .tar.gz, .tgz, .tar.bz2, .tbz2, .7z, .rar)")
+		return fmt.Errorf("unsupported archive format (supported: .zip, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz, .txz, .7z, .rar)")
 	}
 
 	if a.debug {
@@ -7368,6 +12764,8 @@ func (a *Agent) downloadAndExtractArchiveSync(name, serverDir, archiveUrl string
 		extractErr = a.extractTarGzSafe(tmpPath, serverDir)
 	} else if strings.HasSuffix(archivePathLower, ".tar.bz2") || strings.HasSuffix(archivePathLower, ".tbz2") {
 		extractErr = a.extractTarBz2Safe(tmpPath, serverDir)
+	} else if strings.HasSuffix(archivePathLower, ".tar.xz") || strings.HasSuffix(archivePathLower, ".txz") {
+		extractErr = a.extractTarXzSafe(tmpPath, serverDir)
 	} else if strings.HasSuffix(archivePathLower, ".7z") {
 		extractErr = a.extract7z(tmpPath, serverDir)
 	} else if strings.HasSuffix(archivePathLower, ".rar") {
@@ -7449,9 +12847,9 @@ func parseMemoryString(s string) float64 {
 }
 
 type applyReq struct {
-	URL      string `json:"url"`
-	NodeID   string `json:"nodeId"`
-	DestPath string `json:"destPath"`
+	URL        string `json:"url"`
+	NodeID     string `json:"nodeId"`
+	DestPath   string `json:"destPath"`
 	ProviderID string `json:"providerId"`
 	VersionID  string `json:"versionId"`
 }
@@ -7534,32 +12932,7 @@ func (a *Agent) handleApplyVersion(w http.ResponseWriter, r *http.Request, name 
 		a.docker.rmForce(ctx2, name)
 		cancel2()
 
-		var resources *resourceLimits
-		if rm, ok := meta["resources"].(map[string]any); ok {
-			resources = &resourceLimits{}
-			if v, ok := rm["ramMb"].(float64); ok {
-				i := int(v)
-				resources.RamMb = &i
-			}
-			if v, ok := rm["cpuCores"].(float64); ok {
-				resources.CpuCores = &v
-			}
-			if v, ok := rm["storageMb"].(float64); ok {
-				i := int(v)
-				resources.StorageMb = &i
-			} else if v, ok := rm["storageGb"].(float64); ok {
-				i := int(v) * 1024
-				resources.StorageMb = &i
-			}
-			if v, ok := rm["swapMb"].(float64); ok {
-				i := int(v)
-				resources.SwapMb = &i
-			}
-			if v, ok := rm["backupsMax"].(float64); ok {
-				i := int(v)
-				resources.BackupsMax = &i
-			}
-		}
+		resources := resourceLimitsFromMeta(meta)
 
 		ctx3, cancel3 := context.WithTimeout(context.Background(), 60*time.Second)
 		if err := a.startMinecraftContainer(ctx3, name, baseDir, hostPort, resources, nil); err != nil {
@@ -7618,6 +12991,10 @@ func (a *Agent) handleRuntime(w http.ResponseWriter, r *http.Request, name strin
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "missing-runtime"})
 		return
 	}
+	if rawStartup, exists := req.Runtime["startupCommand"]; exists && strings.TrimSpace(fmt.Sprint(rawStartup)) != "" {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "raw docker startup commands are no longer supported"})
+		return
+	}
 	if req.NodeID != "" && a.uuid != "" && req.NodeID != a.uuid {
 		jsonWrite(w, 401, map[string]any{"ok": false, "error": "unauthorized"})
 		return
@@ -7626,20 +13003,16 @@ func (a *Agent) handleRuntime(w http.ResponseWriter, r *http.Request, name strin
 	serverDir := a.serverDir(name)
 
 	existingMeta := a.loadMeta(serverDir)
+	stripLegacyStartupCommandFields(existingMeta)
 
-	hasCustomConfig := false
+	hasStructuredRuntime := false
 	if existingMeta != nil {
-		if _, ok := existingMeta["startupCommand"]; ok {
-			hasCustomConfig = true
-		}
-		if rt, ok := existingMeta["runtime"].(map[string]any); ok {
-			if _, ok := rt["startupCommand"]; ok {
-				hasCustomConfig = true
-			}
+		if rt, ok := existingMeta["runtime"].(map[string]any); ok && len(rt) > 0 {
+			hasStructuredRuntime = true
 		}
 	}
 
-	if !hasCustomConfig {
+	if !hasStructuredRuntime {
 		_ = os.RemoveAll(serverDir)
 	}
 	_ = ensureDir(serverDir)
@@ -7666,7 +13039,84 @@ func (a *Agent) handleRuntime(w http.ResponseWriter, r *http.Request, name strin
 
 	hostPort := 0
 	if req.Port != nil {
-		hostPort = clampPort(req.Port, 3001)
+		parsedPort, ok := parseStrictPortValue(req.Port)
+		if !ok {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid-port"})
+			return
+		}
+		hostPort = parsedPort
+	}
+
+	cleanRuntime := make(map[string]any)
+	for _, key := range []string{"providerId", "versionId", "image", "tag", "restart"} {
+		if raw, ok := req.Runtime[key]; ok {
+			clean := strings.TrimSpace(fmt.Sprint(raw))
+			if clean != "" && clean != "<nil>" {
+				cleanRuntime[key] = clean
+			}
+		}
+	}
+	if rawCommand, ok := req.Runtime["command"]; ok {
+		if clean := normalizeLegacyRuntimeProcessCommand(kind, fmt.Sprint(rawCommand), finalStart, defaultDataDirForType(kind)); clean != "" {
+			if reason := validateRuntimeProcessCommand(clean); reason != "" {
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": reason})
+				return
+			}
+			cleanRuntime["command"] = clean
+		}
+	}
+	if rawEnv, ok := req.Runtime["env"].(map[string]any); ok && len(rawEnv) > 0 {
+		cleanEnv := make(map[string]any)
+		for key, value := range rawEnv {
+			envKey := strings.TrimSpace(key)
+			if envKey == "" {
+				continue
+			}
+			envValue := strings.TrimSpace(fmt.Sprint(value))
+			if envValue == "<nil>" {
+				envValue = ""
+			}
+			cleanEnv[envKey] = envValue
+		}
+		if len(cleanEnv) > 0 {
+			cleanRuntime["env"] = cleanEnv
+		}
+	}
+	if rawVolumes, ok := req.Runtime["volumes"].([]any); ok && len(rawVolumes) > 0 {
+		cleanVolumes := make([]any, 0, len(rawVolumes))
+		for _, entry := range rawVolumes {
+			spec := strings.TrimSpace(fmt.Sprint(entry))
+			if spec == "" || spec == "<nil>" {
+				continue
+			}
+			if strings.ContainsAny(spec, "\x00\r\n") {
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid-volume-spec"})
+				return
+			}
+			cleanVolumes = append(cleanVolumes, spec)
+		}
+		if len(cleanVolumes) > 0 {
+			cleanRuntime["volumes"] = cleanVolumes
+		}
+	}
+	if rawPorts, ok := req.Runtime["ports"].([]any); ok && len(rawPorts) > 0 {
+		cleanPorts := make([]any, 0, len(rawPorts))
+		seenPorts := make(map[int]struct{}, len(rawPorts))
+		for _, entry := range rawPorts {
+			port, ok := parseStrictPortValue(entry)
+			if !ok {
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid-runtime-port"})
+				return
+			}
+			if _, seen := seenPorts[port]; seen {
+				continue
+			}
+			seenPorts[port] = struct{}{}
+			cleanPorts = append(cleanPorts, port)
+		}
+		if len(cleanPorts) > 0 {
+			cleanRuntime["ports"] = cleanPorts
+		}
 	}
 
 	switch kind {
@@ -7691,7 +13141,7 @@ func (a *Agent) handleRuntime(w http.ResponseWriter, r *http.Request, name strin
 			}
 			return "runtime"
 		}(),
-		"runtime": req.Runtime,
+		"runtime": cleanRuntime,
 		"start": func() any {
 			if finalStart != "" {
 				return finalStart
@@ -7708,9 +13158,6 @@ func (a *Agent) handleRuntime(w http.ResponseWriter, r *http.Request, name strin
 	}
 
 	if existingMeta != nil {
-		if cmd, ok := existingMeta["startupCommand"]; ok {
-			meta["startupCommand"] = cmd
-		}
 		if ca, ok := existingMeta["createdAt"]; ok {
 			meta["createdAt"] = ca
 		}
@@ -7730,9 +13177,6 @@ func (a *Agent) handleRuntime(w http.ResponseWriter, r *http.Request, name strin
 			newRt, _ := meta["runtime"].(map[string]any)
 			if newRt == nil {
 				newRt = make(map[string]any)
-			}
-			if cmd, ok := existingRt["startupCommand"]; ok {
-				newRt["startupCommand"] = cmd
 			}
 			if img, ok := existingRt["image"]; ok && newRt["image"] == nil {
 				newRt["image"] = img
@@ -7766,7 +13210,7 @@ func (a *Agent) handleRuntime(w http.ResponseWriter, r *http.Request, name strin
 		ref = img + ":" + tag
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	a.docker.pull(ctx, ref)
+	_ = a.docker.pullImageAPI(ctx, ref)
 	cancel()
 
 	jsonWrite(w, 200, map[string]any{"ok": true, "type": meta["type"], "start": meta["start"], "hostPort": meta["hostPort"]})
@@ -7788,6 +13232,9 @@ func (a *Agent) handleStart(w http.ResponseWriter, r *http.Request, name string)
 		return
 	}
 	meta := a.loadMeta(serverDir)
+	if stripLegacyStartupCommandFields(meta) {
+		_ = a.saveMeta(serverDir, meta)
+	}
 	typ := strings.ToLower(fmt.Sprint(meta["type"]))
 	if a.debug {
 		fmt.Printf("[handleStart] Server: %s, type: %s\n", name, typ)
@@ -7797,81 +13244,46 @@ func (a *Agent) handleStart(w http.ResponseWriter, r *http.Request, name string)
 		HostPort int               `json:"hostPort"`
 		Env      map[string]string `json:"env"`
 	}
-	_ = readJSON(w, r, a.uploadLimit, &body)
-
-	var resources *resourceLimits
-	if rm, ok := meta["resources"].(map[string]any); ok {
-		resources = &resourceLimits{}
-		if v, ok := rm["ramMb"].(float64); ok {
-			i := int(v)
-			resources.RamMb = &i
-		}
-		if v, ok := rm["cpuCores"].(float64); ok {
-			resources.CpuCores = &v
-		}
-		if v, ok := rm["storageMb"].(float64); ok {
-			i := int(v)
-			resources.StorageMb = &i
-		} else if v, ok := rm["storageGb"].(float64); ok {
-			i := int(v) * 1024
-			resources.StorageMb = &i
-		}
-		if v, ok := rm["swapMb"].(float64); ok {
-			i := int(v)
-			resources.SwapMb = &i
-		}
-		if v, ok := rm["backupsMax"].(float64); ok {
-			i := int(v)
-			resources.BackupsMax = &i
-		}
+	if err := readJSON(w, r, a.uploadLimit, &body); err != nil && !errors.Is(err, io.EOF) {
+		jsonWrite(w, 400, map[string]any{"error": "invalid request body"})
+		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	userStartupCmd := ""
-	if sc, ok := meta["startupCommand"].(string); ok && strings.TrimSpace(sc) != "" {
-		userStartupCmd = sc
-	} else if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
-		if sc, ok := runtimeObj["startupCommand"].(string); ok && strings.TrimSpace(sc) != "" {
-			userStartupCmd = sc
-		}
-	}
-	if userStartupCmd != "" {
-		hp := body.HostPort
-		if hp == 0 {
-			hp = anyToInt(meta["hostPort"])
-		}
-		if hp == 0 {
-			if typ == "minecraft" {
-				hp = 25565
-			} else {
-				hp = 8080
-			}
-		}
-		if err := a.executeStartupCommand(ctx, name, serverDir, hp, userStartupCmd, resources, meta); err != nil {
-			jsonWrite(w, 500, map[string]any{"error": "failed to start container", "detail": err.Error()})
+	if body.HostPort != 0 {
+		if _, ok := parseStrictPortValue(body.HostPort); !ok {
+			jsonWrite(w, 400, map[string]any{"error": "invalid hostPort"})
 			return
 		}
-		auditLog.Log("server_start", getClientIP(r), "", name, "start", "success", map[string]any{"type": typ, "customCommand": true})
-		a.broadcastContainerEvent(name, "running")
-		jsonWrite(w, 200, map[string]any{"ok": true})
-		return
+	}
+
+	resolveStartPort := func(defaultPort int) int {
+		if body.HostPort > 0 {
+			return body.HostPort
+		}
+		if storedPort, ok := parseStrictPortValue(meta["hostPort"]); ok {
+			return storedPort
+		}
+		return defaultPort
+	}
+
+	resources := resourceLimitsFromMeta(meta)
+	if a.logs != nil {
+		a.logs.resetRecent(name)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
+	defer cancel()
+	if a.stdinMgr != nil {
+		a.stdinMgr.remove(name)
 	}
 
 	if typ == "minecraft" {
-		hp := body.HostPort
-		if hp == 0 {
-			hp = anyToInt(meta["hostPort"])
-		}
-		if hp == 0 {
-			hp = 25565
-		}
+		hp := resolveStartPort(25565)
 		enforceServerProps(serverDir)
 		if err := a.startMinecraftContainer(ctx, name, serverDir, hp, resources, body.Env); err != nil {
-			jsonWrite(w, 500, map[string]any{"error": "failed to start container"})
+			jsonWrite(w, 500, map[string]any{"error": "failed to start container", "detail": err.Error()})
 			return
 		}
+		a.ensureLiveLogs(name)
 		auditLog.Log("server_start", getClientIP(r), "", name, "start", "success", map[string]any{"type": "minecraft"})
 		a.broadcastContainerEvent(name, "running")
 		jsonWrite(w, 200, map[string]any{"ok": true})
@@ -7879,37 +13291,20 @@ func (a *Agent) handleStart(w http.ResponseWriter, r *http.Request, name string)
 	}
 
 	if meta["runtime"] != nil && (typ == "python" || typ == "nodejs" || typ == "discord-bot" || typ == "runtime") {
-		hp := body.HostPort
-		if hp == 0 {
-			hp = anyToInt(meta["hostPort"])
-		}
+		hp := resolveStartPort(0)
 		if err := a.startRuntimeContainer(ctx, name, serverDir, meta, hp, resources, body.Env); err != nil {
-			jsonWrite(w, 500, map[string]any{"error": "failed to start container"})
+			jsonWrite(w, 500, map[string]any{"error": "failed to start container", "detail": err.Error()})
 			return
 		}
+		a.ensureLiveLogs(name)
 		auditLog.Log("server_start", getClientIP(r), "", name, "start", "success", map[string]any{"type": typ})
 		a.broadcastContainerEvent(name, "running")
 		jsonWrite(w, 200, map[string]any{"ok": true})
 		return
 	}
 
-	if startupCmd, ok := meta["startupCommand"].(string); ok && strings.TrimSpace(startupCmd) != "" {
-		runtimeObj, _ := meta["runtime"].(map[string]any)
-		if runtimeObj == nil {
-			runtimeObj = make(map[string]any)
-		}
-		runtimeObj["startupCommand"] = startupCmd
-		meta["runtime"] = runtimeObj
-	}
-
 	if typ != "minecraft" && typ != "python" && typ != "nodejs" && typ != "discord-bot" && typ != "runtime" {
-		hp := body.HostPort
-		if hp == 0 {
-			hp = anyToInt(meta["hostPort"])
-		}
-		if hp == 0 {
-			hp = 8080
-		}
+		hp := resolveStartPort(8080)
 
 		if meta["runtime"] == nil {
 			meta["runtime"] = make(map[string]any)
@@ -7919,6 +13314,7 @@ func (a *Agent) handleStart(w http.ResponseWriter, r *http.Request, name string)
 			jsonWrite(w, 500, map[string]any{"error": "failed to start container", "detail": err.Error()})
 			return
 		}
+		a.ensureLiveLogs(name)
 		auditLog.Log("server_start", getClientIP(r), "", name, "start", "success", map[string]any{"type": typ})
 		a.broadcastContainerEvent(name, "running")
 		jsonWrite(w, 200, map[string]any{"ok": true})
@@ -8040,6 +13436,12 @@ func (a *Agent) handleRestart(w http.ResponseWriter, r *http.Request, name strin
 		jsonWrite(w, 400, map[string]any{"error": "not running"})
 		return
 	}
+	if a.stdinMgr != nil {
+		a.stdinMgr.remove(name)
+	}
+	if a.logs != nil {
+		a.logs.resetRecent(name)
+	}
 	_, errStr, _, err := a.docker.runCollect(ctx, "restart", name)
 	if err != nil {
 		if a.debug {
@@ -8048,8 +13450,144 @@ func (a *Agent) handleRestart(w http.ResponseWriter, r *http.Request, name strin
 		jsonWrite(w, 500, map[string]any{"error": "container restart failed"})
 		return
 	}
+	a.ensureLiveLogs(name)
 	a.broadcastContainerEvent(name, "running")
 	jsonWrite(w, 200, map[string]any{"ok": true})
+}
+
+func (a *Agent) broadcastConsoleChunk(name, prefix, chunk string) bool {
+	cleaned := cleanLogLine(chunk)
+	if cleaned == "" {
+		return false
+	}
+	cleaned = strings.ReplaceAll(cleaned, "\r\n", "\n")
+	cleaned = strings.ReplaceAll(cleaned, "\r", "\n")
+	t := a.logs.getOrCreate(name)
+	sent := false
+	for _, line := range strings.Split(cleaned, "\n") {
+		line = strings.TrimRight(line, " \t")
+		plain := strings.TrimSpace(ansiSGRRE.ReplaceAllString(line, ""))
+		if plain == "" {
+			continue
+		}
+		a.logs.sendToClients(t, prefix+line)
+		sent = true
+	}
+	return sent
+}
+
+func isMissingExecShell(stderr string, execPath string, exitCode int) bool {
+	if exitCode != 126 && exitCode != 127 {
+		return false
+	}
+	lower := strings.ToLower(stderr)
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(execPath)))
+	if base == "" {
+		return false
+	}
+	return (strings.Contains(lower, "executable file not found") ||
+		strings.Contains(lower, "no such file or directory") ||
+		strings.Contains(lower, "not found")) && strings.Contains(lower, base)
+}
+
+func (a *Agent) executeShellConsoleCommand(ctx context.Context, name, command string) (int, error) {
+	a.broadcastConsoleChunk(name, "stdout:", "$ "+command+"\n")
+	shells := []string{"sh", "/bin/sh", "bash", "/bin/bash"}
+	for idx, shellPath := range shells {
+		stdout, stderr, exitCode, err := a.docker.runCollect(ctx, "exec", name, shellPath, "-lc", command)
+		sawOutput := false
+		if stdout != "" {
+			sawOutput = a.broadcastConsoleChunk(name, "stdout:", stdout) || sawOutput
+		}
+		if stderr != "" {
+			sawOutput = a.broadcastConsoleChunk(name, "stderr:", stderr) || sawOutput
+		}
+		if err != nil && isMissingExecShell(stderr, shellPath, exitCode) && idx < len(shells)-1 {
+			continue
+		}
+		if ctx.Err() != nil {
+			a.broadcastConsoleChunk(name, "stderr:", fmt.Sprintf("[command timed out] %s\n", command))
+			return exitCode, ctx.Err()
+		}
+		if err != nil {
+			if !sawOutput {
+				a.broadcastConsoleChunk(name, "stderr:", fmt.Sprintf("[command exited with code %d]\n", exitCode))
+			}
+			return exitCode, nil
+		}
+		if !sawOutput {
+			a.broadcastConsoleChunk(name, "stdout:", "[command exited with code 0]\n")
+		}
+		return 0, nil
+	}
+	a.broadcastConsoleChunk(name, "stderr:", "[command failed] no supported shell found in container\n")
+	return -1, fmt.Errorf("no supported shell found in container")
+}
+
+func sanitizeCommandRequestID(raw string) string {
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		return ""
+	}
+	if len(id) > consoleCommandRequestIDMaxLen {
+		id = id[:consoleCommandRequestIDMaxLen]
+	}
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-' || r == '_' || r == ':' || r == '.' {
+			continue
+		}
+		return ""
+	}
+	return id
+}
+
+func (a *Agent) claimConsoleCommand(name, command, requestID string) (bool, string) {
+	now := time.Now()
+
+	a.commandMu.Lock()
+	defer a.commandMu.Unlock()
+
+	if a.recentCommands == nil {
+		a.recentCommands = make(map[string]recentConsoleCommand)
+	}
+
+	for key, entry := range a.recentCommands {
+		if now.Sub(entry.at) > consoleCommandRequestIDWindow {
+			delete(a.recentCommands, key)
+		}
+	}
+	if len(a.recentCommands) >= consoleCommandRecentMaxServers {
+		var oldestKey string
+		var oldestAt time.Time
+		for key, entry := range a.recentCommands {
+			if oldestKey == "" || entry.at.Before(oldestAt) {
+				oldestKey = key
+				oldestAt = entry.at
+			}
+		}
+		if oldestKey != "" {
+			delete(a.recentCommands, oldestKey)
+		}
+	}
+
+	if entry, ok := a.recentCommands[name]; ok {
+		if requestID != "" && entry.requestID == requestID && now.Sub(entry.at) <= consoleCommandRequestIDWindow {
+			return false, "request_id"
+		}
+		if entry.command == command && now.Sub(entry.at) <= consoleCommandDuplicateWindow {
+			return false, "rapid_duplicate"
+		}
+	}
+
+	a.recentCommands[name] = recentConsoleCommand{
+		command:   command,
+		requestID: requestID,
+		at:        now,
+	}
+	return true, ""
 }
 
 func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name string) {
@@ -8059,7 +13597,8 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 	}
 
 	var body struct {
-		Command string `json:"command"`
+		Command   string `json:"command"`
+		RequestID string `json:"requestId"`
 	}
 	if err := readJSON(w, r, 16*1024, &body); err != nil {
 		jsonWrite(w, 400, map[string]any{"error": "bad json"})
@@ -8075,6 +13614,7 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 		jsonWrite(w, 400, map[string]any{"error": "command too long", "max": stdinCommandMaxLen})
 		return
 	}
+	requestID := sanitizeCommandRequestID(body.RequestID)
 
 	serverDir := a.serverDir(name)
 	if st, err := os.Stat(serverDir); err != nil || !st.IsDir() {
@@ -8082,12 +13622,44 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 		return
 	}
 
+	if ok, reason := a.claimConsoleCommand(name, cmd, requestID); !ok {
+		jsonWrite(w, 200, map[string]any{"ok": true, "deduplicated": true, "reason": reason})
+		return
+	}
+
 	meta := a.loadMeta(serverDir)
 	serverType := strings.ToLower(fmt.Sprint(meta["type"]))
 	isMinecraft := serverType == "" || serverType == "minecraft"
+	consoleMode := ""
+	if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
+		consoleMode = normalizeConsoleMode(runtimeObj["console"])
+	}
+	useExecShell := !isMinecraft
+	if consoleMode == "stdin" {
+		useExecShell = false
+	} else if consoleMode == "exec" || consoleMode == "exec-shell" || consoleMode == "shell" {
+		useExecShell = true
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+
+	if useExecShell {
+		exitCode, err := a.executeShellConsoleCommand(ctx, name, cmd)
+		if err != nil {
+			jsonWrite(w, 200, map[string]any{
+				"ok":       false,
+				"error":    "failed-to-send",
+				"detail":   err.Error(),
+				"type":     serverType,
+				"mode":     "exec",
+				"exitCode": exitCode,
+			})
+			return
+		}
+		jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "exec", "exitCode": exitCode})
+		return
+	}
 
 	if err := a.docker.sendCommand(ctx, a.stdinMgr, name, cmd, isMinecraft); err != nil {
 		jsonWrite(w, 200, map[string]any{
@@ -8095,17 +13667,19 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 			"error":  "failed-to-send",
 			"detail": err.Error(),
 			"type":   serverType,
+			"mode":   "stdin",
 		})
 		return
 	}
 
-	jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType})
+	jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "stdin"})
 }
 
 func (a *Agent) handleServerCommandBody(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name    string `json:"name"`
-		Command string `json:"command"`
+		Name      string `json:"name"`
+		Command   string `json:"command"`
+		RequestID string `json:"requestId"`
 	}
 	if err := readJSON(w, r, 16*1024, &body); err != nil {
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "bad json"})
@@ -8118,6 +13692,12 @@ func (a *Agent) handleServerCommandBody(w http.ResponseWriter, r *http.Request) 
 	}
 	r2 := *r
 	r2.URL = &url.URL{Path: "/v1/servers/" + name + "/command"}
+	commandBody, _ := json.Marshal(map[string]string{
+		"command":   body.Command,
+		"requestId": body.RequestID,
+	})
+	r2.Body = io.NopCloser(bytes.NewReader(commandBody))
+	r2.ContentLength = int64(len(commandBody))
 	a.handleCommand(w, &r2, name)
 }
 
@@ -8157,25 +13737,41 @@ func (a *Agent) handleLogsSSE(w http.ResponseWriter, r *http.Request, name strin
 		flusher.Flush()
 	}
 	sendLine := func(line string) {
-		payload := map[string]any{"line": cleanLogLine(line)}
+		cleaned := cleanLogLine(line)
+		if cleaned == "" {
+			return
+		}
+		payload := map[string]any{"line": cleaned}
 		b, _ := json.Marshal(payload)
 		fmt.Fprintf(w, "data: %s\n\n", string(b))
 		flusher.Flush()
 	}
 
 	sendEvent("hello", map[string]any{"server": name, "ts": time.Now().UnixMilli(), "tail": tailN})
+	t := a.logs.getOrCreate(name)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	out, _, _, _ := a.docker.runCollect(ctx, "logs", "--tail", fmt.Sprint(tailN), name)
-	cancel()
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimRight(line, "\r")
-		if line != "" {
+	if tailN > 0 {
+		snapshot := t.snapshotRecent(tailN)
+		if len(snapshot) == 0 {
+			snapshot = a.logs.fetchTailSnapshotSingleflight(name, tailN, func() []string {
+				ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+				out, errOut, _, _ := a.docker.runCollect(ctx, "logs", "--tail", fmt.Sprint(tailN), name)
+				cancel()
+				lines := append(parseDockerLogSnapshot(out, tailN), parseDockerLogSnapshot(errOut, tailN)...)
+				if len(lines) > tailN {
+					lines = lines[len(lines)-tailN:]
+				}
+				return lines
+			})
+			if len(snapshot) > 0 {
+				t.appendRecentBatch(snapshot)
+				t.markDockerSnapshotPrimed()
+			}
+		}
+		for _, line := range snapshot {
 			sendLine(line)
 		}
 	}
-
-	t := a.logs.getOrCreate(name)
 	ch := make(chan string, 256)
 
 	t.mu.Lock()
@@ -8197,19 +13793,16 @@ func (a *Agent) handleLogsSSE(w http.ResponseWriter, r *http.Request, name strin
 		case <-hb.C:
 			sendEvent("keepalive", map[string]any{"ts": time.Now().UnixMilli()})
 		case s := <-ch:
-			line := s
-			if strings.HasPrefix(line, "stdout:") {
-				line = strings.TrimPrefix(line, "stdout:")
-			} else if strings.HasPrefix(line, "stderr:") {
-				line = strings.TrimPrefix(line, "stderr:")
-			}
-			sendLine(line)
+			sendLine(normalizeStreamedLogLine(s))
 		}
 	}
 }
 
 func (a *Agent) handleKill(w http.ResponseWriter, r *http.Request, name string) {
 	a.logs.killTail(name)
+	if a.stdinMgr != nil {
+		a.stdinMgr.remove(name)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -8294,9 +13887,14 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 		Docker         *dockerTemplateConfig `json:"docker"`
 		StartupCommand string                `json:"startupCommand"`
 		HostPort       int                   `json:"hostPort"`
+		JavaVersion    string                `json:"javaVersion"`
 	}
 	if err := readJSON(w, r, a.uploadLimit, &req); err != nil {
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "bad json", "detail": err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.StartupCommand) != "" || (req.Docker != nil && strings.TrimSpace(req.Docker.StartupCommand) != "") {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "raw docker startup commands are no longer supported"})
 		return
 	}
 
@@ -8304,6 +13902,24 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 	if template == "" {
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "missing templateId"})
 		return
+	}
+	if req.HostPort != 0 {
+		if _, ok := parseStrictPortValue(req.HostPort); !ok {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid hostPort"})
+			return
+		}
+	}
+	if req.Docker != nil {
+		for _, p := range req.Docker.Ports {
+			if _, ok := parseStrictPortValue(p); !ok {
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": fmt.Sprintf("invalid docker port: %d", p)})
+				return
+			}
+		}
+		if cleanPortProtocols := sanitizeDockerPortProtocols(req.Docker.PortProtocols, req.Docker.Ports); len(req.Docker.PortProtocols) > 0 && len(cleanPortProtocols) == 0 {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid docker port protocols"})
+			return
+		}
 	}
 
 	if ok, why := a.verifyReinstallAdminRequest(r, name, template); !ok {
@@ -8323,19 +13939,9 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 	fmt.Printf("[reinstall] Container removed for %s\n", name)
 
 	oldMeta := a.loadMeta(serverDir)
+	stripLegacyStartupCommandFields(oldMeta)
 	existingResources, _ := oldMeta["resources"].(map[string]any)
-
-	existingStartupCmd := ""
-	if sc, ok := oldMeta["startupCommand"].(string); ok && strings.TrimSpace(sc) != "" {
-		existingStartupCmd = sc
-	} else if rt, ok := oldMeta["runtime"].(map[string]any); ok {
-		if sc, ok := rt["startupCommand"].(string); ok && strings.TrimSpace(sc) != "" {
-			existingStartupCmd = sc
-		}
-	}
-	if existingStartupCmd != "" {
-		fmt.Printf("[reinstall] Preserving active startupCommand from old meta for %s\n", name)
-	}
+	oldRuntime, _ := oldMeta["runtime"].(map[string]any)
 
 	if _, err := os.Stat(serverDir); err == nil {
 		if err := os.RemoveAll(serverDir); err != nil {
@@ -8355,24 +13961,29 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 
 	hostPort := req.HostPort
 	if hostPort == 0 {
-		if req.Docker != nil && len(req.Docker.Ports) > 0 {
+		if existingPort, ok := parseStrictPortValue(oldMeta["hostPort"]); ok {
+			hostPort = existingPort
+		} else if req.Docker != nil && len(req.Docker.Ports) > 0 {
 			hostPort = req.Docker.Ports[0]
+		} else if template == "minecraft" {
+			hostPort = 25565
 		} else {
 			hostPort = 8080
 		}
 	}
 
-	startupCmd := ""
-	if existingStartupCmd != "" {
-		startupCmd = existingStartupCmd
-		fmt.Printf("[reinstall] Using preserved active startupCommand for %s\n", name)
-	} else if req.StartupCommand != "" {
-		startupCmd = req.StartupCommand
-	} else if req.Docker != nil && req.Docker.StartupCommand != "" {
-		startupCmd = req.Docker.StartupCommand
-	}
-
 	runtimeConfig := map[string]any{}
+	if cleanJavaVersion := normalizeMinecraftJavaVersion(req.JavaVersion); strings.TrimSpace(req.JavaVersion) != "" {
+		if cleanJavaVersion == "" {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "unsupported minecraft java version"})
+			return
+		}
+		if template != "minecraft" {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "java version selection is only available for minecraft"})
+			return
+		}
+		runtimeConfig["javaVersion"] = cleanJavaVersion
+	}
 	if req.Docker != nil {
 		if req.Docker.Image != "" {
 			runtimeConfig["image"] = req.Docker.Image
@@ -8380,22 +13991,169 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 		if req.Docker.Tag != "" {
 			runtimeConfig["tag"] = req.Docker.Tag
 		}
-		if req.Docker.Command != "" {
-			runtimeConfig["command"] = req.Docker.Command
+		if cmd := sanitizeRuntimeCommand(req.Docker.Command); cmd != "" {
+			startFile := defaultStartFileForType(template)
+			dataDir := defaultDataDirForType(template)
+			cleanCmd := normalizeLegacyRuntimeProcessCommand(template, cmd, startFile, dataDir)
+			if reason := validateRuntimeProcessCommand(cleanCmd); reason != "" {
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": reason})
+				return
+			}
+			runtimeConfig["command"] = cleanCmd
 		}
-		if len(req.Docker.Ports) > 0 {
+		if req.Docker.Ports != nil {
 			runtimeConfig["ports"] = req.Docker.Ports
 		}
-		if len(req.Docker.Volumes) > 0 {
+		if portProtocols := sanitizeDockerPortProtocols(req.Docker.PortProtocols, req.Docker.Ports); len(portProtocols) > 0 {
+			runtimeConfig["portProtocols"] = portProtocols
+		}
+		if req.Docker.Volumes != nil {
 			runtimeConfig["volumes"] = req.Docker.Volumes
 		}
-		if len(req.Docker.Env) > 0 {
+		if req.Docker.Env != nil {
 			runtimeConfig["env"] = req.Docker.Env
+		}
+		if startup := startupTemplateFromDockerConfig(req.Docker); startup != "" {
+			runtimeConfig["adpanelStartup"] = startup
+			delete(runtimeConfig, "command")
+		}
+		if install := dockerTemplateInstall(req.Docker); install != nil {
+			runtimeConfig["install"] = install
+		}
+		reqWorkdir := strings.TrimSpace(req.Docker.Workdir)
+		if reqWorkdir == "" {
+			reqWorkdir = strings.TrimSpace(req.Docker.WorkingDir)
+		}
+		if reqWorkdir != "" {
+			cleanWorkdir := normalizeContainerWorkdir(reqWorkdir)
+			if cleanWorkdir == "" {
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid workdir (must be an absolute path like /app)"})
+				return
+			}
+			runtimeConfig["workdir"] = cleanWorkdir
+		}
+		if restart := strings.TrimSpace(req.Docker.Restart); restart != "" {
+			runtimeConfig["restart"] = restart
+		} else if restartPolicy := strings.TrimSpace(req.Docker.RestartPolicy); restartPolicy != "" {
+			runtimeConfig["restart"] = restartPolicy
+		}
+		if req.Docker.Console != nil {
+			runtimeConfig["console"] = req.Docker.Console
 		}
 		runtimeConfig["providerId"] = "custom"
 	}
-	if startupCmd != "" {
-		runtimeConfig["startupCommand"] = startupCmd
+	if oldRuntime != nil {
+		for _, key := range []string{"providerId", "versionId", "image", "tag", "javaVersion", "restart", "adpanelStartup", "install", "portProtocols"} {
+			if _, exists := runtimeConfig[key]; exists {
+				continue
+			}
+			if key == "portProtocols" {
+				if protocols := runtimePortProtocolMap(oldRuntime[key]); len(protocols) > 0 {
+					clean := map[string][]string{}
+					for port, values := range protocols {
+						clean[strconv.Itoa(port)] = values
+					}
+					runtimeConfig[key] = clean
+				}
+				continue
+			}
+			if key == "install" {
+				if install := installConfigFromRuntime(oldRuntime); install != nil {
+					runtimeConfig[key] = install
+				}
+				continue
+			}
+			value := strings.TrimSpace(fmt.Sprint(oldRuntime[key]))
+			if key == "adpanelStartup" && (value == "" || value == "<nil>") {
+				value = startupTemplateFromRuntime(oldRuntime)
+			}
+			if value != "" && value != "<nil>" {
+				runtimeConfig[key] = value
+			}
+		}
+		if _, exists := runtimeConfig["command"]; !exists {
+			if cmd := sanitizeRuntimeCommand(oldRuntime["command"]); cmd != "" {
+				startFile := defaultStartFileForType(template)
+				dataDir := defaultDataDirForType(template)
+				cleanCmd := normalizeLegacyRuntimeProcessCommand(template, cmd, startFile, dataDir)
+				if validateRuntimeProcessCommand(cleanCmd) == "" {
+					runtimeConfig["command"] = cleanCmd
+				}
+			}
+		}
+		if _, exists := runtimeConfig["ports"]; !exists {
+			if rawPorts, ok := oldRuntime["ports"].([]any); ok && len(rawPorts) > 0 {
+				cleanPorts := make([]any, 0, len(rawPorts))
+				seenPorts := make(map[int]struct{}, len(rawPorts))
+				for _, entry := range rawPorts {
+					port, ok := parseStrictPortValue(entry)
+					if !ok {
+						continue
+					}
+					if _, seen := seenPorts[port]; seen {
+						continue
+					}
+					seenPorts[port] = struct{}{}
+					cleanPorts = append(cleanPorts, port)
+				}
+				if len(cleanPorts) > 0 {
+					runtimeConfig["ports"] = cleanPorts
+				}
+			}
+		}
+		if _, exists := runtimeConfig["volumes"]; !exists {
+			if rawVolumes, ok := oldRuntime["volumes"].([]any); ok && len(rawVolumes) > 0 {
+				cleanVolumes := make([]any, 0, len(rawVolumes))
+				for _, entry := range rawVolumes {
+					spec := strings.TrimSpace(fmt.Sprint(entry))
+					if spec == "" || spec == "<nil>" || strings.ContainsAny(spec, "\x00\r\n") {
+						continue
+					}
+					cleanVolumes = append(cleanVolumes, spec)
+				}
+				if len(cleanVolumes) > 0 {
+					runtimeConfig["volumes"] = cleanVolumes
+				}
+			}
+		}
+		if _, exists := runtimeConfig["env"]; !exists {
+			if rawEnv, ok := oldRuntime["env"].(map[string]any); ok && len(rawEnv) > 0 {
+				cleanEnv := make(map[string]any)
+				for key, value := range rawEnv {
+					envKey := strings.TrimSpace(key)
+					if envKey == "" {
+						continue
+					}
+					envValue := strings.TrimSpace(fmt.Sprint(value))
+					if envValue == "<nil>" {
+						envValue = ""
+					}
+					cleanEnv[envKey] = envValue
+				}
+				if len(cleanEnv) > 0 {
+					runtimeConfig["env"] = cleanEnv
+				}
+			}
+		}
+		if _, exists := runtimeConfig["workdir"]; !exists {
+			oldWorkdir := strings.TrimSpace(fmt.Sprint(oldRuntime["workdir"]))
+			if oldWorkdir == "" || oldWorkdir == "<nil>" {
+				oldWorkdir = strings.TrimSpace(fmt.Sprint(oldRuntime["workingDir"]))
+			}
+			if cleanWorkdir := normalizeContainerWorkdir(oldWorkdir); cleanWorkdir != "" {
+				runtimeConfig["workdir"] = cleanWorkdir
+			}
+		}
+		if _, exists := runtimeConfig["console"]; !exists {
+			if rawConsole, ok := oldRuntime["console"]; ok && rawConsole != nil {
+				runtimeConfig["console"] = rawConsole
+			}
+		}
+	}
+
+	startFile := strings.TrimSpace(fmt.Sprint(oldMeta["start"]))
+	if startFile == "" {
+		startFile = defaultStartFileForType(template)
 	}
 
 	meta := map[string]any{
@@ -8404,11 +14162,11 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 		"hostPort":  hostPort,
 		"createdAt": time.Now().UnixMilli(),
 	}
-	if startupCmd != "" {
-		meta["startupCommand"] = startupCmd
+	if oldCreatedAt, ok := oldMeta["createdAt"]; ok {
+		meta["createdAt"] = oldCreatedAt
 	}
-	if len(runtimeConfig) > 0 {
-		meta["runtime"] = runtimeConfig
+	if startFile != "" {
+		meta["start"] = startFile
 	}
 	if existingResources != nil && len(existingResources) > 0 {
 		meta["resources"] = existingResources
@@ -8418,10 +14176,6 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 	}
 
 	if template == "minecraft" {
-		if hostPort == 0 || hostPort == 8080 {
-			hostPort = 25565
-			meta["hostPort"] = hostPort
-		}
 		fork := "paper"
 		ver := "1.21.8"
 		writeMinecraftScaffold(serverDir, name, fork, ver)
@@ -8439,12 +14193,54 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 		}
 		dlCancel2()
 
+		mcImage := defaultMinecraftProcessImage
+		mcTag := defaultMinecraftProcessTag
+		mcCommand := defaultMinecraftProcessCommand
+		mcWorkdir := defaultDataDirForType("minecraft")
+		mcJavaVersion := normalizeMinecraftJavaVersion(runtimeConfig["javaVersion"])
+		if image, ok := runtimeConfig["image"].(string); ok && strings.TrimSpace(image) != "" {
+			mcImage = strings.TrimSpace(image)
+		}
+		if tag, ok := runtimeConfig["tag"].(string); ok && strings.TrimSpace(tag) != "" {
+			mcTag = strings.TrimSpace(tag)
+		}
+		if cmd, ok := runtimeConfig["command"].(string); ok && strings.TrimSpace(cmd) != "" {
+			mcCommand = strings.TrimSpace(cmd)
+		}
+		if workdir, ok := runtimeConfig["workdir"].(string); ok && strings.TrimSpace(workdir) != "" {
+			mcWorkdir = strings.TrimSpace(workdir)
+		}
+		if mcJavaVersion == "" {
+			mcJavaVersion = minecraftJavaVersionFromTag(mcTag)
+		}
+		if mcJavaVersion != "" {
+			mcImage = defaultMinecraftProcessImage
+			mcTag = minecraftJavaTag(mcJavaVersion)
+		}
+
+		mcRuntime := map[string]any{
+			"image":       mcImage,
+			"tag":         mcTag,
+			"command":     mcCommand,
+			"workdir":     mcWorkdir,
+			"javaVersion": mcJavaVersion,
+		}
+		for _, key := range []string{"providerId", "versionId", "ports", "volumes", "env", "restart", "console"} {
+			if value, ok := runtimeConfig[key]; ok && value != nil {
+				mcRuntime[key] = value
+			}
+		}
+
 		meta = map[string]any{
 			"type":     "minecraft",
 			"fork":     fork,
 			"version":  ver,
 			"start":    "server.jar",
 			"hostPort": hostPort,
+			"runtime":  mcRuntime,
+		}
+		if oldCreatedAt, ok := oldMeta["createdAt"]; ok {
+			meta["createdAt"] = oldCreatedAt
 		}
 		if existingResources != nil && len(existingResources) > 0 {
 			meta["resources"] = existingResources
@@ -8454,113 +14250,58 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 		}
 		_ = a.saveMeta(serverDir, meta)
 		enforceServerProps(serverDir)
-
-		if existingStartupCmd != "" {
-			meta["startupCommand"] = existingStartupCmd
-			runtimeObj, _ := meta["runtime"].(map[string]any)
-			if runtimeObj == nil {
-				runtimeObj = make(map[string]any)
-			}
-			runtimeObj["startupCommand"] = existingStartupCmd
-			meta["runtime"] = runtimeObj
-			_ = a.saveMeta(serverDir, meta)
-			fmt.Printf("[reinstall] Preserved active startupCommand for minecraft server %s\n", name)
-		} else {
-			effectiveCmd := a.buildEffectiveDockerCommand(name, serverDir, meta)
-			if effectiveCmd != "" {
-				meta["startupCommand"] = effectiveCmd
-				runtimeObj, _ := meta["runtime"].(map[string]any)
-				if runtimeObj == nil {
-					runtimeObj = make(map[string]any)
-				}
-				runtimeObj["startupCommand"] = effectiveCmd
-				meta["runtime"] = runtimeObj
-				_ = a.saveMeta(serverDir, meta)
+	} else {
+		if cmd, ok := runtimeConfig["command"].(string); !ok || strings.TrimSpace(cmd) == "" {
+			if defaultCmd := defaultRuntimeCommandForType(template, startFile, defaultDataDirForType(template)); defaultCmd != "" {
+				runtimeConfig["command"] = defaultCmd
 			}
 		}
-	} else {
+		if _, ok := runtimeConfig["workdir"]; !ok && hasManagedRuntimeDefaults(template) {
+			runtimeConfig["workdir"] = defaultDataDirForType(template)
+		}
+		if len(runtimeConfig) > 0 {
+			meta["runtime"] = runtimeConfig
+		}
+
+		if install := installConfigFromRuntime(runtimeConfig); install != nil {
+			if err := a.runTemplateInstall(name, serverDir, install, runtimeConfig, hostPort, nil); err != nil {
+				fmt.Printf("[reinstall] Template install failed: %v\n", err)
+				jsonWrite(w, 500, map[string]any{"ok": false, "error": "install failed", "detail": err.Error()})
+				return
+			}
+		}
+
+		switch template {
+		case "python":
+			scaffoldPython(serverDir, startFile)
+		case "nodejs", "discord-bot":
+			p := hostPort
+			if p == 0 {
+				p = 3001
+			}
+			scaffoldNode(serverDir, startFile, p)
+		default:
+			if startFile != "" {
+				_ = os.WriteFile(filepath.Join(serverDir, filepath.Base(startFile)), []byte(""), 0o644)
+			}
+		}
+
 		_ = a.saveMeta(serverDir, meta)
 
-		imagePulled := false
-		if req.Docker != nil && req.Docker.Image != "" {
-			imageRef := req.Docker.Image
-			if req.Docker.Tag != "" {
-				imageRef += ":" + req.Docker.Tag
-			} else {
-				imageRef += ":latest"
+		if img, ok := runtimeConfig["image"].(string); ok && strings.TrimSpace(img) != "" {
+			tag := "latest"
+			if t, ok := runtimeConfig["tag"].(string); ok && strings.TrimSpace(t) != "" {
+				tag = strings.TrimSpace(t)
 			}
-
-			fmt.Printf("[reinstall] Pulling Docker image: %s\n", imageRef)
+			imageRef := strings.TrimSpace(img) + ":" + tag
 			pullCtx, pullCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			a.docker.pull(pullCtx, imageRef)
-			pullCancel()
-			fmt.Printf("[reinstall] Docker image pulled: %s\n", imageRef)
-			imagePulled = true
-
-			ensureVolumeWritable(serverDir)
-		}
-
-		if !imagePulled {
-			if img, ok := runtimeConfig["image"].(string); ok && strings.TrimSpace(img) != "" {
-				tag := "latest"
-				if t, ok := runtimeConfig["tag"].(string); ok && strings.TrimSpace(t) != "" {
-					tag = t
-				}
-				fallbackRef := strings.TrimSpace(img) + ":" + tag
-				fmt.Printf("[reinstall] Pre-pulling Docker image from runtime config: %s\n", fallbackRef)
-				pullCtx, pullCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-				a.docker.pull(pullCtx, fallbackRef)
+			if err := a.docker.pullImageAPI(pullCtx, imageRef); err != nil {
 				pullCancel()
-				fmt.Printf("[reinstall] Docker image pre-pulled: %s\n", fallbackRef)
-				ensureVolumeWritable(serverDir)
-				imagePulled = true
+				jsonWrite(w, 500, map[string]any{"ok": false, "error": "docker image pull failed", "detail": err.Error()})
+				return
 			}
-		}
-
-		if !imagePulled && startupCmd != "" {
-			cmdLower := strings.ToLower(strings.TrimSpace(startupCmd))
-			if strings.HasPrefix(cmdLower, "docker run") {
-				tempArgs := parseShellArgs(strings.TrimSpace(startupCmd[len("docker run"):]))
-				skipN := false
-				for _, tArg := range tempArgs {
-					if skipN {
-						skipN = false
-						continue
-					}
-					if strings.HasPrefix(tArg, "-") {
-						if strings.Contains(tArg, "=") {
-							continue
-						}
-						skipN = true
-						continue
-					}
-					candidate := strings.TrimSpace(tArg)
-					if candidate != "" && !strings.HasPrefix(candidate, "{") {
-						fmt.Printf("[reinstall] Pre-pulling Docker image from startupCommand: %s\n", candidate)
-						pullCtx, pullCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-						a.docker.pull(pullCtx, candidate)
-						pullCancel()
-						fmt.Printf("[reinstall] Docker image pre-pulled: %s\n", candidate)
-						ensureVolumeWritable(serverDir)
-					}
-					break
-				}
-			}
-		}
-
-		if startupCmd == "" && req.Docker != nil && req.Docker.Image != "" {
-			effectiveCmd := a.buildEffectiveDockerCommand(name, serverDir, meta)
-			if effectiveCmd != "" {
-				meta["startupCommand"] = effectiveCmd
-				runtimeObj, _ := meta["runtime"].(map[string]any)
-				if runtimeObj == nil {
-					runtimeObj = make(map[string]any)
-				}
-				runtimeObj["startupCommand"] = effectiveCmd
-				meta["runtime"] = runtimeObj
-				_ = a.saveMeta(serverDir, meta)
-				fmt.Printf("[reinstall] Generated effective startupCommand: %s\n", effectiveCmd)
-			}
+			pullCancel()
+			ensureVolumeWritable(serverDir)
 		}
 	}
 
@@ -8568,7 +14309,6 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 	auditLog.Log("server_reinstall", getClientIP(r), "", name, "reinstall", "success", map[string]any{"template": template})
 	jsonWrite(w, 200, map[string]any{"ok": true, "name": name, "template": template, "meta": meta})
 }
-
 
 func (a *Agent) handleFilesList(w http.ResponseWriter, r *http.Request, name string) {
 	root := a.serverDir(name)
@@ -8964,7 +14704,6 @@ func (a *Agent) handleFilesArchive(w http.ResponseWriter, r *http.Request, name 
 	relPath, _ := filepath.Rel(root, archivePath)
 	jsonWrite(w, 200, map[string]any{"ok": true, "path": relPath, "name": archiveName})
 }
-
 
 func (a *Agent) backupsDir() string {
 	return filepath.Join(a.dataRoot, "backups")
@@ -9465,7 +15204,6 @@ func copyDir(src, dst string) error {
 		return os.Chmod(destPath, linfo.Mode())
 	})
 }
-
 
 func (a *Agent) safeUnderVolumes(p string) (string, bool) {
 	s := strings.TrimSpace(p)
@@ -10011,6 +15749,14 @@ func (a *Agent) handleFSExtract(w http.ResponseWriter, r *http.Request) {
 			jsonWrite(w, 500, map[string]any{"ok": false, "error": "extract failed"})
 			return
 		}
+	case "tarxz":
+		if err := a.extractTarXzSafe(abs, dir); err != nil {
+			if a.debug {
+				fmt.Printf("[fs] extract tarxz error for %s: %v\n", abs, err)
+			}
+			jsonWrite(w, 500, map[string]any{"ok": false, "error": "extract failed"})
+			return
+		}
 	case "7z":
 		if err := a.extract7z(abs, dir); err != nil {
 			if a.debug {
@@ -10105,76 +15851,480 @@ func (a *Agent) handleFSUploadRaw(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) handleFSUploadStream(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, a.uploadLimit)
 
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	mr, err := r.MultipartReader()
+	if err != nil {
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "bad multipart"})
 		return
 	}
-	defer r.MultipartForm.RemoveAll()
 
-	dirStr := r.FormValue("dir")
-	absDir, ok := a.safeUnderVolumes(dirStr)
+	var absDir string
+	var destPath string
+	var uploaded bool
+	var written int64
+
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "bad multipart"})
+			return
+		}
+
+		formName := part.FormName()
+		fileName := part.FileName()
+
+		if formName == "dir" {
+			b, readErr := io.ReadAll(io.LimitReader(part, 64<<10))
+			if readErr != nil {
+				_ = part.Close()
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid dir"})
+				return
+			}
+			_ = part.Close()
+			if len(b) >= 64<<10 {
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid dir"})
+				return
+			}
+			parsedDir, ok := a.safeUnderVolumes(string(b))
+			if !ok {
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid dir"})
+				return
+			}
+			if err := ensureResolvedUnder(a.volumesDir, parsedDir); err != nil {
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": "symlink escape blocked"})
+				return
+			}
+			absDir = parsedDir
+			continue
+		}
+
+		if formName != "file" || fileName == "" {
+			_, _ = io.Copy(io.Discard, part)
+			_ = part.Close()
+			continue
+		}
+
+		if uploaded {
+			_, _ = io.Copy(io.Discard, part)
+			_ = part.Close()
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "too many files"})
+			return
+		}
+		if absDir == "" {
+			_, _ = io.Copy(io.Discard, part)
+			_ = part.Close()
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "dir field must be sent before file"})
+			return
+		}
+
+		rawName := filepath.Base(fileName)
+		safeName := sanitizeName(rawName)
+		if safeName == "" {
+			safeName = "upload.bin"
+		}
+
+		_ = ensureDir(absDir)
+		destPath = filepath.Join(absDir, safeName)
+
+		var replacedBytes int64
+		if info, err := os.Lstat(destPath); err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				_ = part.Close()
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": "cannot overwrite symlink"})
+				return
+			}
+			if info.IsDir() {
+				_ = part.Close()
+				jsonWrite(w, 400, map[string]any{"ok": false, "error": "destination is a directory"})
+				return
+			}
+			replacedBytes = info.Size()
+		}
+
+		allowedBytes, baseUsedBytes, limitBytes, diskLimited, diskErr := a.uploadDiskAllowanceForPath(absDir, replacedBytes)
+		if diskErr != nil {
+			_ = part.Close()
+			diskErr["ok"] = false
+			jsonWrite(w, 507, diskErr)
+			return
+		}
+
+		out, err := os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|syscall.O_NOFOLLOW, 0o644)
+		if err != nil {
+			_ = part.Close()
+			if a.debug {
+				fmt.Printf("[fs] upload stream create error: %v\n", err)
+			}
+			jsonWrite(w, 500, map[string]any{"ok": false, "error": "file create failed"})
+			return
+		}
+
+		diskAllowedBytes := int64(-1)
+		if diskLimited {
+			diskAllowedBytes = allowedBytes
+		}
+		written, limitKind, err := copyUploadWithLimits(out, part, a.uploadLimit, diskAllowedBytes)
+		closeErr := out.Close()
+		_ = part.Close()
+		if err != nil {
+			_ = os.Remove(destPath)
+			if a.debug {
+				fmt.Printf("[fs] upload stream write error: %v\n", err)
+			}
+			jsonWrite(w, 500, map[string]any{"ok": false, "error": "write failed"})
+			return
+		}
+		if closeErr != nil {
+			_ = os.Remove(destPath)
+			jsonWrite(w, 500, map[string]any{"ok": false, "error": "close failed"})
+			return
+		}
+		if limitKind == "upload" {
+			_ = os.Remove(destPath)
+			jsonWrite(w, 413, map[string]any{
+				"ok":       false,
+				"error":    "file too large",
+				"limit_mb": a.uploadLimit / (1024 * 1024),
+			})
+			return
+		}
+		if limitKind == "disk" {
+			_ = os.Remove(destPath)
+			out := diskLimitUploadPayload(baseUsedBytes, limitBytes, written+1)
+			out["ok"] = false
+			jsonWrite(w, 507, out)
+			return
+		}
+
+		uploaded = true
+	}
+
+	if !uploaded {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "missing file field"})
+		return
+	}
+
+	jsonWrite(w, 200, map[string]any{"ok": true, "path": destPath, "bytes": written})
+}
+
+func uploadURLAllowsAnyPort() bool {
+	return os.Getenv("ADPANEL_NODE_FETCH_ALLOW_ANY_PORT") == "1" || os.Getenv("REMOTE_FETCH_ALLOW_ANY_PORT") == "1"
+}
+
+func uploadURLPortAllowed(u *url.URL) bool {
+	if uploadURLAllowsAnyPort() {
+		return true
+	}
+	port := u.Port()
+	return port == "" || port == "80" || port == "443"
+}
+
+func sanitizeUploadFilenameForURL(name string) string {
+	s := strings.TrimSpace(name)
+	if s == "" {
+		return ""
+	}
+	if decoded, err := url.PathUnescape(s); err == nil {
+		s = decoded
+	}
+	s = strings.NewReplacer("\x00", "_", "\r", "_", "\n", "_", "\\", "/").Replace(s)
+	s = path.Base(s)
+	if s == "." || s == ".." || s == "/" || s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_', r == ' ':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := strings.TrimSpace(strings.TrimLeft(b.String(), "."))
+	if out == "" || out == "." || out == ".." {
+		return ""
+	}
+	if len(out) > 200 {
+		out = out[len(out)-200:]
+		out = strings.TrimLeft(out, ". ")
+	}
+	if out == "" || out == "." || out == ".." {
+		return ""
+	}
+	return out
+}
+
+func filenameFromContentDisposition(cd string) string {
+	if strings.TrimSpace(cd) == "" {
+		return ""
+	}
+	_, params, err := mime.ParseMediaType(cd)
+	if err != nil {
+		return ""
+	}
+	return params["filename"]
+}
+
+func openURLUploadTempFile(dir, filename string) (*os.File, string, error) {
+	prefix := "." + sanitizeUploadFilenameForURL(filename)
+	if prefix == "." {
+		prefix = ".download"
+	}
+	for i := 0; i < 16; i++ {
+		tmpPath := filepath.Join(dir, fmt.Sprintf("%s.%s.urlupload.tmp", prefix, randomHex(8)))
+		if !isUnder(dir, tmpPath) {
+			return nil, "", fmt.Errorf("invalid temp path")
+		}
+		f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o644)
+		if err == nil {
+			return f, tmpPath, nil
+		}
+		if os.IsExist(err) {
+			continue
+		}
+		return nil, "", err
+	}
+	return nil, "", fmt.Errorf("could not allocate temp file")
+}
+
+func (a *Agent) handleFSUploadURL(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Dir string `json:"dir"`
+		URL string `json:"url"`
+	}
+	if err := readJSON(w, r, 16<<10, &body); err != nil {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "bad json"})
+		return
+	}
+
+	rawURL := strings.TrimSpace(body.URL)
+	if rawURL == "" {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "missing url"})
+		return
+	}
+	if len(rawURL) > 2048 {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "url too long"})
+		return
+	}
+
+	parsedURL, err := a.dl.safeURL(rawURL)
+	if err != nil {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid url", "detail": err.Error()})
+		return
+	}
+	if !uploadURLPortAllowed(parsedURL) {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid url", "detail": "only ports 80/443 are allowed"})
+		return
+	}
+
+	absDir, ok := a.safeUnderVolumes(body.Dir)
 	if !ok {
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid dir"})
 		return
 	}
-	var uploadSize int64
-	if r.ContentLength > 0 {
-		uploadSize = r.ContentLength
+	dirInfo, err := os.Lstat(absDir)
+	if err != nil || !dirInfo.IsDir() {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "target dir not found"})
+		return
 	}
-	if diskErr := a.checkDiskLimitForPath(absDir, uploadSize); diskErr != nil {
-		diskErr["ok"] = false
-		jsonWrite(w, 507, diskErr)
+	if dirInfo.Mode()&os.ModeSymlink != 0 {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "cannot upload into symlink"})
 		return
 	}
 	if err := ensureResolvedUnder(a.volumesDir, absDir); err != nil {
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "symlink escape blocked"})
 		return
 	}
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		jsonWrite(w, 400, map[string]any{"ok": false, "error": "missing file field"})
+	if diskErr := a.checkDiskLimitForPath(absDir, 0); diskErr != nil {
+		diskErr["ok"] = false
+		jsonWrite(w, 507, diskErr)
 		return
 	}
-	defer file.Close()
 
-	rawName := filepath.Base(header.Filename)
-	safeName := sanitizeName(rawName)
-	if safeName == "" {
-		safeName = "upload.bin"
+	maxBytes := a.uploadLimit
+	if maxBytes <= 0 {
+		maxBytes = 1024 * 1024 * 1024
 	}
 
-	_ = ensureDir(absDir)
-	destPath := filepath.Join(absDir, safeName)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+	defer cancel()
 
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsedURL.String(), nil)
+	if err != nil {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid url"})
+		return
+	}
+	req.Header.Set("User-Agent", "ADPanel-Node/"+NodeVersion)
+	req.Header.Set("Accept", "*/*")
+
+	client := a.dl.clientNoProxy()
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		nextURL, err := a.dl.safeURL(req.URL.String())
+		if err != nil {
+			return err
+		}
+		if !uploadURLPortAllowed(nextURL) {
+			return fmt.Errorf("only ports 80/443 are allowed")
+		}
+		return nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if a.debug {
+			fmt.Printf("[fs] uploadUrl request error: %v\n", err)
+		}
+		jsonWrite(w, 502, map[string]any{"ok": false, "error": "fetch failed", "detail": "remote request failed"})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		jsonWrite(w, 502, map[string]any{"ok": false, "error": "fetch failed", "detail": fmt.Sprintf("remote http %d", resp.StatusCode)})
+		return
+	}
+
+	if resp.ContentLength > maxBytes {
+		jsonWrite(w, 413, map[string]any{
+			"ok":       false,
+			"error":    "file too large",
+			"limit_mb": maxBytes / (1024 * 1024),
+		})
+		return
+	}
+
+	filename := sanitizeUploadFilenameForURL(filenameFromContentDisposition(resp.Header.Get("Content-Disposition")))
+	if filename == "" && parsedURL.Path != "" {
+		filename = sanitizeUploadFilenameForURL(path.Base(parsedURL.Path))
+	}
+	if filename == "" {
+		filename = "download.bin"
+	}
+
+	destPath := filepath.Join(absDir, filename)
+	if !isUnder(absDir, destPath) {
+		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid filename"})
+		return
+	}
+
+	var replacedBytes int64
 	if info, err := os.Lstat(destPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			jsonWrite(w, 400, map[string]any{"ok": false, "error": "cannot overwrite symlink"})
 			return
 		}
+		if info.IsDir() {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "destination is a directory"})
+			return
+		}
+		replacedBytes = info.Size()
 	}
 
-	out, err := os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|syscall.O_NOFOLLOW, 0o644)
+	if resp.ContentLength > 0 {
+		extraBytes := resp.ContentLength - replacedBytes
+		if extraBytes < 0 {
+			extraBytes = 0
+		}
+		if diskErr := a.checkDiskLimitForPath(absDir, extraBytes); diskErr != nil {
+			diskErr["ok"] = false
+			jsonWrite(w, 507, diskErr)
+			return
+		}
+	}
+
+	allowedBytes, baseUsedBytes, limitBytes, diskLimited, diskErr := a.uploadDiskAllowanceForPath(absDir, replacedBytes)
+	if diskErr != nil {
+		diskErr["ok"] = false
+		jsonWrite(w, 507, diskErr)
+		return
+	}
+	if resp.ContentLength > 0 && diskLimited && resp.ContentLength > allowedBytes {
+		out := diskLimitUploadPayload(baseUsedBytes, limitBytes, resp.ContentLength)
+		out["ok"] = false
+		jsonWrite(w, 507, out)
+		return
+	}
+
+	out, tmpPath, err := openURLUploadTempFile(absDir, filename)
 	if err != nil {
 		if a.debug {
-			fmt.Printf("[fs] upload stream create error: %v\n", err)
+			fmt.Printf("[fs] uploadUrl create error: %v\n", err)
 		}
 		jsonWrite(w, 500, map[string]any{"ok": false, "error": "file create failed"})
 		return
 	}
-	defer out.Close()
+	committed := false
+	defer func() {
+		if !committed && tmpPath != "" {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
-	if _, err := io.Copy(out, file); err != nil {
+	diskAllowedBytes := int64(-1)
+	if diskLimited {
+		diskAllowedBytes = allowedBytes
+	}
+	written, limitKind, copyErr := copyUploadWithLimits(out, resp.Body, maxBytes, diskAllowedBytes)
+	closeErr := out.Close()
+	if copyErr != nil {
 		if a.debug {
-			fmt.Printf("[fs] upload stream write error: %v\n", err)
+			fmt.Printf("[fs] uploadUrl write error: %v\n", copyErr)
 		}
 		jsonWrite(w, 500, map[string]any{"ok": false, "error": "write failed"})
 		return
 	}
+	if closeErr != nil {
+		jsonWrite(w, 500, map[string]any{"ok": false, "error": "close failed"})
+		return
+	}
+	if limitKind == "upload" {
+		jsonWrite(w, 413, map[string]any{
+			"ok":       false,
+			"error":    "file too large",
+			"limit_mb": maxBytes / (1024 * 1024),
+		})
+		return
+	}
+	if limitKind == "disk" {
+		out := diskLimitUploadPayload(baseUsedBytes, limitBytes, written+1)
+		out["ok"] = false
+		jsonWrite(w, 507, out)
+		return
+	}
 
-	jsonWrite(w, 200, map[string]any{"ok": true, "path": destPath})
+	if diskErr := a.checkDiskLimitForPathAfterReplacing(absDir, replacedBytes); diskErr != nil {
+		diskErr["ok"] = false
+		jsonWrite(w, 507, diskErr)
+		return
+	}
+
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		if a.debug {
+			fmt.Printf("[fs] uploadUrl rename error: %v\n", err)
+		}
+		jsonWrite(w, 500, map[string]any{"ok": false, "error": "rename failed"})
+		return
+	}
+	committed = true
+
+	jsonWrite(w, 200, map[string]any{
+		"ok":       true,
+		"path":     destPath,
+		"filename": filename,
+		"bytes":    written,
+		"msg":      fmt.Sprintf("Downloaded %s (%d bytes)", filename, written),
+	})
 }
-
 
 func main() {
 	cfgPath := os.Getenv("ADPANEL_NODE_CONFIG")
@@ -10261,6 +16411,24 @@ func main() {
 		}
 	}
 
+	resourceStatsTTL := serverResourceStatsDefaultTTL
+	if v := os.Getenv("RESOURCE_STATS_CACHE_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 500 && n <= 30000 {
+			resourceStatsTTL = time.Duration(n) * time.Millisecond
+		}
+	}
+	resourceStatsDiskTTL := serverResourceStatsDiskTTL
+	if v := os.Getenv("RESOURCE_STATS_DISK_CACHE_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1000 && n <= 300000 {
+			resourceStatsDiskTTL = time.Duration(n) * time.Millisecond
+		}
+	}
+
+	panelHMAC := strings.TrimSpace(os.Getenv("PANEL_HMAC_SECRET"))
+	if panelHMAC == "" {
+		panelHMAC = strings.TrimSpace(cfg.String("panel", "hmac_secret"))
+	}
+
 	agent := &Agent{
 		cfg:         cfg,
 		debug:       debug,
@@ -10273,17 +16441,20 @@ func main() {
 		dataRoot:    dataRoot,
 		volumesDir:  volumesDir,
 		sftpPort:    sftpPort,
-		panelHMAC:   os.Getenv("PANEL_HMAC_SECRET"),
+		panelHMAC:   panelHMAC,
 		stopGrace:   time.Duration(stopGraceMS) * time.Millisecond,
 		docker:      Docker{debug: debug},
 		dl: Downloader{
 			headerTimeout: time.Duration(headerTimeoutMS) * time.Millisecond,
 			maxBytes:      downloadMax,
 		},
+		resourceStats:  newServerResourceStatsCache(resourceStatsTTL, resourceStatsDiskTTL),
 		stoppingNow:    make(map[string]time.Time),
+		recentCommands: make(map[string]recentConsoleCommand),
 		importProgress: make(map[string]*ImportProgress),
 		importSem:      make(chan struct{}, 3),
 	}
+	agent.ensureNodeInformationFile()
 	agent.logs = newLogManager(agent.docker, debug)
 	agent.stdinMgr = newStdinManager(&agent.docker, debug)
 
@@ -10296,6 +16467,23 @@ func main() {
 
 	memMon := newMemoryMonitor(agent, 10*time.Second, debug)
 	memMon.start()
+
+	networkAbuseMon := newNetworkAbuseMonitor(agent, 5*time.Second, debug)
+	networkAbuseMon.start()
+
+	statsCacheStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				agent.resourceStats.cleanup(serverResourceStatsMaxIdle)
+			case <-statsCacheStop:
+				return
+			}
+		}
+	}()
 
 	httpSrv := &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", agent.apiHost, agent.apiPort),
@@ -10358,6 +16546,10 @@ func main() {
 		memMon.stop()
 
 		diskMon.stop()
+
+		networkAbuseMon.stop()
+
+		close(statsCacheStop)
 
 		if agent.stdinMgr != nil {
 			agent.stdinMgr.stop()
