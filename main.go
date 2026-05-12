@@ -601,7 +601,9 @@ func (d Docker) rmForce(ctx context.Context, name string) {
 }
 
 func (d Docker) pull(ctx context.Context, ref string) {
-	_, _, _, _ = d.runCollect(ctx, "pull", ref)
+	if err := d.pullImageAPI(ctx, ref); err != nil {
+		_, _, _, _ = d.runCollect(ctx, "pull", ref)
+	}
 }
 
 func (d Docker) imageExistsLocally(ctx context.Context, ref string) bool {
@@ -14197,19 +14199,28 @@ func (a *Agent) handleDeleteServer(w http.ResponseWriter, r *http.Request, name 
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid name"})
 		return
 	}
+	opMu := a.getServerOpLock(name)
+	opMu.Lock()
+	defer opMu.Unlock()
+
 	a.logs.killTail(name)
+	if a.stdinMgr != nil {
+		a.stdinMgr.remove(name)
+	}
 
 	filesOnly := r.URL.Query().Get("files_only") == "true"
 	if !filesOnly {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		a.docker.updateRestartNo(ctx, name)
-		a.docker.rmForce(ctx, name)
+		if err := a.docker.removeContainerAPI(ctx, dockerContainerName(name), true); err != nil && ctx.Err() == nil {
+			fmt.Printf("[delete] container removal warning for %s: %v\n", name, err)
+		}
 		cancel()
 	}
 
 	serverDir := a.serverDir(name)
 	backupsDir := a.serverBackupsDir(name)
-	fmt.Printf("[delete] attempting to remove server directory: %s\n", serverDir)
+	fmt.Printf("[delete] attempting to detach server directory: %s\n", serverDir)
 
 	if filepath.Clean(serverDir) == filepath.Clean(a.volumesDir) {
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "refusing to delete volumes root"})
@@ -14223,27 +14234,44 @@ func (a *Agent) handleDeleteServer(w http.ResponseWriter, r *http.Request, name 
 	if _, err := os.Stat(serverDir); os.IsNotExist(err) {
 		fmt.Printf("[delete] directory already gone: %s\n", serverDir)
 		_ = os.Remove(a.metaPath(name))
+		backupQueued := false
 		if isUnder(a.backupsDir(), backupsDir) {
-			_ = os.RemoveAll(backupsDir)
+			if detachedBackup, backupExists, detachErr := a.detachPathForAsyncDelete(a.backupsDir(), backupsDir, "backups", name); detachErr != nil {
+				fmt.Printf("[delete] backup detach warning for %s: %v\n", name, detachErr)
+			} else if backupExists {
+				backupQueued = true
+				removeDetachedPathAsync("backups", detachedBackup)
+			}
 		}
 		auditLog.Log("server_delete", getClientIP(r), "", name, "delete", "success", nil)
-		jsonWrite(w, 200, map[string]any{"ok": true, "name": name})
+		jsonWrite(w, 200, map[string]any{"ok": true, "name": name, "deleting": backupQueued})
 		return
 	}
 
-	if err := os.RemoveAll(serverDir); err != nil {
-		fmt.Printf("[delete] error removing %s: %v\n", serverDir, err)
-		jsonWrite(w, 500, map[string]any{"ok": false, "error": "failed to delete server"})
+	detachedServer, serverExists, err := a.detachPathForAsyncDelete(a.volumesDir, serverDir, "server", name)
+	if err != nil {
+		fmt.Printf("[delete] error detaching %s: %v\n", serverDir, err)
+		jsonWrite(w, 500, map[string]any{"ok": false, "error": "failed to queue server delete", "detail": err.Error()})
 		return
 	}
 	_ = os.Remove(a.metaPath(name))
-	if isUnder(a.backupsDir(), backupsDir) {
-		_ = os.RemoveAll(backupsDir)
+	if serverExists {
+		removeDetachedPathAsync("server", detachedServer)
 	}
 
-	fmt.Printf("[delete] successfully removed: %s\n", serverDir)
+	backupQueued := false
+	if isUnder(a.backupsDir(), backupsDir) {
+		if detachedBackup, backupExists, detachErr := a.detachPathForAsyncDelete(a.backupsDir(), backupsDir, "backups", name); detachErr != nil {
+			fmt.Printf("[delete] backup detach warning for %s: %v\n", name, detachErr)
+		} else if backupExists {
+			backupQueued = true
+			removeDetachedPathAsync("backups", detachedBackup)
+		}
+	}
+
+	fmt.Printf("[delete] queued async cleanup for %s (serverQueued=%v backupsQueued=%v)\n", name, serverExists, backupQueued)
 	auditLog.Log("server_delete", getClientIP(r), "", name, "delete", "success", nil)
-	jsonWrite(w, 200, map[string]any{"ok": true, "name": name})
+	jsonWrite(w, 200, map[string]any{"ok": true, "name": name, "deleting": serverExists || backupQueued})
 }
 
 func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, name string) {
@@ -15098,6 +15126,127 @@ func (a *Agent) backupsDir() string {
 
 func (a *Agent) serverBackupsDir(serverName string) string {
 	return filepath.Join(a.backupsDir(), sanitizeName(serverName))
+}
+
+func deletionTrashDir(parent string) string {
+	return filepath.Join(parent, ".adpanel_deleting")
+}
+
+func deletionTombstoneName(label, name string) string {
+	safe := sanitizeName(name)
+	if safe == "" {
+		safe = "unknown"
+	}
+	label = sanitizeName(label)
+	if label == "" {
+		label = "path"
+	}
+	return fmt.Sprintf("%s-%s-%d", label, safe, time.Now().UnixNano())
+}
+
+func (a *Agent) detachPathForAsyncDelete(parentRoot, target, label, name string) (string, bool, error) {
+	parentRoot = filepath.Clean(parentRoot)
+	target = filepath.Clean(target)
+	if parentRoot == "" || target == "" || target == "." || target == string(os.PathSeparator) {
+		return "", false, fmt.Errorf("invalid delete path")
+	}
+	if filepath.Clean(parentRoot) == target {
+		return "", false, fmt.Errorf("refusing to delete root")
+	}
+	if !isUnder(parentRoot, target) {
+		return "", false, fmt.Errorf("delete path escapes root")
+	}
+	if _, err := os.Lstat(target); err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+
+	trashRoot := deletionTrashDir(parentRoot)
+	if err := ensureDir(trashRoot); err != nil {
+		return "", true, err
+	}
+
+	var lastErr error
+	for i := 0; i < 10; i++ {
+		dst := filepath.Join(trashRoot, deletionTombstoneName(label, name))
+		if i > 0 {
+			dst = fmt.Sprintf("%s-%d", dst, i)
+		}
+		if err := os.Rename(target, dst); err == nil {
+			return dst, true, nil
+		} else {
+			if os.IsNotExist(err) {
+				return "", false, nil
+			}
+			lastErr = err
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+	return "", true, lastErr
+}
+
+func chmodTreeWritable(root string) {
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if info.IsDir() {
+			_ = os.Chmod(p, 0o777)
+			return nil
+		}
+		_ = os.Chmod(p, info.Mode().Perm()|0o600)
+		return nil
+	})
+}
+
+func removeAllWritable(root string) error {
+	root = filepath.Clean(root)
+	if root == "" || root == "." || root == string(os.PathSeparator) {
+		return fmt.Errorf("refusing to remove unsafe path")
+	}
+	if err := os.RemoveAll(root); err == nil {
+		return nil
+	} else {
+		firstErr := err
+		chmodTreeWritable(root)
+		if retryErr := os.RemoveAll(root); retryErr != nil {
+			return fmt.Errorf("%v; retry after chmod failed: %w", firstErr, retryErr)
+		}
+	}
+	return nil
+}
+
+func removeDetachedPathAsync(label, root string) {
+	root = filepath.Clean(root)
+	if root == "" || root == "." || root == string(os.PathSeparator) {
+		return
+	}
+	go func() {
+		started := time.Now()
+		if err := removeAllWritable(root); err != nil {
+			fmt.Printf("[delete] async cleanup failed for %s %s after %s: %v\n", label, root, time.Since(started).Round(time.Millisecond), err)
+			return
+		}
+		fmt.Printf("[delete] async cleanup completed for %s %s in %s\n", label, root, time.Since(started).Round(time.Millisecond))
+	}()
+}
+
+func (a *Agent) cleanupPendingDeletes() {
+	roots := []string{deletionTrashDir(a.volumesDir), deletionTrashDir(a.backupsDir())}
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			removeDetachedPathAsync("startup-trash", filepath.Join(root, entry.Name()))
+		}
+	}
 }
 
 type BackupMeta struct {
@@ -16842,6 +16991,7 @@ func main() {
 		importSem:      make(chan struct{}, 3),
 	}
 	agent.ensureNodeInformationFile()
+	agent.cleanupPendingDeletes()
 	agent.logs = newLogManager(agent.docker, debug)
 	agent.stdinMgr = newStdinManager(&agent.docker, debug)
 
