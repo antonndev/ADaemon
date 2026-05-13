@@ -88,3 +88,53 @@ func TestRustRestartRecreatesContainer(t *testing.T) {
 		t.Fatalf("did not expect minecraft restart to use rust recreate path")
 	}
 }
+
+func TestRustGetsDefaultHighFileLimit(t *testing.T) {
+	resources := withRuntimeDefaultFileLimit(nil, "rust", "ghcr.io/pterodactyl/games:rust")
+	if resources == nil || resources.FileLimit == nil || *resources.FileLimit != maxFileLimit {
+		t.Fatalf("expected rust to default to max file limit, got %#v", resources)
+	}
+
+	customLimit := 65535
+	resources = withRuntimeDefaultFileLimit(&resourceLimits{FileLimit: &customLimit}, "rust", "ghcr.io/pterodactyl/games:rust")
+	if resources == nil || resources.FileLimit == nil || *resources.FileLimit != customLimit {
+		t.Fatalf("expected explicit file limit to be preserved, got %#v", resources)
+	}
+
+	if got := withRuntimeDefaultFileLimit(nil, "minecraft", "eclipse-temurin:21-jre"); got != nil {
+		t.Fatalf("did not expect non-rust runtime defaults, got %#v", got)
+	}
+}
+
+func TestLegacyRustRuntimeMigratesToPterodactyl(t *testing.T) {
+	meta := map[string]any{
+		"type":     "rust",
+		"template": "rust",
+		"runtime": map[string]any{
+			"image":   "didstopia/rust-server",
+			"tag":     "full",
+			"volumes": []any{"{BOT_DIR}:/steamcmd/rust"},
+			"workdir": "/",
+			"env": map[string]any{
+				"RUST_SERVER_NAME":      "Legacy Rust",
+				"RUST_RCON_PASSWORD":    "secret",
+				"RUST_SERVER_QUERYPORT": "28016",
+			},
+		},
+	}
+	if !normalizeRustRuntimeForPterodactyl(meta) {
+		t.Fatalf("expected legacy rust metadata to be migrated")
+	}
+	runtimeObj := meta["runtime"].(map[string]any)
+	if runtimeObj["image"] != "ghcr.io/pterodactyl/games" || runtimeObj["tag"] != "rust" {
+		t.Fatalf("expected pterodactyl rust runtime, got %#v:%#v", runtimeObj["image"], runtimeObj["tag"])
+	}
+	env := runtimeObj["env"].(map[string]string)
+	if env["SERVER_NAME"] != "Legacy Rust" || env["RCON_PASS"] != "secret" {
+		t.Fatalf("expected legacy env values to be preserved, got %#v", env)
+	}
+	volumes := runtimeObj["volumes"].([]any)
+	if len(volumes) != 1 || volumes[0] != "{BOT_DIR}:/home/container" {
+		t.Fatalf("expected home/container volume, got %#v", volumes)
+	}
+}
