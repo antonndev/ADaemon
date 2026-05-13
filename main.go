@@ -597,8 +597,13 @@ func (d Docker) containerState(ctx context.Context, name string) string {
 	return strings.ToLower(strings.TrimSpace(out))
 }
 
+func (d Docker) kill(ctx context.Context, name string) {
+	_, _, _, _ = d.runCollect(ctx, "kill", name)
+}
+
 func (d Docker) rmForce(ctx context.Context, name string) {
-	_, _, _, _ = d.runCollect(ctx, "rm", "-f", name)
+	d.kill(ctx, name)
+	_, _, _, _ = d.runCollect(ctx, "rm", "-f", "-v", name)
 }
 
 func (d Docker) pull(ctx context.Context, ref string) {
@@ -1837,6 +1842,7 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 			if d.debug {
 				fmt.Printf("[docker] target process stdin failed for %s: %v\n", name, err)
 			}
+			return fmt.Errorf("failed-to-send: target process stdin failed: %w", targetErr)
 		}
 	}
 
@@ -5432,6 +5438,22 @@ func runtimeIntSlice(raw any) []int {
 	}
 }
 
+func runtimeBool(raw any) bool {
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case string:
+		clean := strings.ToLower(strings.TrimSpace(v))
+		return clean == "1" || clean == "true" || clean == "yes" || clean == "on"
+	case float64:
+		return v != 0
+	case int:
+		return v != 0
+	default:
+		return false
+	}
+}
+
 func runtimeEnvMap(raw any) map[string]string {
 	out := map[string]string{}
 	switch v := raw.(type) {
@@ -5454,6 +5476,75 @@ func runtimeEnvMap(raw any) map[string]string {
 		return nil
 	}
 	return out
+}
+
+func primaryPortEnvKeysForTemplate(tpl string) []string {
+	switch strings.ToLower(strings.TrimSpace(tpl)) {
+	case "ark-survival-evolved", "ark":
+		return []string{"GAME_CLIENT_PORT"}
+	case "cs2", "dayz", "rust", "valheim":
+		return []string{"SERVER_PORT"}
+	case "fivem", "redm":
+		return []string{"SERVER_PORT", "PORT", "ADPANEL_GAME_PORT"}
+	case "palworld":
+		return []string{"PORT"}
+	case "project-zomboid":
+		return []string{"DEFAULT_PORT"}
+	case "ragemp":
+		return []string{"RAGEMP_PORT"}
+	default:
+		return nil
+	}
+}
+
+func applyRuntimeHostPortEnv(tpl string, env map[string]string, hostPort int) {
+	if env == nil || hostPort <= 0 {
+		return
+	}
+	portValue := fmt.Sprint(hostPort)
+	env["PORT"] = portValue
+	env["SERVER_PORT"] = portValue
+	for _, key := range primaryPortEnvKeysForTemplate(tpl) {
+		env[key] = portValue
+	}
+}
+
+func renderRuntimeEnvTemplates(tpl string, env map[string]string, hostPort int) {
+	if env == nil {
+		return
+	}
+	for key, value := range env {
+		if !strings.Contains(value, "{{") && !strings.Contains(value, "{PORT}") && !strings.Contains(value, "{SERVER_PORT}") {
+			continue
+		}
+		rendered := renderADPanelStartupTemplate(value, env, hostPort)
+		if hostPort > 0 {
+			rendered = strings.ReplaceAll(rendered, "{SERVER_PORT}", fmt.Sprint(hostPort))
+			rendered = strings.ReplaceAll(rendered, "{PORT}", fmt.Sprint(hostPort))
+		}
+		env[key] = rendered
+	}
+}
+
+func runtimeUsesHostPortInsideContainer(tpl string, runtimeObj map[string]any, env map[string]string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(tpl))
+	switch normalized {
+	case "ark-survival-evolved", "ark", "cs2", "dayz", "fivem", "redm", "palworld", "project-zomboid", "ragemp", "rust", "valheim":
+		return true
+	}
+	for _, key := range primaryPortEnvKeysForTemplate(normalized) {
+		if _, ok := env[key]; ok {
+			return true
+		}
+	}
+	startup := strings.TrimSpace(env["STARTUP"])
+	if startup == "" {
+		startup = startupTemplateFromRuntime(runtimeObj)
+	}
+	return strings.Contains(startup, "{{SERVER_PORT}}") ||
+		strings.Contains(startup, "{{PORT}}") ||
+		strings.Contains(startup, "{SERVER_PORT}") ||
+		strings.Contains(startup, "{PORT}")
 }
 
 func (a *Agent) resolveStructuredBinds(tpl string, runtimeObj map[string]any, serverDir string) ([]string, string) {
@@ -6004,6 +6095,23 @@ func (a *Agent) preferredStructuredContainerUser(ctx context.Context, imageRef s
 	}
 
 	return fmt.Sprintf("%d:%d", uid, gid)
+}
+
+func runtimeRequestsRootUser(runtimeObj map[string]any) bool {
+	if runtimeObj == nil {
+		return false
+	}
+	return runtimeBool(runtimeObj["runAsRoot"]) || runtimeBool(runtimeObj["run_as_root"])
+}
+
+func (a *Agent) structuredContainerUser(ctx context.Context, imageRef string, uid, gid int, runtimeObj map[string]any) string {
+	if runtimeRequestsRootUser(runtimeObj) {
+		if a.debug {
+			fmt.Printf("[docker] template requested root entrypoint for %s\n", imageRef)
+		}
+		return ""
+	}
+	return a.preferredStructuredContainerUser(ctx, imageRef, uid, gid)
 }
 
 func hostConfigMemoryLimitMb(cfg dockerHostConfig) float64 {
@@ -6911,6 +7019,9 @@ func (a *Agent) runTemplateInstall(name, serverDir string, install *templateInst
 	env := adpanelStartupDefaultEnv(name, hostPort, resources, startup)
 	env = mergeStringEnv(env, runtimeEnvMap(runtimeObj["env"]))
 	env = mergeStringEnv(env, install.Env)
+	tpl := strings.ToLower(strings.TrimSpace(fmt.Sprint(runtimeObj["providerId"])))
+	applyRuntimeHostPortEnv(tpl, env, hostPort)
+	renderRuntimeEnvTemplates(tpl, env, hostPort)
 	if startup != "" {
 		env["STARTUP"] = renderADPanelStartupTemplate(startup, env, hostPort)
 	}
@@ -7339,7 +7450,7 @@ func (a *Agent) startMinecraftContainer(ctx context.Context, name, serverDir str
 		if err != nil {
 			return err
 		}
-		req.User = a.preferredStructuredContainerUser(ctx, imageRef, uid, gid)
+		req.User = a.structuredContainerUser(ctx, imageRef, uid, gid, runtimeObj)
 		req.Cmd = cmdArgs
 	}
 
@@ -7411,9 +7522,8 @@ func (a *Agent) startRuntimeContainer(ctx context.Context, name, serverDir strin
 		env[strings.TrimSpace(k)] = v
 	}
 	if effectivePort > 0 {
-		if _, ok := env["PORT"]; !ok {
-			env["PORT"] = fmt.Sprint(effectivePort)
-		}
+		applyRuntimeHostPortEnv(tpl, env, effectivePort)
+		renderRuntimeEnvTemplates(tpl, env, effectivePort)
 	}
 
 	startFile := strings.TrimSpace(fmt.Sprint(meta["start"]))
@@ -7436,7 +7546,7 @@ func (a *Agent) startRuntimeContainer(ctx context.Context, name, serverDir strin
 		Env:          envMapToList(env),
 		Cmd:          cmdArgs,
 		WorkingDir:   workdir,
-		User:         a.preferredStructuredContainerUser(ctx, imageRef, uid, gid),
+		User:         a.structuredContainerUser(ctx, imageRef, uid, gid, runtimeObj),
 		Tty:          true,
 		OpenStdin:    true,
 		AttachStdin:  true,
@@ -8357,11 +8467,8 @@ func (a *Agent) startCustomDockerContainer(ctx context.Context, name, serverDir 
 	if env == nil {
 		env = map[string]string{}
 	}
-	if hostPort > 0 {
-		if _, ok := env["PORT"]; !ok {
-			env["PORT"] = fmt.Sprint(hostPort)
-		}
-	}
+	applyRuntimeHostPortEnv(tpl, env, hostPort)
+	renderRuntimeEnvTemplates(tpl, env, hostPort)
 	if adpanelStartup != "" {
 		for key, value := range adpanelStartupDefaultEnv(name, hostPort, resources, adpanelStartup) {
 			if _, exists := env[key]; !exists {
@@ -8376,6 +8483,9 @@ func (a *Agent) startCustomDockerContainer(ctx context.Context, name, serverDir 
 		if p := ports[0]; p > 0 {
 			mainContainerPort = p
 		}
+	}
+	if runtimeUsesHostPortInsideContainer(tpl, runtimeObj, env) && hostPort > 0 {
+		mainContainerPort = hostPort
 	}
 	if mainContainerPort <= 0 {
 		mainContainerPort = hostPort
@@ -8423,7 +8533,7 @@ func (a *Agent) startCustomDockerContainer(ctx context.Context, name, serverDir 
 		Env:          envMapToList(env),
 		Cmd:          cmdArgs,
 		WorkingDir:   workdir,
-		User:         a.preferredStructuredContainerUser(ctx, imageRef, uid, gid),
+		User:         a.structuredContainerUser(ctx, imageRef, uid, gid, runtimeObj),
 		Tty:          true,
 		OpenStdin:    true,
 		AttachStdin:  true,
@@ -10884,6 +10994,8 @@ type dockerTemplateConfig struct {
 	Env                      map[string]string      `json:"env"`
 	Restart                  string                 `json:"restart"`
 	RestartPolicy            string                 `json:"restartPolicy"`
+	RunAsRoot                bool                   `json:"runAsRoot"`
+	RunAsRootSnake           bool                   `json:"run_as_root"`
 	StartupCommand           string                 `json:"startupCommand"`
 	Install                  *templateInstallConfig `json:"install"`
 	Installation             *templateInstallConfig `json:"installation"`
@@ -11367,6 +11479,9 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 				runtimeConfig["restart"] = restart
 			} else if restartPolicy := strings.TrimSpace(req.Docker.RestartPolicy); restartPolicy != "" {
 				runtimeConfig["restart"] = restartPolicy
+			}
+			if req.Docker.RunAsRoot || req.Docker.RunAsRootSnake {
+				runtimeConfig["runAsRoot"] = true
 			}
 			if req.Docker.Console != nil {
 				runtimeConfig["console"] = req.Docker.Console
@@ -14310,7 +14425,13 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 		return
 	}
 
-	jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "stdin"})
+	a.broadcastConsoleChunk(name, "stdout:", "$ "+cmd+"\n")
+	if len(targetProcesses) > 0 {
+		a.broadcastConsoleChunk(name, "stdout:", "[command sent to game process stdin]\n")
+	} else {
+		a.broadcastConsoleChunk(name, "stdout:", "[command sent to container stdin]\n")
+	}
+	jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "stdin", "targeted": len(targetProcesses) > 0})
 }
 
 func (a *Agent) handleServerCommandBody(w http.ResponseWriter, r *http.Request) {
@@ -14438,6 +14559,7 @@ func (a *Agent) handleLogsSSE(w http.ResponseWriter, r *http.Request, name strin
 
 func (a *Agent) handleKill(w http.ResponseWriter, r *http.Request, name string) {
 	a.logs.killTail(name)
+	a.logs.resetRecent(name)
 	if a.stdinMgr != nil {
 		a.stdinMgr.remove(name)
 	}
@@ -14446,6 +14568,7 @@ func (a *Agent) handleKill(w http.ResponseWriter, r *http.Request, name string) 
 	defer cancel()
 	a.docker.updateRestartNo(ctx, name)
 	a.docker.rmForce(ctx, name)
+	a.logs.resetRecent(name)
 	a.broadcastContainerEvent(name, "stopped")
 	jsonWrite(w, 200, map[string]any{"ok": true})
 }
@@ -14497,6 +14620,7 @@ func (a *Agent) performDeleteServer(name string, filesOnly bool, clientIP string
 	defer opMu.Unlock()
 
 	a.logs.killTail(name)
+	a.logs.resetRecent(name)
 	if a.stdinMgr != nil {
 		a.stdinMgr.remove(name)
 	}
@@ -14504,8 +14628,11 @@ func (a *Agent) performDeleteServer(name string, filesOnly bool, clientIP string
 	if !filesOnly {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		a.docker.updateRestartNo(ctx, name)
-		if err := a.docker.removeContainerAPI(ctx, dockerContainerName(name), true); err != nil && ctx.Err() == nil {
-			fmt.Printf("[delete] container removal warning for %s: %v\n", name, err)
+		a.docker.rmForce(ctx, name)
+		if ctx.Err() == nil {
+			if err := a.docker.removeContainerAPI(ctx, dockerContainerName(name), true); err != nil {
+				fmt.Printf("[delete] container removal warning for %s: %v\n", name, err)
+			}
 		}
 		cancel()
 		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -14515,6 +14642,7 @@ func (a *Agent) performDeleteServer(name string, filesOnly bool, clientIP string
 			fmt.Printf("[delete] container still exists for %s; queued retry cleanup\n", name)
 			a.removeContainerEventually(name)
 		}
+		a.logs.resetRecent(name)
 	}
 
 	serverDir := a.serverDir(name)
@@ -14570,9 +14698,10 @@ func (a *Agent) performDeleteServer(name string, filesOnly bool, clientIP string
 
 func (a *Agent) removeContainerEventually(name string) {
 	go func() {
-		for attempt := 1; attempt <= 60; attempt++ {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		for attempt := 1; attempt <= 30; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			a.docker.updateRestartNo(ctx, name)
+			a.docker.rmForce(ctx, name)
 			err := a.docker.removeContainerAPI(ctx, dockerContainerName(name), true)
 			cancel()
 
@@ -14593,7 +14722,7 @@ func (a *Agent) removeContainerEventually(name string) {
 			} else {
 				fmt.Printf("[delete] container retry %d did not remove %s yet\n", attempt, name)
 			}
-			delay := time.Duration(10*attempt) * time.Second
+			delay := time.Duration(attempt) * time.Second
 			if delay > time.Minute {
 				delay = time.Minute
 			}
@@ -14781,13 +14910,16 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 		} else if restartPolicy := strings.TrimSpace(req.Docker.RestartPolicy); restartPolicy != "" {
 			runtimeConfig["restart"] = restartPolicy
 		}
+		if req.Docker.RunAsRoot || req.Docker.RunAsRootSnake {
+			runtimeConfig["runAsRoot"] = true
+		}
 		if req.Docker.Console != nil {
 			runtimeConfig["console"] = req.Docker.Console
 		}
 		runtimeConfig["providerId"] = "custom"
 	}
 	if oldRuntime != nil {
-		for _, key := range []string{"providerId", "versionId", "image", "tag", "javaVersion", "restart", "adpanelStartup", "install", "portProtocols"} {
+		for _, key := range []string{"providerId", "versionId", "image", "tag", "javaVersion", "restart", "adpanelStartup", "install", "portProtocols", "runAsRoot"} {
 			if _, exists := runtimeConfig[key]; exists {
 				continue
 			}
@@ -14804,6 +14936,12 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 			if key == "install" {
 				if install := installConfigFromRuntime(oldRuntime); install != nil {
 					runtimeConfig[key] = install
+				}
+				continue
+			}
+			if key == "runAsRoot" {
+				if runtimeBool(oldRuntime[key]) {
+					runtimeConfig[key] = true
 				}
 				continue
 			}
@@ -15526,7 +15664,7 @@ func (a *Agent) deleteStatus(ctx context.Context, name string) map[string]any {
 	}
 	serverTrashExists := deleteTrashEntryExists(a.volumesDir, "server", name)
 	backupTrashExists := deleteTrashEntryExists(a.backupsDir(), "backups", name)
-	deleted := containerCheckOk && !containerExists && !serverDirExists && !metaExists && !backupsDirExists && !serverTrashExists && !backupTrashExists
+	deleted := containerCheckOk && !containerExists && !serverDirExists && !metaExists && !backupsDirExists
 	return map[string]any{
 		"ok":                true,
 		"deleteStatus":      true,
