@@ -6356,6 +6356,16 @@ func normalizeTemplateInstallConfig(raw *templateInstallConfig) *templateInstall
 	if minimumStorageMb < 0 {
 		minimumStorageMb = 0
 	}
+	timeoutSeconds := raw.TimeoutSeconds
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 1800
+	}
+	if timeoutSeconds < 60 {
+		timeoutSeconds = 60
+	}
+	if timeoutSeconds > 7200 {
+		timeoutSeconds = 7200
+	}
 
 	env := map[string]string{}
 	for key, value := range raw.Env {
@@ -6371,7 +6381,7 @@ func normalizeTemplateInstallConfig(raw *templateInstallConfig) *templateInstall
 		Script:           script,
 		MountPath:        mountPath,
 		RuntimePath:      runtimePath,
-		TimeoutSeconds:   1800,
+		TimeoutSeconds:   timeoutSeconds,
 		MinimumStorageMb: minimumStorageMb,
 		AllowEmpty:       raw.AllowEmpty || raw.AllowEmptyResult,
 	}
@@ -6639,7 +6649,7 @@ func (a *Agent) pullSetupImage(name, serverDir, imageRef, label string, timeout 
 	}
 	a.updateSetupState(name, serverDir, "pulling", fmt.Sprintf("Pulling %s image %s", label, imageRef))
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	err := a.docker.pullImageAPI(ctx, imageRef)
+	err := a.docker.ensureImageAvailableAPI(ctx, imageRef)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("%s image pull failed: %w", label, err)
@@ -6732,7 +6742,7 @@ func (a *Agent) runTemplateInstall(name, serverDir string, install *templateInst
 	defer cancel()
 
 	a.emitSetupLog(name, "stdout", "Preparing template installer")
-	if err := a.docker.pullImageAPI(ctx, install.Image); err != nil {
+	if err := a.docker.ensureImageAvailableAPI(ctx, install.Image); err != nil {
 		return fmt.Errorf("installer image pull failed: %w", err)
 	}
 	a.emitSetupLog(name, "stdout", "Running template installer in "+install.Image)
@@ -10205,6 +10215,11 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case "kill":
 				if method == "POST" {
 					a.handleKill(w, r, name)
+					return
+				}
+			case "delete-status":
+				if method == "GET" {
+					a.handleDeleteStatus(w, r, name)
 					return
 				}
 			case "files":
@@ -14199,6 +14214,43 @@ func (a *Agent) handleDeleteServer(w http.ResponseWriter, r *http.Request, name 
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid name"})
 		return
 	}
+	filesOnly := r.URL.Query().Get("files_only") == "true"
+	if r.URL.Query().Get("async") == "true" {
+		serverDir := a.serverDir(name)
+		if filepath.Clean(serverDir) == filepath.Clean(a.volumesDir) {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "refusing to delete volumes root"})
+			return
+		}
+		if !isUnder(a.volumesDir, serverDir) {
+			jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid path"})
+			return
+		}
+		clientIP := getClientIP(r)
+		go func() {
+			if _, err := a.performDeleteServer(name, filesOnly, clientIP); err != nil {
+				fmt.Printf("[delete] async delete failed for %s: %v\n", name, err)
+				auditLog.Log("server_delete", clientIP, "", name, "delete", "failure", map[string]any{"error": err.Error()})
+			}
+		}()
+		jsonWrite(w, http.StatusAccepted, map[string]any{"ok": true, "name": name, "deleting": true})
+		return
+	}
+
+	result, err := a.performDeleteServer(name, filesOnly, getClientIP(r))
+	if err != nil {
+		jsonWrite(w, 500, map[string]any{"ok": false, "error": "failed to queue server delete", "detail": err.Error()})
+		return
+	}
+	jsonWrite(w, 200, map[string]any{"ok": true, "name": name, "deleting": result.ServerQueued || result.BackupQueued})
+}
+
+type deleteServerResult struct {
+	ServerQueued bool
+	BackupQueued bool
+}
+
+func (a *Agent) performDeleteServer(name string, filesOnly bool, clientIP string) (deleteServerResult, error) {
+	var result deleteServerResult
 	opMu := a.getServerOpLock(name)
 	opMu.Lock()
 	defer opMu.Unlock()
@@ -14208,7 +14260,6 @@ func (a *Agent) handleDeleteServer(w http.ResponseWriter, r *http.Request, name 
 		a.stdinMgr.remove(name)
 	}
 
-	filesOnly := r.URL.Query().Get("files_only") == "true"
 	if !filesOnly {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		a.docker.updateRestartNo(ctx, name)
@@ -14216,6 +14267,13 @@ func (a *Agent) handleDeleteServer(w http.ResponseWriter, r *http.Request, name 
 			fmt.Printf("[delete] container removal warning for %s: %v\n", name, err)
 		}
 		cancel()
+		verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		containerStillExists := a.docker.containerExists(verifyCtx, name)
+		verifyCancel()
+		if containerStillExists {
+			fmt.Printf("[delete] container still exists for %s; queued retry cleanup\n", name)
+			a.removeContainerEventually(name)
+		}
 	}
 
 	serverDir := a.serverDir(name)
@@ -14223,55 +14281,85 @@ func (a *Agent) handleDeleteServer(w http.ResponseWriter, r *http.Request, name 
 	fmt.Printf("[delete] attempting to detach server directory: %s\n", serverDir)
 
 	if filepath.Clean(serverDir) == filepath.Clean(a.volumesDir) {
-		jsonWrite(w, 400, map[string]any{"ok": false, "error": "refusing to delete volumes root"})
-		return
+		return result, fmt.Errorf("refusing to delete volumes root")
 	}
 	if !isUnder(a.volumesDir, serverDir) {
-		jsonWrite(w, 400, map[string]any{"ok": false, "error": "invalid path"})
-		return
+		return result, fmt.Errorf("invalid path")
 	}
 
 	if _, err := os.Stat(serverDir); os.IsNotExist(err) {
 		fmt.Printf("[delete] directory already gone: %s\n", serverDir)
 		_ = os.Remove(a.metaPath(name))
-		backupQueued := false
 		if isUnder(a.backupsDir(), backupsDir) {
 			if detachedBackup, backupExists, detachErr := a.detachPathForAsyncDelete(a.backupsDir(), backupsDir, "backups", name); detachErr != nil {
 				fmt.Printf("[delete] backup detach warning for %s: %v\n", name, detachErr)
 			} else if backupExists {
-				backupQueued = true
+				result.BackupQueued = true
 				removeDetachedPathAsync("backups", detachedBackup)
 			}
 		}
-		auditLog.Log("server_delete", getClientIP(r), "", name, "delete", "success", nil)
-		jsonWrite(w, 200, map[string]any{"ok": true, "name": name, "deleting": backupQueued})
-		return
+		auditLog.Log("server_delete", clientIP, "", name, "delete", "success", nil)
+		return result, nil
 	}
 
 	detachedServer, serverExists, err := a.detachPathForAsyncDelete(a.volumesDir, serverDir, "server", name)
 	if err != nil {
 		fmt.Printf("[delete] error detaching %s: %v\n", serverDir, err)
-		jsonWrite(w, 500, map[string]any{"ok": false, "error": "failed to queue server delete", "detail": err.Error()})
-		return
+		return result, err
 	}
 	_ = os.Remove(a.metaPath(name))
 	if serverExists {
+		result.ServerQueued = true
 		removeDetachedPathAsync("server", detachedServer)
 	}
 
-	backupQueued := false
 	if isUnder(a.backupsDir(), backupsDir) {
 		if detachedBackup, backupExists, detachErr := a.detachPathForAsyncDelete(a.backupsDir(), backupsDir, "backups", name); detachErr != nil {
 			fmt.Printf("[delete] backup detach warning for %s: %v\n", name, detachErr)
 		} else if backupExists {
-			backupQueued = true
+			result.BackupQueued = true
 			removeDetachedPathAsync("backups", detachedBackup)
 		}
 	}
 
-	fmt.Printf("[delete] queued async cleanup for %s (serverQueued=%v backupsQueued=%v)\n", name, serverExists, backupQueued)
-	auditLog.Log("server_delete", getClientIP(r), "", name, "delete", "success", nil)
-	jsonWrite(w, 200, map[string]any{"ok": true, "name": name, "deleting": serverExists || backupQueued})
+	fmt.Printf("[delete] queued async cleanup for %s (serverQueued=%v backupsQueued=%v)\n", name, result.ServerQueued, result.BackupQueued)
+	auditLog.Log("server_delete", clientIP, "", name, "delete", "success", nil)
+	return result, nil
+}
+
+func (a *Agent) removeContainerEventually(name string) {
+	go func() {
+		for attempt := 1; attempt <= 60; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			a.docker.updateRestartNo(ctx, name)
+			err := a.docker.removeContainerAPI(ctx, dockerContainerName(name), true)
+			cancel()
+
+			checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			exists := a.docker.containerExists(checkCtx, name)
+			checkCancel()
+			if !exists {
+				if err != nil {
+					fmt.Printf("[delete] container retry cleanup completed for %s after transient error: %v\n", name, err)
+				} else {
+					fmt.Printf("[delete] container retry cleanup completed for %s\n", name)
+				}
+				return
+			}
+
+			if err != nil {
+				fmt.Printf("[delete] container retry %d failed for %s: %v\n", attempt, name, err)
+			} else {
+				fmt.Printf("[delete] container retry %d did not remove %s yet\n", attempt, name)
+			}
+			delay := time.Duration(10*attempt) * time.Second
+			if delay > time.Minute {
+				delay = time.Minute
+			}
+			time.Sleep(delay)
+		}
+		fmt.Printf("[delete] container retry cleanup gave up for %s after repeated failures\n", name)
+	}()
 }
 
 func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, name string) {
@@ -14710,7 +14798,7 @@ func (a *Agent) handleReinstallServer(w http.ResponseWriter, r *http.Request, na
 			}
 			imageRef := strings.TrimSpace(img) + ":" + tag
 			pullCtx, pullCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			if err := a.docker.pullImageAPI(pullCtx, imageRef); err != nil {
+			if err := a.docker.ensureImageAvailableAPI(pullCtx, imageRef); err != nil {
 				pullCancel()
 				jsonWrite(w, 500, map[string]any{"ok": false, "error": "docker image pull failed", "detail": err.Error()})
 				return
@@ -15142,6 +15230,81 @@ func deletionTombstoneName(label, name string) string {
 		label = "path"
 	}
 	return fmt.Sprintf("%s-%s-%d", label, safe, time.Now().UnixNano())
+}
+
+func deleteTrashPrefix(label, name string) string {
+	safe := sanitizeName(name)
+	if safe == "" {
+		safe = "unknown"
+	}
+	label = sanitizeName(label)
+	if label == "" {
+		label = "path"
+	}
+	return fmt.Sprintf("%s-%s-", label, safe)
+}
+
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+func deleteTrashEntryExists(parentRoot, label, name string) bool {
+	entries, err := os.ReadDir(deletionTrashDir(parentRoot))
+	if err != nil {
+		return false
+	}
+	prefix := deleteTrashPrefix(label, name)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) containerExistsKnown(ctx context.Context, name string) (bool, bool) {
+	_, _, _, err := a.docker.runCollect(ctx, "inspect", name)
+	if err == nil {
+		return true, true
+	}
+	if ctx.Err() != nil {
+		return false, false
+	}
+	return false, true
+}
+
+func (a *Agent) deleteStatus(ctx context.Context, name string) map[string]any {
+	containerExists, containerCheckOk := a.containerExistsKnown(ctx, name)
+	serverDirExists := pathExists(a.serverDir(name))
+	metaExists := pathExists(a.metaPath(name))
+	backupsDir := a.serverBackupsDir(name)
+	backupsDirExists := false
+	if isUnder(a.backupsDir(), backupsDir) {
+		backupsDirExists = pathExists(backupsDir)
+	}
+	serverTrashExists := deleteTrashEntryExists(a.volumesDir, "server", name)
+	backupTrashExists := deleteTrashEntryExists(a.backupsDir(), "backups", name)
+	deleted := containerCheckOk && !containerExists && !serverDirExists && !metaExists && !backupsDirExists && !serverTrashExists && !backupTrashExists
+	return map[string]any{
+		"ok":                true,
+		"deleteStatus":      true,
+		"name":              name,
+		"deleted":           deleted,
+		"containerExists":   containerExists,
+		"containerCheckOk":  containerCheckOk,
+		"serverDirExists":   serverDirExists,
+		"metaExists":        metaExists,
+		"backupsDirExists":  backupsDirExists,
+		"serverTrashExists": serverTrashExists,
+		"backupTrashExists": backupTrashExists,
+	}
+}
+
+func (a *Agent) handleDeleteStatus(w http.ResponseWriter, r *http.Request, name string) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	jsonWrite(w, 200, a.deleteStatus(ctx, name))
 }
 
 func (a *Agent) detachPathForAsyncDelete(parentRoot, target, label, name string) (string, bool, error) {
