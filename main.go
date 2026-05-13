@@ -31,6 +31,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -4360,6 +4361,167 @@ func dockerCpuSharesFromWeight(weight int) int64 {
 	return shares
 }
 
+func runtimeNeedsHighFileLimit(tpl, imageRef string) bool {
+	tpl = strings.ToLower(strings.TrimSpace(tpl))
+	imageRef = strings.ToLower(strings.TrimSpace(imageRef))
+	if tpl == "rust" {
+		return true
+	}
+	return strings.Contains(imageRef, "pterodactyl/games:rust") ||
+		strings.Contains(imageRef, "parkervcp/games:rust") ||
+		strings.Contains(imageRef, "didstopia/rust-server")
+}
+
+func withRuntimeDefaultFileLimit(resources *resourceLimits, tpl, imageRef string) *resourceLimits {
+	if !runtimeNeedsHighFileLimit(tpl, imageRef) {
+		return resources
+	}
+	if resources != nil && resources.FileLimit != nil {
+		return resources
+	}
+
+	limit := maxFileLimit
+	if resources == nil {
+		return &resourceLimits{FileLimit: &limit}
+	}
+	copy := *resources
+	copy.FileLimit = &limit
+	return &copy
+}
+
+const rustPterodactylStartup = `./RustDedicated -batchmode -nographics -logfile "{{LOG_FILE}}" +server.ip 0.0.0.0 +server.port {{SERVER_PORT}} +server.queryport {{QUERY_PORT}} +server.identity "{{SERVER_IDENTITY}}" +server.level "{{SERVER_LEVEL}}" +server.seed {{SERVER_SEED}} +server.worldsize {{WORLD_SIZE}} +server.hostname "{{SERVER_NAME}}" +server.description "{{SERVER_DESCRIPTION}}" +server.maxplayers {{MAX_PLAYERS}} +server.secure {{SERVER_SECURE}} +rcon.ip 0.0.0.0 +rcon.web {{RCON_WEB}} +rcon.port {{RCON_PORT}} +rcon.password "{{RCON_PASS}}" +app.port {{RUST_PLUS_PORT}} +server.saveinterval {{SAVE_INTERVAL}} {{ADDITIONAL_ARGS}}`
+
+func normalizeRustRuntimeForPterodactyl(meta map[string]any) bool {
+	if meta == nil {
+		return false
+	}
+	template := strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["type"])))
+	if template == "" || template == "<nil>" {
+		template = strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["template"])))
+	}
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	image := ""
+	tag := ""
+	if runtimeObj != nil {
+		image = strings.ToLower(strings.TrimSpace(fmt.Sprint(runtimeObj["image"])))
+		tag = strings.ToLower(strings.TrimSpace(fmt.Sprint(runtimeObj["tag"])))
+	}
+	imageRef := image + ":" + tag
+	isRust := template == "rust" ||
+		strings.Contains(imageRef, "didstopia/rust-server") ||
+		strings.Contains(imageRef, "pterodactyl/games:rust") ||
+		strings.Contains(imageRef, "parkervcp/games:rust")
+	if !isRust {
+		return false
+	}
+	if runtimeObj == nil {
+		runtimeObj = map[string]any{}
+	}
+
+	changed := false
+	set := func(key string, value any) {
+		if !reflect.DeepEqual(runtimeObj[key], value) {
+			runtimeObj[key] = value
+			changed = true
+		}
+	}
+	set("image", "ghcr.io/pterodactyl/games")
+	set("tag", "rust")
+	set("volumes", []any{"{BOT_DIR}:/home/container"})
+	set("workdir", "/home/container")
+	set("command", "")
+	set("adpanelStartup", "")
+	set("startupDisplay", "/bin/bash /entrypoint.sh")
+	set("ports", []any{28015, 28016, 28082})
+	set("portProtocols", map[string]any{
+		"28015": []any{"udp"},
+		"28016": []any{"tcp", "udp"},
+		"28082": []any{"tcp", "udp"},
+	})
+	set("console", map[string]any{
+		"type":            "stdin",
+		"targetProcesses": []any{"RustDedicated"},
+	})
+
+	env := runtimeEnvMap(runtimeObj["env"])
+	if env == nil {
+		env = map[string]string{}
+	}
+	copyEnv := func(dst, src string) {
+		if strings.TrimSpace(env[dst]) == "" && strings.TrimSpace(env[src]) != "" {
+			env[dst] = env[src]
+			changed = true
+		}
+	}
+	copyEnv("SERVER_IDENTITY", "RUST_SERVER_IDENTITY")
+	copyEnv("SERVER_PORT", "RUST_SERVER_PORT")
+	copyEnv("QUERY_PORT", "RUST_SERVER_QUERYPORT")
+	copyEnv("SERVER_SEED", "RUST_SERVER_SEED")
+	copyEnv("WORLD_SIZE", "RUST_SERVER_WORLDSIZE")
+	copyEnv("SERVER_NAME", "RUST_SERVER_NAME")
+	copyEnv("SERVER_DESCRIPTION", "RUST_SERVER_DESCRIPTION")
+	copyEnv("MAX_PLAYERS", "RUST_SERVER_MAXPLAYERS")
+	copyEnv("RCON_PORT", "RUST_RCON_PORT")
+	copyEnv("RCON_PASS", "RUST_RCON_PASSWORD")
+	copyEnv("RUST_PLUS_PORT", "RUST_APP_PORT")
+
+	envDefaults := map[string]string{
+		"STARTUP":            rustPterodactylStartup,
+		"AUTO_UPDATE":        "0",
+		"FRAMEWORK":          "",
+		"OXIDE":              "0",
+		"LD_LIBRARY_PATH":    "/home/container/RustDedicated_Data/Plugins/x86_64:/home/container",
+		"LOG_FILE":           "/home/container/logs/rust.log",
+		"SERVER_PORT":        "28015",
+		"QUERY_PORT":         "28016",
+		"RCON_PORT":          "28016",
+		"RUST_PLUS_PORT":     "28082",
+		"SERVER_IDENTITY":    "adpanel",
+		"SERVER_LEVEL":       "Procedural Map",
+		"SERVER_SEED":        "12345",
+		"WORLD_SIZE":         "3500",
+		"SERVER_NAME":        "ADPanel Rust Server",
+		"SERVER_DESCRIPTION": "Rust server hosted with ADPanel",
+		"MAX_PLAYERS":        "100",
+		"SERVER_SECURE":      "1",
+		"RCON_WEB":           "true",
+		"RCON_PASS":          "change-me",
+		"RCON_PASSWORD":      "change-me",
+		"RCON_IP":            "127.0.0.1",
+		"SAVE_INTERVAL":      "300",
+		"ADDITIONAL_ARGS":    "",
+		"TZ":                 "Etc/UTC",
+	}
+	for key, value := range envDefaults {
+		if _, ok := env[key]; !ok {
+			env[key] = value
+			changed = true
+		}
+	}
+	if env["RCON_PASSWORD"] != env["RCON_PASS"] {
+		env["RCON_PASSWORD"] = env["RCON_PASS"]
+		changed = true
+	}
+	if !reflect.DeepEqual(runtimeObj["env"], env) {
+		runtimeObj["env"] = env
+		changed = true
+	}
+
+	if meta["type"] != "rust" {
+		meta["type"] = "rust"
+		changed = true
+	}
+	if meta["template"] != "rust" {
+		meta["template"] = "rust"
+		changed = true
+	}
+	if !reflect.DeepEqual(meta["runtime"], runtimeObj) {
+		meta["runtime"] = runtimeObj
+		changed = true
+	}
+	return changed
+}
+
 func validateResourcePerformanceLimits(resources *resourceLimits) string {
 	if resources == nil {
 		return ""
@@ -8274,6 +8436,7 @@ func (a *Agent) startCustomDockerContainer(ctx context.Context, name, serverDir 
 	if desiredRestart == "<nil>" {
 		desiredRestart = ""
 	}
+	resources = withRuntimeDefaultFileLimit(resources, tpl, imageRef)
 	req.HostConfig = buildStructuredHostConfig(
 		binds,
 		portBindings,
@@ -13652,6 +13815,9 @@ func (a *Agent) handleStart(w http.ResponseWriter, r *http.Request, name string)
 	if stripLegacyStartupCommandFields(meta) {
 		_ = a.saveMeta(serverDir, meta)
 	}
+	if normalizeRustRuntimeForPterodactyl(meta) {
+		_ = a.saveMeta(serverDir, meta)
+	}
 	typ := strings.ToLower(fmt.Sprint(meta["type"]))
 	if a.debug {
 		fmt.Printf("[handleStart] Server: %s, type: %s\n", name, typ)
@@ -13879,6 +14045,9 @@ func (a *Agent) handleRestart(w http.ResponseWriter, r *http.Request, name strin
 
 	serverDir := a.serverDir(name)
 	meta := a.loadMeta(serverDir)
+	if normalizeRustRuntimeForPterodactyl(meta) {
+		_ = a.saveMeta(serverDir, meta)
+	}
 	if shouldRecreateContainerOnRestart(meta) {
 		if a.stdinMgr != nil {
 			a.stdinMgr.remove(name)
