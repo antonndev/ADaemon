@@ -5133,6 +5133,18 @@ func imageConfigDeclaresVolume(cfg imageConfig, containerPath string) bool {
 	return false
 }
 
+func imageUsesPterodactylContainerWorkdir(imageRef string, imgCfg imageConfig) bool {
+	workdir := path.Clean(strings.TrimSpace(imgCfg.Workdir))
+	if workdir != "/home/container" {
+		return false
+	}
+	imageLower := strings.ToLower(strings.TrimSpace(imageRef))
+	return strings.Contains(imageLower, "ghcr.io/pterodactyl/") ||
+		strings.Contains(imageLower, "ghcr.io/ptero-eggs/") ||
+		strings.Contains(imageLower, "ghcr.io/parkervcp/") ||
+		strings.Contains(imageLower, "pterodactyl/")
+}
+
 func (a *Agent) inspectRuntimeImageConfig(ctx context.Context, imageRef string) imageConfig {
 	cleanImageRef := strings.TrimSpace(imageRef)
 	if cleanImageRef == "" {
@@ -5149,12 +5161,18 @@ func sanitizeCustomImageDefaultBinds(imageRef string, imgCfg imageConfig, binds 
 	if workdir == "" || workdir == "." || workdir == "/" || !imageConfigHasRuntimeDefault(imgCfg) || imageConfigDeclaresVolume(imgCfg, workdir) {
 		return binds, dataDir
 	}
+	if imageUsesPterodactylContainerWorkdir(imageRef, imgCfg) {
+		return binds, dataDir
+	}
 
 	gameDataPath := ""
 	if isGameServerDockerImage(imageRef) {
 		gameDataPath = path.Clean(getGameServerDataPath(imageRef))
 	}
-	if gameDataPath == "." || gameDataPath == "/" || gameDataPath == workdir {
+	if gameDataPath == workdir {
+		return binds, dataDir
+	}
+	if gameDataPath == "." || gameDataPath == "/" {
 		gameDataPath = ""
 	}
 
@@ -13823,6 +13841,29 @@ func (a *Agent) handleStop(w http.ResponseWriter, r *http.Request, name string) 
 	auditLog.Log("server_stop", getClientIP(r), "", name, "stop", "success", nil)
 }
 
+func shouldRecreateContainerOnRestart(meta map[string]any) bool {
+	if meta == nil {
+		return false
+	}
+	template := strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["type"])))
+	if template == "" || template == "<nil>" {
+		template = strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["template"])))
+	}
+	if template == "rust" {
+		return true
+	}
+	runtimeObj, _ := meta["runtime"].(map[string]any)
+	if runtimeObj == nil {
+		return false
+	}
+	image := strings.ToLower(strings.TrimSpace(fmt.Sprint(runtimeObj["image"])))
+	tag := strings.ToLower(strings.TrimSpace(fmt.Sprint(runtimeObj["tag"])))
+	imageRef := image + ":" + tag
+	return strings.Contains(imageRef, "pterodactyl/games:rust") ||
+		strings.Contains(imageRef, "parkervcp/games:rust") ||
+		strings.Contains(imageRef, "didstopia/rust-server")
+}
+
 func (a *Agent) handleRestart(w http.ResponseWriter, r *http.Request, name string) {
 	if !isValidContainerName(name) {
 		jsonWrite(w, 400, map[string]any{"error": "invalid container name"})
@@ -13835,6 +13876,37 @@ func (a *Agent) handleRestart(w http.ResponseWriter, r *http.Request, name strin
 		jsonWrite(w, 400, map[string]any{"error": "not running"})
 		return
 	}
+
+	serverDir := a.serverDir(name)
+	meta := a.loadMeta(serverDir)
+	if shouldRecreateContainerOnRestart(meta) {
+		if a.stdinMgr != nil {
+			a.stdinMgr.remove(name)
+		}
+		if a.logs != nil {
+			a.logs.resetRecent(name)
+		}
+		startCtx, startCancel := context.WithTimeout(context.Background(), 240*time.Second)
+		defer startCancel()
+		resources := resourceLimitsFromMeta(meta)
+		hostPort := 8080
+		if storedPort, ok := parseStrictPortValue(meta["hostPort"]); ok {
+			hostPort = storedPort
+		} else if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
+			if ports := runtimeIntSlice(runtimeObj["ports"]); len(ports) > 0 && ports[0] > 0 {
+				hostPort = ports[0]
+			}
+		}
+		if err := a.startCustomDockerContainer(startCtx, name, serverDir, meta, hostPort, resources); err != nil {
+			jsonWrite(w, 500, map[string]any{"error": "container recreate failed", "detail": err.Error()})
+			return
+		}
+		a.ensureLiveLogs(name)
+		a.broadcastContainerEvent(name, "running")
+		jsonWrite(w, 200, map[string]any{"ok": true, "recreated": true})
+		return
+	}
+
 	if a.stdinMgr != nil {
 		a.stdinMgr.remove(name)
 	}
