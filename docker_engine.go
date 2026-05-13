@@ -271,6 +271,24 @@ func (d Docker) pullImageAPI(ctx context.Context, ref string) error {
 	return lastErr
 }
 
+func (d Docker) ensureImageAvailableAPI(ctx context.Context, ref string) error {
+	imageRef := strings.TrimSpace(ref)
+	if imageRef == "" {
+		return fmt.Errorf("missing image reference")
+	}
+	if d.imageExistsLocally(ctx, imageRef) {
+		return nil
+	}
+	if err := d.pullImageAPI(ctx, imageRef); err != nil {
+		if isTransientDockerPullError(err) && d.imageExistsLocally(ctx, imageRef) {
+			fmt.Printf("[docker] pull failed for %s with transient error, using cached image: %v\n", imageRef, err)
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 func (d Docker) pullImageAPIOnce(ctx context.Context, ref string) error {
 	image, tag := splitDockerImageRef(ref)
 	if image == "" {
@@ -431,13 +449,9 @@ func (d Docker) runContainerAPI(ctx context.Context, name string, req dockerCont
 	removeCancel()
 
 	pullCtx, pullCancel := context.WithTimeout(ctx, 10*time.Minute)
-	if err := d.pullImageAPI(pullCtx, req.Image); err != nil {
-		if isTransientDockerPullError(err) && d.imageExistsLocally(ctx, req.Image) {
-			fmt.Printf("[docker] pull failed for %s with transient error, using cached image: %v\n", req.Image, err)
-		} else {
-			pullCancel()
-			return err
-		}
+	if err := d.ensureImageAvailableAPI(pullCtx, req.Image); err != nil {
+		pullCancel()
+		return err
 	}
 	pullCancel()
 
