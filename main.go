@@ -45,7 +45,7 @@ import (
 )
 
 const (
-	NodeVersion       = "1.2.4"
+	NodeVersion       = "1.2.5"
 	DefaultConfigPath = "/var/lib/node/config.yml"
 	DefaultDataRoot   = "/var/lib/node"
 	DefaultAPIHost    = "0.0.0.0"
@@ -1289,6 +1289,7 @@ type stdinConn struct {
 	stdin    io.WriteCloser
 	cmd      *exec.Cmd
 	lastUsed time.Time
+	tty      bool
 	mu       sync.Mutex
 	closed   bool
 }
@@ -1520,19 +1521,23 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 	attachCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	stdin, err := sm.docker.attachContainerAPI(attachCtx, name, dockerAttachOptions{Stdin: true})
+	stdin, err := sm.docker.attachContainerAPI(attachCtx, name, dockerAttachOptions{Stdin: true, Stdout: true, Stderr: true})
 	if err != nil {
 		return nil, fmt.Errorf("failed to attach container stdin: %w", err)
 	}
+	go func() {
+		_, _ = io.Copy(io.Discard, stdin)
+	}()
 
 	conn := &stdinConn{
 		name:     name,
 		stdin:    stdin,
 		lastUsed: time.Now(),
+		tty:      sm.docker.containerTTY(ctx, name),
 	}
 
 	if sm.debug {
-		fmt.Printf("[stdin-manager] created Docker API stdin connection for %s\n", name)
+		fmt.Printf("[stdin-manager] created Docker API stdin connection for %s (tty=%t)\n", name, conn.tty)
 	}
 
 	return conn, nil
@@ -1560,7 +1565,11 @@ func (c *stdinConn) sendCommand(cmd string) error {
 		return fmt.Errorf("connection closed")
 	}
 	c.lastUsed = time.Now()
-	line := strings.TrimRight(cmd, "\r\n") + "\n"
+	lineEnding := "\n"
+	if c.tty {
+		lineEnding = "\r"
+	}
+	line := strings.TrimRight(cmd, "\r\n") + lineEnding
 	if deadlineWriter, ok := c.stdin.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		_ = deadlineWriter.SetWriteDeadline(time.Now().Add(stdinWriteTimeout))
 		defer deadlineWriter.SetWriteDeadline(time.Time{})
@@ -1627,6 +1636,17 @@ func (d Docker) writeToContainerProcessStdin(ctx context.Context, containerName,
 		}
 	}
 	return fmt.Errorf("process stdin write failed: no supported shell found in container")
+}
+
+func (d Docker) containerTTY(ctx context.Context, containerName string) bool {
+	name := dockerContainerName(containerName)
+	if name == "" {
+		return false
+	}
+	inspectCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	out, _, _, err := d.runCollect(inspectCtx, "inspect", "-f", "{{.Config.Tty}}", name)
+	return err == nil && strings.EqualFold(strings.TrimSpace(out), "true")
 }
 
 func (d Docker) writeToMinecraftProcessStdin(ctx context.Context, containerName, command string) error {
