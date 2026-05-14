@@ -45,7 +45,7 @@ import (
 )
 
 const (
-	NodeVersion       = "1.2.3"
+	NodeVersion       = "1.2.4"
 	DefaultConfigPath = "/var/lib/node/config.yml"
 	DefaultDataRoot   = "/var/lib/node"
 	DefaultAPIHost    = "0.0.0.0"
@@ -1779,18 +1779,6 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 		return fmt.Errorf("container-not-running")
 	}
 
-	var targetErr error
-	if len(targetProcesses) > 0 {
-		if err := d.writeToTargetProcessStdin(ctx, name, cmd, targetProcesses); err == nil {
-			return nil
-		} else {
-			targetErr = err
-			if d.debug {
-				fmt.Printf("[docker] target process stdin failed for %s: %v\n", name, err)
-			}
-		}
-	}
-
 	var attachedErr error
 	if stdinMgr != nil {
 		if err := d.sendViaAttachedStdin(ctx, stdinMgr, name, cmd); err == nil {
@@ -1799,6 +1787,18 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 			attachedErr = err
 			if d.debug {
 				fmt.Printf("[docker] attached stdin failed for %s: %v\n", name, err)
+			}
+		}
+	}
+
+	var targetErr error
+	if len(targetProcesses) > 0 {
+		if err := d.writeToTargetProcessStdin(ctx, name, cmd, targetProcesses); err == nil {
+			return nil
+		} else {
+			targetErr = err
+			if d.debug {
+				fmt.Printf("[docker] target process stdin failed for %s: %v\n", name, err)
 			}
 		}
 	}
