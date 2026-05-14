@@ -5547,6 +5547,72 @@ func runtimeUsesHostPortInsideContainer(tpl string, runtimeObj map[string]any, e
 		strings.Contains(startup, "{PORT}")
 }
 
+func isCfxTemplate(tpl string) bool {
+	switch strings.ToLower(strings.TrimSpace(tpl)) {
+	case "fivem", "five-m", "redm":
+		return true
+	default:
+		return false
+	}
+}
+
+func migrateNestedCfxServerFiles(serverDir string) {
+	nested := filepath.Join(serverDir, "serverfiles")
+	info, err := os.Stat(nested)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	entries, err := os.ReadDir(nested)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		src := filepath.Join(nested, entry.Name())
+		dst := filepath.Join(serverDir, entry.Name())
+		if pathExists(dst) {
+			continue
+		}
+		if err := os.Rename(src, dst); err != nil {
+			fmt.Printf("[cfx-layout] could not move %s to %s: %v\n", src, dst, err)
+		}
+	}
+	_ = os.Remove(nested)
+}
+
+func normalizeCfxRuntimeLayout(tpl string, runtimeObj map[string]any, serverDir string) bool {
+	if runtimeObj == nil || !isCfxTemplate(tpl) {
+		return false
+	}
+	changed := false
+	migrateNestedCfxServerFiles(serverDir)
+	desiredVolume := "{BOT_DIR}:/serverdata/serverfiles"
+	volumes := runtimeStringSlice(runtimeObj["volumes"])
+	if len(volumes) != 1 || strings.TrimSpace(volumes[0]) != desiredVolume {
+		runtimeObj["volumes"] = []any{desiredVolume}
+		changed = true
+	}
+	if normalizeContainerWorkdir(runtimeObj["workdir"]) != "/serverdata/serverfiles" {
+		runtimeObj["workdir"] = "/serverdata/serverfiles"
+		changed = true
+	}
+	env := runtimeEnvMap(runtimeObj["env"])
+	if env == nil {
+		env = map[string]string{}
+	}
+	for key, value := range map[string]string{
+		"DATA_DIR":    "/serverdata",
+		"SERVER_DIR":  "/serverdata/serverfiles",
+		"GAME_CONFIG": "server.cfg",
+	} {
+		if env[key] != value {
+			env[key] = value
+			changed = true
+		}
+	}
+	runtimeObj["env"] = env
+	return changed
+}
+
 func (a *Agent) resolveStructuredBinds(tpl string, runtimeObj map[string]any, serverDir string) ([]string, string) {
 	defaultDir := defaultDataDirForType(tpl)
 	binds := []string{}
@@ -8409,6 +8475,10 @@ func (a *Agent) startCustomDockerContainer(ctx context.Context, name, serverDir 
 	tpl := strings.ToLower(fmt.Sprint(meta["type"]))
 	if tpl == "" || tpl == "<nil>" {
 		tpl = strings.ToLower(fmt.Sprint(runtimeObj["providerId"]))
+	}
+	if normalizeCfxRuntimeLayout(tpl, runtimeObj, serverDir) {
+		meta["runtime"] = runtimeObj
+		_ = a.saveMeta(serverDir, meta)
 	}
 
 	binds, dataDir := a.resolveStructuredBinds(tpl, runtimeObj, serverDir)
