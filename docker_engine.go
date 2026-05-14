@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -93,6 +94,22 @@ type dockerContainerInspectResponse struct {
 type dockerPullProgress struct {
 	Status string `json:"status"`
 	Error  string `json:"error"`
+}
+
+type dockerAttachOptions struct {
+	Stdin  bool
+	Stdout bool
+	Stderr bool
+	Logs   bool
+}
+
+type dockerHijackedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *dockerHijackedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
 }
 
 type dockerImageInspectConfig struct {
@@ -230,6 +247,80 @@ func (d Docker) engineRequest(ctx context.Context, method, rawPath string, query
 		return nil, resp.StatusCode, readErr
 	}
 	return respBody, resp.StatusCode, nil
+}
+
+func (d Docker) attachContainerAPI(ctx context.Context, name string, opts dockerAttachOptions) (io.ReadWriteCloser, error) {
+	dockerName := dockerContainerName(name)
+	if dockerName == "" {
+		return nil, fmt.Errorf("missing container name")
+	}
+	if !opts.Stdin && !opts.Stdout && !opts.Stderr {
+		return nil, fmt.Errorf("no attach streams requested")
+	}
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "unix", dockerEngineSocketPath)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	query := url.Values{}
+	query.Set("stream", "1")
+	if opts.Stdin {
+		query.Set("stdin", "1")
+	}
+	if opts.Stdout {
+		query.Set("stdout", "1")
+	}
+	if opts.Stderr {
+		query.Set("stderr", "1")
+	}
+	if opts.Logs {
+		query.Set("logs", "1")
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"http://docker"+dockerAPIPath("/containers/"+url.PathEscape(dockerName)+"/attach", query),
+		nil,
+	)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "tcp")
+
+	if err := req.Write(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, req)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols && resp.StatusCode != http.StatusOK {
+		detail := ""
+		if resp.Body != nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			detail = decodeDockerAPIError(body)
+		}
+		_ = conn.Close()
+		if detail == "" {
+			detail = resp.Status
+		}
+		return nil, fmt.Errorf("failed to attach container %s: %s", dockerName, detail)
+	}
+
+	_ = conn.SetDeadline(time.Time{})
+	return &dockerHijackedConn{Conn: conn, reader: reader}, nil
 }
 
 func splitDockerImageRef(ref string) (string, string) {
