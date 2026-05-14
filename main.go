@@ -1521,13 +1521,10 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 	attachCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	stdin, err := sm.docker.attachContainerAPI(attachCtx, name, dockerAttachOptions{Stdin: true, Stdout: true, Stderr: true})
+	stdin, err := sm.docker.attachContainerAPI(attachCtx, name, dockerAttachOptions{Stdin: true})
 	if err != nil {
 		return nil, fmt.Errorf("failed to attach container stdin: %w", err)
 	}
-	go func() {
-		_, _ = io.Copy(io.Discard, stdin)
-	}()
 
 	conn := &stdinConn{
 		name:     name,
@@ -1616,7 +1613,8 @@ func (d Docker) writeToContainerProcessStdin(ctx context.Context, containerName,
 	}
 	shells := []string{"sh", "/bin/sh", "bash", "/bin/bash"}
 	for idx, shellPath := range shells {
-		pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, shellPath, "-lc", "cat > /proc/1/fd/0")
+		script := "fd=$(readlink /proc/1/fd/0 2>/dev/null || true); case \"$fd\" in /dev/null*) exit 45 ;; esac; cat > /proc/1/fd/0"
+		pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, shellPath, "-lc", script)
 		pipeCmd.Stdin = strings.NewReader(cmd + "\r")
 		pipeCmd.Stdout = io.Discard
 		var stderr bytes.Buffer
@@ -1625,6 +1623,9 @@ func (d Docker) writeToContainerProcessStdin(ctx context.Context, containerName,
 			return nil
 		} else {
 			exitCode := exitCodeFromErr(err)
+			if exitCode == 45 {
+				return fmt.Errorf("process stdin is not open; restart the server so the container is recreated with interactive stdin")
+			}
 			if isMissingExecShell(stderr.String(), shellPath, exitCode) && idx < len(shells)-1 {
 				continue
 			}
@@ -1649,13 +1650,28 @@ func (d Docker) containerTTY(ctx context.Context, containerName string) bool {
 	return err == nil && strings.EqualFold(strings.TrimSpace(out), "true")
 }
 
+func (d Docker) containerOpenStdin(ctx context.Context, containerName string) bool {
+	name := dockerContainerName(containerName)
+	if name == "" {
+		return false
+	}
+	inspectCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	out, _, _, err := d.runCollect(inspectCtx, "inspect", "-f", "{{.Config.OpenStdin}} {{.Config.AttachStdin}}", name)
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(out)))
+	return len(fields) >= 1 && fields[0] == "true"
+}
+
 func (d Docker) writeToMinecraftProcessStdin(ctx context.Context, containerName, command string) error {
 	name := dockerContainerName(containerName)
 	cmd := strings.TrimSpace(command)
 	if name == "" || cmd == "" {
 		return fmt.Errorf("missing-params")
 	}
-	script := "pid=$(pgrep -n java || pgrep -n bedrock_server || echo 1); cat > /proc/$pid/fd/0"
+	script := "pid=$(pgrep -n java || pgrep -n bedrock_server || echo 1); fd=$(readlink \"/proc/$pid/fd/0\" 2>/dev/null || true); case \"$fd\" in /dev/null*) exit 45 ;; esac; cat > \"/proc/$pid/fd/0\""
 	shells := []string{"sh", "/bin/sh", "bash", "/bin/bash"}
 	for idx, shellPath := range shells {
 		pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, shellPath, "-lc", script)
@@ -1667,6 +1683,9 @@ func (d Docker) writeToMinecraftProcessStdin(ctx context.Context, containerName,
 			return nil
 		} else {
 			exitCode := exitCodeFromErr(err)
+			if exitCode == 45 {
+				return fmt.Errorf("minecraft stdin is not open; restart the server so the container is recreated with interactive stdin")
+			}
 			if isMissingExecShell(stderr.String(), shellPath, exitCode) && idx < len(shells)-1 {
 				continue
 			}
@@ -1708,6 +1727,8 @@ func (d Docker) writeToTargetProcessStdin(ctx context.Context, containerName, co
 		"  [ -n \"$pid\" ] && break",
 		"done",
 		"[ -n \"$pid\" ] || exit 44",
+		"fd=$(readlink \"/proc/$pid/fd/0\" 2>/dev/null || true)",
+		"case \"$fd\" in /dev/null*) exit 45 ;; esac",
 		"cat > \"/proc/$pid/fd/0\"",
 	}, "\n")
 
@@ -1729,6 +1750,9 @@ func (d Docker) writeToTargetProcessStdin(ctx context.Context, containerName, co
 			exitCode := exitCodeFromErr(err)
 			if exitCode == 44 {
 				return fmt.Errorf("target process not found: %s", strings.Join(targets, ", "))
+			}
+			if exitCode == 45 {
+				return fmt.Errorf("target process stdin is not open; restart the server so the container is recreated with interactive stdin")
 			}
 			if isMissingExecShell(stderr.String(), shellPath, exitCode) && idx < len(shells)-1 {
 				continue
@@ -1797,6 +1821,14 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 
 	if state := d.containerState(ctx, name); state != "running" {
 		return fmt.Errorf("container-not-running")
+	}
+
+	openStdin := d.containerOpenStdin(ctx, name)
+	if !openStdin {
+		if stdinMgr != nil {
+			stdinMgr.remove(name)
+		}
+		return fmt.Errorf("container stdin is not open; restart the server so the container is recreated with interactive stdin")
 	}
 
 	var attachedErr error
@@ -8111,7 +8143,7 @@ func (a *Agent) executeStartupCommand(ctx context.Context, name, serverDir strin
 	if resources != nil && resources.PidsLimit != nil && *resources.PidsLimit >= minPidsLimit && *resources.PidsLimit <= maxPidsLimit {
 		pidsLimit = *resources.PidsLimit
 	}
-	finalArgs := []string{"run", "-d", "-t", "--restart", "unless-stopped", "--name", name}
+	finalArgs := []string{"run", "-d", "-i", "-t", "--restart", "unless-stopped", "--name", name}
 	finalArgs = append(finalArgs, "--cap-drop=ALL", fmt.Sprintf("--pids-limit=%d", pidsLimit))
 	finalArgs = append(finalArgs, panelSafeCaps()...)
 	if resources != nil {
@@ -8895,8 +8927,13 @@ type logTail struct {
 }
 
 type logSnapshotCall struct {
-	done  chan struct{}
-	lines []string
+	done    chan struct{}
+	entries []logSnapshotEntry
+}
+
+type logSnapshotEntry struct {
+	line string
+	ts   int64
 }
 
 const logTailRecentMaxLines = 1200
@@ -8989,27 +9026,61 @@ func (t *logTail) markDockerSnapshotPrimed() bool {
 	return true
 }
 
-func parseDockerLogSnapshot(raw string, tail int) []string {
-	cleaned := cleanLogLine(raw)
-	if cleaned == "" {
+func splitDockerLogTimestamp(raw string) (string, int64) {
+	line := strings.TrimRight(raw, "\r")
+	token, rest, ok := strings.Cut(line, " ")
+	if !ok || token == "" || rest == "" {
+		return line, 0
+	}
+	if t, err := time.Parse(time.RFC3339Nano, token); err == nil {
+		return strings.TrimLeft(rest, " \t"), t.UnixMilli()
+	}
+	return line, 0
+}
+
+func parseDockerLogSnapshotEntries(raw string, tail int) []logSnapshotEntry {
+	if raw == "" {
 		return nil
 	}
-	parts := strings.Split(cleaned, "\n")
-	lines := make([]string, 0, len(parts))
+	raw = stripDockerStreamFraming(raw)
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "\n")
+	parts := strings.Split(raw, "\n")
+	entries := make([]logSnapshotEntry, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimRight(part, "\r")
-		if part == "" {
+		if strings.TrimSpace(part) == "" {
 			continue
 		}
-		lines = append(lines, part)
+		linePart, ts := splitDockerLogTimestamp(part)
+		cleaned := cleanLogLine(linePart)
+		if cleaned == "" {
+			continue
+		}
+		for _, line := range strings.Split(cleaned, "\n") {
+			line = strings.TrimRight(line, "\r")
+			if line == "" {
+				continue
+			}
+			entries = append(entries, logSnapshotEntry{line: line, ts: ts})
+		}
 	}
-	if tail > 0 && len(lines) > tail {
-		lines = lines[len(lines)-tail:]
+	if tail > 0 && len(entries) > tail {
+		entries = entries[len(entries)-tail:]
+	}
+	return entries
+}
+
+func parseDockerLogSnapshot(raw string, tail int) []string {
+	entries := parseDockerLogSnapshotEntries(raw, tail)
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		lines = append(lines, entry.line)
 	}
 	return lines
 }
 
-func (lm *logManager) fetchTailSnapshotSingleflight(name string, tail int, fetch func() []string) []string {
+func (lm *logManager) fetchTailSnapshotSingleflight(name string, tail int, fetch func() []logSnapshotEntry) []logSnapshotEntry {
 	if tail <= 0 || fetch == nil {
 		return nil
 	}
@@ -9019,21 +9090,21 @@ func (lm *logManager) fetchTailSnapshotSingleflight(name string, tail int, fetch
 	if call, ok := lm.snapshotInFlight[key]; ok {
 		lm.snapshotMu.Unlock()
 		<-call.done
-		return append([]string(nil), call.lines...)
+		return append([]logSnapshotEntry(nil), call.entries...)
 	}
 	call := &logSnapshotCall{done: make(chan struct{})}
 	lm.snapshotInFlight[key] = call
 	lm.snapshotMu.Unlock()
 
-	lines := fetch()
+	entries := fetch()
 
 	lm.snapshotMu.Lock()
-	call.lines = append([]string(nil), lines...)
+	call.entries = append([]logSnapshotEntry(nil), entries...)
 	close(call.done)
 	delete(lm.snapshotInFlight, key)
 	lm.snapshotMu.Unlock()
 
-	return append([]string(nil), lines...)
+	return append([]logSnapshotEntry(nil), entries...)
 }
 
 func (lm *logManager) getOrCreate(name string) *logTail {
@@ -9090,18 +9161,18 @@ func (lm *logManager) primeDockerLogSnapshot(t *logTail, tail int) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	stdout, stderr, _, _ := lm.d.runCollect(ctx, "logs", "--tail", fmt.Sprint(tail), t.name)
+	stdout, stderr, _, _ := lm.d.runCollect(ctx, "logs", "--timestamps", "--tail", fmt.Sprint(tail), t.name)
 	cancel()
 
-	for _, line := range parseDockerLogSnapshot(stdout, tail) {
-		lm.sendToClients(t, "stdout:"+line)
+	for _, entry := range parseDockerLogSnapshotEntries(stdout, tail) {
+		lm.sendToClients(t, "stdout:"+entry.line)
 	}
-	for _, line := range parseDockerLogSnapshot(stderr, tail) {
-		lower := strings.ToLower(line)
+	for _, entry := range parseDockerLogSnapshotEntries(stderr, tail) {
+		lower := strings.ToLower(entry.line)
 		if strings.Contains(lower, "no such container") || strings.Contains(lower, "can not get logs from container which is dead") {
 			continue
 		}
-		lm.sendToClients(t, "stderr:"+line)
+		lm.sendToClients(t, "stderr:"+entry.line)
 	}
 }
 
@@ -12157,7 +12228,7 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 			hostPort = 25565
 		}
 		uid, gid := statUIDGID(serverDir)
-		parts := []string{"docker run -d -t",
+		parts := []string{"docker run -d -i -t",
 			"--name", name,
 			"--restart", "unless-stopped",
 			"-p", fmt.Sprintf("%d:25565", hostPort),
@@ -12225,7 +12296,7 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 		}
 		imageRef := image + ":" + tag
 
-		parts := []string{"docker run -d -t", "--name", name, "--restart", "unless-stopped"}
+		parts := []string{"docker run -d -i -t", "--name", name, "--restart", "unless-stopped"}
 		if hasRam {
 			parts = append(parts, "--memory", fmt.Sprintf("%dm", int(ramMb)))
 			parts = append(parts, "--memory-reservation", fmt.Sprintf("%dm", int(ramMb*90/100)))
@@ -12315,7 +12386,7 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 		if hostPort == 0 {
 			hostPort = 8080
 		}
-		parts := []string{"docker run -d -t", "--name", name, "--restart", "unless-stopped"}
+		parts := []string{"docker run -d -i -t", "--name", name, "--restart", "unless-stopped"}
 		if hasRam {
 			parts = append(parts, "--memory", fmt.Sprintf("%dm", int(ramMb)))
 			parts = append(parts, "--memory-reservation", fmt.Sprintf("%dm", int(ramMb*90/100)))
@@ -14243,7 +14314,9 @@ func (a *Agent) handleRestart(w http.ResponseWriter, r *http.Request, name strin
 	if normalizeRustRuntimeForPterodactyl(meta) {
 		_ = a.saveMeta(serverDir, meta)
 	}
-	if shouldRecreateContainerOnRestart(meta) {
+	consoleMode := inferredConsoleModeForServer(meta)
+	recreateForConsoleStdin := consoleMode == "stdin" && !a.docker.containerOpenStdin(ctx, name)
+	if shouldRecreateContainerOnRestart(meta) || recreateForConsoleStdin {
 		if a.stdinMgr != nil {
 			a.stdinMgr.remove(name)
 		}
@@ -14253,21 +14326,46 @@ func (a *Agent) handleRestart(w http.ResponseWriter, r *http.Request, name strin
 		startCtx, startCancel := context.WithTimeout(context.Background(), 240*time.Second)
 		defer startCancel()
 		resources := resourceLimitsFromMeta(meta)
-		hostPort := 8080
-		if storedPort, ok := parseStrictPortValue(meta["hostPort"]); ok {
-			hostPort = storedPort
-		} else if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
-			if ports := runtimeIntSlice(runtimeObj["ports"]); len(ports) > 0 && ports[0] > 0 {
-				hostPort = ports[0]
+		resolveStoredPort := func(defaultPort int) int {
+			if storedPort, ok := parseStrictPortValue(meta["hostPort"]); ok {
+				return storedPort
 			}
+			if runtimeObj, ok := meta["runtime"].(map[string]any); ok {
+				if ports := runtimeIntSlice(runtimeObj["ports"]); len(ports) > 0 && ports[0] > 0 {
+					return ports[0]
+				}
+			}
+			return defaultPort
 		}
-		if err := a.startCustomDockerContainer(startCtx, name, serverDir, meta, hostPort, resources); err != nil {
-			jsonWrite(w, 500, map[string]any{"error": "container recreate failed", "detail": err.Error()})
+		typ := strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["type"])))
+		if typ == "" || typ == "<nil>" {
+			typ = strings.ToLower(strings.TrimSpace(fmt.Sprint(meta["template"])))
+		}
+		var startErr error
+		switch {
+		case typ == "minecraft":
+			hostPort := resolveStoredPort(25565)
+			enforceServerProps(serverDir)
+			startErr = a.startMinecraftContainer(startCtx, name, serverDir, hostPort, resources, nil)
+		case meta["runtime"] != nil && (typ == "python" || typ == "nodejs" || typ == "discord-bot" || typ == "runtime"):
+			hostPort := resolveStoredPort(0)
+			startErr = a.startRuntimeContainer(startCtx, name, serverDir, meta, hostPort, resources, nil)
+		default:
+			hostPort := resolveStoredPort(8080)
+			startErr = a.startCustomDockerContainer(startCtx, name, serverDir, meta, hostPort, resources)
+		}
+		if startErr != nil {
+			jsonWrite(w, 500, map[string]any{"error": "container recreate failed", "detail": startErr.Error()})
 			return
 		}
 		a.ensureLiveLogs(name)
 		a.broadcastContainerEvent(name, "running")
-		jsonWrite(w, 200, map[string]any{"ok": true, "recreated": true})
+		jsonWrite(w, 200, map[string]any{"ok": true, "recreated": true, "reason": func() string {
+			if recreateForConsoleStdin {
+				return "stdin"
+			}
+			return "runtime"
+		}()})
 		return
 	}
 
@@ -14563,12 +14661,15 @@ func (a *Agent) handleLogsSSE(w http.ResponseWriter, r *http.Request, name strin
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev, string(b))
 		flusher.Flush()
 	}
-	sendLine := func(line string) {
+	sendLine := func(line string, ts int64) {
 		cleaned := cleanLogLine(line)
 		if cleaned == "" {
 			return
 		}
 		payload := map[string]any{"line": cleaned}
+		if ts > 0 {
+			payload["ts"] = ts
+		}
 		b, _ := json.Marshal(payload)
 		fmt.Fprintf(w, "data: %s\n\n", string(b))
 		flusher.Flush()
@@ -14578,25 +14679,41 @@ func (a *Agent) handleLogsSSE(w http.ResponseWriter, r *http.Request, name strin
 	t := a.logs.getOrCreate(name)
 
 	if tailN > 0 {
-		snapshot := t.snapshotRecent(tailN)
+		recentSnapshot := t.snapshotRecent(tailN)
+		snapshot := make([]logSnapshotEntry, 0, len(recentSnapshot))
+		for _, line := range recentSnapshot {
+			snapshot = append(snapshot, logSnapshotEntry{line: line})
+		}
 		if len(snapshot) == 0 {
-			snapshot = a.logs.fetchTailSnapshotSingleflight(name, tailN, func() []string {
+			snapshot = a.logs.fetchTailSnapshotSingleflight(name, tailN, func() []logSnapshotEntry {
 				ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-				out, errOut, _, _ := a.docker.runCollect(ctx, "logs", "--tail", fmt.Sprint(tailN), name)
+				out, errOut, _, _ := a.docker.runCollect(ctx, "logs", "--timestamps", "--tail", fmt.Sprint(tailN), name)
 				cancel()
-				lines := append(parseDockerLogSnapshot(out, tailN), parseDockerLogSnapshot(errOut, tailN)...)
-				if len(lines) > tailN {
-					lines = lines[len(lines)-tailN:]
+				entries := append(parseDockerLogSnapshotEntries(out, tailN), parseDockerLogSnapshotEntries(errOut, tailN)...)
+				sort.SliceStable(entries, func(i, j int) bool {
+					left := entries[i].ts
+					right := entries[j].ts
+					if left == 0 || right == 0 {
+						return false
+					}
+					return left < right
+				})
+				if len(entries) > tailN {
+					entries = entries[len(entries)-tailN:]
 				}
-				return lines
+				return entries
 			})
 			if len(snapshot) > 0 {
-				t.appendRecentBatch(snapshot)
+				lines := make([]string, 0, len(snapshot))
+				for _, entry := range snapshot {
+					lines = append(lines, entry.line)
+				}
+				t.appendRecentBatch(lines)
 				t.markDockerSnapshotPrimed()
 			}
 		}
-		for _, line := range snapshot {
-			sendLine(line)
+		for _, entry := range snapshot {
+			sendLine(entry.line, entry.ts)
 		}
 	}
 	ch := make(chan string, 256)
@@ -14620,7 +14737,7 @@ func (a *Agent) handleLogsSSE(w http.ResponseWriter, r *http.Request, name strin
 		case <-hb.C:
 			sendEvent("keepalive", map[string]any{"ts": time.Now().UnixMilli()})
 		case s := <-ch:
-			sendLine(normalizeStreamedLogLine(s))
+			sendLine(normalizeStreamedLogLine(s), time.Now().UnixMilli())
 		}
 	}
 }
