@@ -1517,37 +1517,22 @@ func (sm *stdinManager) getOrCreate(ctx context.Context, containerName string) (
 }
 
 func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdinConn, error) {
-	cmd := exec.Command("docker", "attach", "--sig-proxy=false", name)
+	attachCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
-	stdin, err := cmd.StdinPipe()
+	stdin, err := sm.docker.attachContainerAPI(attachCtx, name, dockerAttachOptions{Stdin: true})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create stdin pipe: %w", err)
-	}
-
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-
-	if err := cmd.Start(); err != nil {
-		stdin.Close()
-		return nil, fmt.Errorf("failed to start docker attach: %w", err)
+		return nil, fmt.Errorf("failed to attach container stdin: %w", err)
 	}
 
 	conn := &stdinConn{
 		name:     name,
 		stdin:    stdin,
-		cmd:      cmd,
 		lastUsed: time.Now(),
 	}
 
-	go func() {
-		_ = cmd.Wait()
-		conn.mu.Lock()
-		conn.closed = true
-		conn.mu.Unlock()
-	}()
-
 	if sm.debug {
-		fmt.Printf("[stdin-manager] created new connection for %s\n", name)
+		fmt.Printf("[stdin-manager] created Docker API stdin connection for %s\n", name)
 	}
 
 	return conn, nil
@@ -1576,6 +1561,10 @@ func (c *stdinConn) sendCommand(cmd string) error {
 	}
 	c.lastUsed = time.Now()
 	line := strings.TrimRight(cmd, "\r\n") + "\n"
+	if deadlineWriter, ok := c.stdin.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = deadlineWriter.SetWriteDeadline(time.Now().Add(stdinWriteTimeout))
+		defer deadlineWriter.SetWriteDeadline(time.Time{})
+	}
 	if _, err := io.WriteString(c.stdin, line); err != nil {
 		c.closed = true
 		if c.stdin != nil {
@@ -8926,6 +8915,7 @@ type logTail struct {
 
 	stopCh chan struct{}
 	cmd    *exec.Cmd
+	conn   io.Closer
 }
 
 type logSnapshotCall struct {
@@ -9103,11 +9093,16 @@ func (lm *logManager) removeIfEmpty(t *logTail) {
 			return
 		}
 		t.closed = true
+		cmd := t.cmd
+		conn := t.conn
 		t.mu.Unlock()
 
 		close(t.stopCh)
-		if t.cmd != nil && t.cmd.Process != nil {
-			_ = t.cmd.Process.Kill()
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		if conn != nil {
+			_ = conn.Close()
 		}
 		delete(lm.tails, t.name)
 	}
@@ -9180,20 +9175,27 @@ func (lm *logManager) followLoop(t *logTail) {
 		lastState = "running"
 		backoff = 1 * time.Second
 
-		cmd := exec.Command("docker", "logs", "--tail", "0", "-f", dockerContainerName(t.name))
-		stdout, _ := cmd.StdoutPipe()
-		stderr, _ := cmd.StderrPipe()
-		if err := cmd.Start(); err != nil {
-			fmt.Printf("[logs] failed to start docker logs for %s: %v\n", t.name, err)
+		attachCtx, attachCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		stream, err := lm.d.attachContainerAPI(attachCtx, t.name, dockerAttachOptions{Stdout: true, Stderr: true})
+		attachCancel()
+		if err != nil {
+			fmt.Printf("[logs] failed to attach live stream for %s: %v\n", t.name, err)
 			time.Sleep(1 * time.Second)
 			continue
 		}
 
+		select {
+		case <-t.stopCh:
+			_ = stream.Close()
+			return
+		default:
+		}
+
 		t.mu.Lock()
-		t.cmd = cmd
+		t.conn = stream
 		t.mu.Unlock()
 
-		broadcast := func(prefix string, r io.Reader) {
+		broadcast := func(r io.Reader) {
 			sc := bufio.NewScanner(r)
 			buf := make([]byte, 0, 64*1024)
 			sc.Buffer(buf, 2*1024*1024)
@@ -9202,28 +9204,22 @@ func (lm *logManager) followLoop(t *logTail) {
 				if line == "" {
 					continue
 				}
-				if prefix == "stderr:" {
-					if strings.Contains(strings.ToLower(line), "no such container") {
-						continue
-					}
-					if strings.Contains(strings.ToLower(line), "can not get logs from container which is dead") {
-						continue
-					}
+				lower := strings.ToLower(line)
+				if strings.Contains(lower, "no such container") {
+					continue
 				}
-				lm.sendToClients(t, prefix+line)
+				if strings.Contains(lower, "can not get logs from container which is dead") {
+					continue
+				}
+				lm.sendToClients(t, "stdout:"+line)
 			}
 		}
 
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() { defer wg.Done(); broadcast("stdout:", stdout) }()
-		go func() { defer wg.Done(); broadcast("stderr:", stderr) }()
-		wg.Wait()
-
-		_ = cmd.Wait()
+		broadcast(stream)
+		_ = stream.Close()
 
 		t.mu.Lock()
-		t.cmd = nil
+		t.conn = nil
 		t.mu.Unlock()
 
 		select {
@@ -9275,10 +9271,16 @@ func (lm *logManager) killTail(name string) {
 	if !alreadyClosed {
 		t.closed = true
 	}
-	if t.cmd != nil && t.cmd.Process != nil {
-		_ = t.cmd.Process.Kill()
-	}
+	cmd := t.cmd
+	conn := t.conn
 	t.mu.Unlock()
+
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
 
 	if !alreadyClosed {
 		close(t.stopCh)
