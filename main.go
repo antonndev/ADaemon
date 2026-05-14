@@ -45,7 +45,7 @@ import (
 )
 
 const (
-	NodeVersion       = "1.2.2"
+	NodeVersion       = "1.2.3"
 	DefaultConfigPath = "/var/lib/node/config.yml"
 	DefaultDataRoot   = "/var/lib/node"
 	DefaultAPIHost    = "0.0.0.0"
@@ -9156,7 +9156,7 @@ func (lm *logManager) followLoop(t *logTail) {
 			buf := make([]byte, 0, 64*1024)
 			sc.Buffer(buf, 2*1024*1024)
 			for sc.Scan() {
-				line := sc.Text()
+				line := cleanLogLine(sc.Text())
 				if line == "" {
 					continue
 				}
