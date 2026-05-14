@@ -14426,11 +14426,6 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 	}
 
 	a.broadcastConsoleChunk(name, "stdout:", "$ "+cmd+"\n")
-	if len(targetProcesses) > 0 {
-		a.broadcastConsoleChunk(name, "stdout:", "[command sent to game process stdin]\n")
-	} else {
-		a.broadcastConsoleChunk(name, "stdout:", "[command sent to container stdin]\n")
-	}
 	jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "stdin", "targeted": len(targetProcesses) > 0})
 }
 
