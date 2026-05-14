@@ -1303,6 +1303,61 @@ type stdinManager struct {
 	stopOnce sync.Once
 }
 
+func preferDockerCLIConsoleTransport() bool {
+	override := strings.ToLower(strings.TrimSpace(os.Getenv("ADPANEL_DOCKER_STREAM_TRANSPORT")))
+	switch override {
+	case "cli", "docker-cli", "docker":
+		return true
+	case "api", "docker-api", "hijack":
+		return false
+	}
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	raw, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return true
+	}
+	osInfo := strings.ToLower(string(raw))
+	id := ""
+	idLike := ""
+	for _, line := range strings.Split(osInfo, "\n") {
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		switch strings.TrimSpace(key) {
+		case "id":
+			id = val
+		case "id_like":
+			idLike = val
+		}
+	}
+	if id == "ubuntu" || id == "debian" || strings.Contains(idLike, "debian") || strings.Contains(idLike, "ubuntu") {
+		return false
+	}
+	return true
+}
+
+func containerTTYForHost() bool {
+	return !preferDockerCLIConsoleTransport()
+}
+
+func dockerRunInteractiveArgs() []string {
+	if containerTTYForHost() {
+		return []string{"run", "-d", "-i", "-t"}
+	}
+	return []string{"run", "-d", "-i"}
+}
+
+func dockerRunInteractivePrefix() string {
+	if containerTTYForHost() {
+		return "docker run -d -i -t"
+	}
+	return "docker run -d -i"
+}
+
 func newStdinManager(docker *Docker, debug bool) *stdinManager {
 	sm := &stdinManager{
 		conns:  make(map[string]*stdinConn),
@@ -1518,11 +1573,29 @@ func (sm *stdinManager) getOrCreate(ctx context.Context, containerName string) (
 }
 
 func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdinConn, error) {
+	preferCLI := preferDockerCLIConsoleTransport()
+	if preferCLI {
+		conn, err := sm.createDockerCLIStdinConn(ctx, name)
+		if err == nil {
+			return conn, nil
+		}
+		if sm.debug {
+			fmt.Printf("[stdin-manager] Docker CLI stdin attach failed for %s: %v\n", name, err)
+		}
+	}
+
 	attachCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	stdin, err := sm.docker.attachContainerAPI(attachCtx, name, dockerAttachOptions{Stdin: true})
 	if err != nil {
+		if !preferCLI {
+			conn, cliErr := sm.createDockerCLIStdinConn(ctx, name)
+			if cliErr == nil {
+				return conn, nil
+			}
+			return nil, fmt.Errorf("failed to attach container stdin: Docker API: %v; Docker CLI: %w", err, cliErr)
+		}
 		return nil, fmt.Errorf("failed to attach container stdin: %w", err)
 	}
 
@@ -1537,6 +1610,46 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 		fmt.Printf("[stdin-manager] created Docker API stdin connection for %s (tty=%t)\n", name, conn.tty)
 	}
 
+	return conn, nil
+}
+
+func (sm *stdinManager) createDockerCLIStdinConn(ctx context.Context, name string) (*stdinConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("empty container name")
+	}
+
+	cmd := exec.Command("docker", "attach", "--sig-proxy=false", name)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
+
+	conn := &stdinConn{
+		name:     name,
+		stdin:    stdin,
+		cmd:      cmd,
+		lastUsed: time.Now(),
+		tty:      sm.docker.containerTTY(ctx, name),
+	}
+	go func() {
+		_ = cmd.Wait()
+		conn.mu.Lock()
+		conn.closed = true
+		conn.mu.Unlock()
+	}()
+
+	if sm.debug {
+		fmt.Printf("[stdin-manager] created Docker CLI stdin connection for %s (tty=%t)\n", name, conn.tty)
+	}
 	return conn, nil
 }
 
@@ -1823,12 +1936,33 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 		return fmt.Errorf("container-not-running")
 	}
 
+	tty := d.containerTTY(ctx, name)
+	portablePipeMode := preferDockerCLIConsoleTransport()
+	if portablePipeMode && tty {
+		if stdinMgr != nil {
+			stdinMgr.remove(name)
+		}
+		return fmt.Errorf("container console was created with TTY transport; restart the server so it is recreated with portable stdin pipes")
+	}
+
 	openStdin := d.containerOpenStdin(ctx, name)
 	if !openStdin {
 		if stdinMgr != nil {
 			stdinMgr.remove(name)
 		}
 		return fmt.Errorf("container stdin is not open; restart the server so the container is recreated with interactive stdin")
+	}
+
+	var targetErr error
+	if portablePipeMode && len(targetProcesses) > 0 {
+		if err := d.writeToTargetProcessStdin(ctx, name, cmd, targetProcesses); err == nil {
+			return nil
+		} else {
+			targetErr = err
+			if d.debug {
+				fmt.Printf("[docker] target process stdin failed for %s: %v\n", name, err)
+			}
+		}
 	}
 
 	var attachedErr error
@@ -1843,8 +1977,7 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 		}
 	}
 
-	var targetErr error
-	if len(targetProcesses) > 0 {
+	if !portablePipeMode && len(targetProcesses) > 0 {
 		if err := d.writeToTargetProcessStdin(ctx, name, cmd, targetProcesses); err == nil {
 			return nil
 		} else {
@@ -7507,7 +7640,7 @@ func (a *Agent) startMinecraftContainer(ctx context.Context, name, serverDir str
 
 	req := dockerContainerCreateRequest{
 		Image:        imageRef,
-		Tty:          true,
+		Tty:          containerTTYForHost(),
 		OpenStdin:    true,
 		AttachStdin:  true,
 		AttachStdout: true,
@@ -7642,7 +7775,7 @@ func (a *Agent) startRuntimeContainer(ctx context.Context, name, serverDir strin
 		Cmd:          cmdArgs,
 		WorkingDir:   workdir,
 		User:         a.structuredContainerUser(ctx, imageRef, uid, gid, runtimeObj),
-		Tty:          true,
+		Tty:          containerTTYForHost(),
 		OpenStdin:    true,
 		AttachStdin:  true,
 		AttachStdout: true,
@@ -8143,7 +8276,8 @@ func (a *Agent) executeStartupCommand(ctx context.Context, name, serverDir strin
 	if resources != nil && resources.PidsLimit != nil && *resources.PidsLimit >= minPidsLimit && *resources.PidsLimit <= maxPidsLimit {
 		pidsLimit = *resources.PidsLimit
 	}
-	finalArgs := []string{"run", "-d", "-i", "-t", "--restart", "unless-stopped", "--name", name}
+	finalArgs := dockerRunInteractiveArgs()
+	finalArgs = append(finalArgs, "--restart", "unless-stopped", "--name", name)
 	finalArgs = append(finalArgs, "--cap-drop=ALL", fmt.Sprintf("--pids-limit=%d", pidsLimit))
 	finalArgs = append(finalArgs, panelSafeCaps()...)
 	if resources != nil {
@@ -8633,7 +8767,7 @@ func (a *Agent) startCustomDockerContainer(ctx context.Context, name, serverDir 
 		Cmd:          cmdArgs,
 		WorkingDir:   workdir,
 		User:         a.structuredContainerUser(ctx, imageRef, uid, gid, runtimeObj),
-		Tty:          true,
+		Tty:          containerTTYForHost(),
 		OpenStdin:    true,
 		AttachStdin:  true,
 		AttachStdout: true,
@@ -9176,6 +9310,82 @@ func (lm *logManager) primeDockerLogSnapshot(t *logTail, tail int) {
 	}
 }
 
+func (lm *logManager) broadcastLiveLogLine(t *logTail, prefix, raw string) {
+	line := cleanLogLine(raw)
+	if line == "" {
+		return
+	}
+	lower := strings.ToLower(line)
+	if strings.Contains(lower, "no such container") {
+		return
+	}
+	if strings.Contains(lower, "can not get logs from container which is dead") {
+		return
+	}
+	lm.sendToClients(t, prefix+line)
+}
+
+func (lm *logManager) followDockerLogsCLI(t *logTail) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "logs", "-f", "--tail", "0", t.name)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	t.mu.Lock()
+	t.cmd = cmd
+	t.conn = nil
+	t.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-t.stopCh:
+			cancel()
+		case <-done:
+		}
+	}()
+
+	var wg sync.WaitGroup
+	scan := func(r io.Reader, prefix string) {
+		defer wg.Done()
+		sc := bufio.NewScanner(r)
+		buf := make([]byte, 0, 64*1024)
+		sc.Buffer(buf, 2*1024*1024)
+		for sc.Scan() {
+			lm.broadcastLiveLogLine(t, prefix, sc.Text())
+		}
+	}
+	wg.Add(2)
+	go scan(stdout, "stdout:")
+	go scan(stderr, "stderr:")
+
+	err = cmd.Wait()
+	close(done)
+	wg.Wait()
+
+	t.mu.Lock()
+	if t.cmd == cmd {
+		t.cmd = nil
+	}
+	t.mu.Unlock()
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
 func (lm *logManager) followLoop(t *logTail) {
 	backoff := 1 * time.Second
 	lastState := ""
@@ -9222,13 +9432,36 @@ func (lm *logManager) followLoop(t *logTail) {
 		lastState = "running"
 		backoff = 1 * time.Second
 
+		if preferDockerCLIConsoleTransport() {
+			if err := lm.followDockerLogsCLI(t); err != nil {
+				if lm.debug {
+					fmt.Printf("[logs] Docker CLI log stream ended for %s: %v\n", t.name, err)
+				}
+			}
+			select {
+			case <-t.stopCh:
+				return
+			default:
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+		}
+
 		attachCtx, attachCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		stream, err := lm.d.attachContainerAPI(attachCtx, t.name, dockerAttachOptions{Stdout: true, Stderr: true})
 		attachCancel()
 		if err != nil {
 			fmt.Printf("[logs] failed to attach live stream for %s: %v\n", t.name, err)
-			time.Sleep(1 * time.Second)
-			continue
+			if cliErr := lm.followDockerLogsCLI(t); cliErr != nil && lm.debug {
+				fmt.Printf("[logs] Docker CLI log fallback ended for %s: %v\n", t.name, cliErr)
+			}
+			select {
+			case <-t.stopCh:
+				return
+			default:
+				time.Sleep(1 * time.Second)
+				continue
+			}
 		}
 
 		select {
@@ -9247,18 +9480,7 @@ func (lm *logManager) followLoop(t *logTail) {
 			buf := make([]byte, 0, 64*1024)
 			sc.Buffer(buf, 2*1024*1024)
 			for sc.Scan() {
-				line := cleanLogLine(sc.Text())
-				if line == "" {
-					continue
-				}
-				lower := strings.ToLower(line)
-				if strings.Contains(lower, "no such container") {
-					continue
-				}
-				if strings.Contains(lower, "can not get logs from container which is dead") {
-					continue
-				}
-				lm.sendToClients(t, "stdout:"+line)
+				lm.broadcastLiveLogLine(t, "stdout:", sc.Text())
 			}
 		}
 
@@ -12228,7 +12450,7 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 			hostPort = 25565
 		}
 		uid, gid := statUIDGID(serverDir)
-		parts := []string{"docker run -d -i -t",
+		parts := []string{dockerRunInteractivePrefix(),
 			"--name", name,
 			"--restart", "unless-stopped",
 			"-p", fmt.Sprintf("%d:25565", hostPort),
@@ -12296,7 +12518,7 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 		}
 		imageRef := image + ":" + tag
 
-		parts := []string{"docker run -d -i -t", "--name", name, "--restart", "unless-stopped"}
+		parts := []string{dockerRunInteractivePrefix(), "--name", name, "--restart", "unless-stopped"}
 		if hasRam {
 			parts = append(parts, "--memory", fmt.Sprintf("%dm", int(ramMb)))
 			parts = append(parts, "--memory-reservation", fmt.Sprintf("%dm", int(ramMb*90/100)))
@@ -12386,7 +12608,7 @@ func (a *Agent) buildEffectiveDockerCommand(name, serverDir string, meta map[str
 		if hostPort == 0 {
 			hostPort = 8080
 		}
-		parts := []string{"docker run -d -i -t", "--name", name, "--restart", "unless-stopped"}
+		parts := []string{dockerRunInteractivePrefix(), "--name", name, "--restart", "unless-stopped"}
 		if hasRam {
 			parts = append(parts, "--memory", fmt.Sprintf("%dm", int(ramMb)))
 			parts = append(parts, "--memory-reservation", fmt.Sprintf("%dm", int(ramMb*90/100)))
@@ -14315,7 +14537,7 @@ func (a *Agent) handleRestart(w http.ResponseWriter, r *http.Request, name strin
 		_ = a.saveMeta(serverDir, meta)
 	}
 	consoleMode := inferredConsoleModeForServer(meta)
-	recreateForConsoleStdin := consoleMode == "stdin" && !a.docker.containerOpenStdin(ctx, name)
+	recreateForConsoleStdin := consoleMode == "stdin" && (!a.docker.containerOpenStdin(ctx, name) || (preferDockerCLIConsoleTransport() && a.docker.containerTTY(ctx, name)))
 	if shouldRecreateContainerOnRestart(meta) || recreateForConsoleStdin {
 		if a.stdinMgr != nil {
 			a.stdinMgr.remove(name)
