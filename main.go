@@ -4870,6 +4870,8 @@ func defaultDataDirForType(tpl string) string {
 	switch strings.ToLower(strings.TrimSpace(tpl)) {
 	case "python", "nodejs", "discord-bot", "runtime":
 		return "/app"
+	case "fivem", "five-m", "redm":
+		return cfxRuntimeServerDir
 	default:
 		return "/data"
 	}
@@ -5547,6 +5549,8 @@ func runtimeUsesHostPortInsideContainer(tpl string, runtimeObj map[string]any, e
 		strings.Contains(startup, "{PORT}")
 }
 
+const cfxRuntimeServerDir = "/serverdata/serverfiles"
+
 func isCfxTemplate(tpl string) bool {
 	switch strings.ToLower(strings.TrimSpace(tpl)) {
 	case "fivem", "five-m", "redm":
@@ -5585,14 +5589,14 @@ func normalizeCfxRuntimeLayout(tpl string, runtimeObj map[string]any, serverDir 
 	}
 	changed := false
 	migrateNestedCfxServerFiles(serverDir)
-	desiredVolume := "{BOT_DIR}:/serverdata/serverfiles"
+	desiredVolume := "{BOT_DIR}:" + cfxRuntimeServerDir
 	volumes := runtimeStringSlice(runtimeObj["volumes"])
 	if len(volumes) != 1 || strings.TrimSpace(volumes[0]) != desiredVolume {
 		runtimeObj["volumes"] = []any{desiredVolume}
 		changed = true
 	}
-	if normalizeContainerWorkdir(runtimeObj["workdir"]) != "/serverdata/serverfiles" {
-		runtimeObj["workdir"] = "/serverdata/serverfiles"
+	if normalizeContainerWorkdir(runtimeObj["workdir"]) != cfxRuntimeServerDir {
+		runtimeObj["workdir"] = cfxRuntimeServerDir
 		changed = true
 	}
 	env := runtimeEnvMap(runtimeObj["env"])
@@ -5600,9 +5604,11 @@ func normalizeCfxRuntimeLayout(tpl string, runtimeObj map[string]any, serverDir 
 		env = map[string]string{}
 	}
 	for key, value := range map[string]string{
-		"DATA_DIR":    "/serverdata",
-		"SERVER_DIR":  "/serverdata/serverfiles",
+		"DATA_DIR":    cfxRuntimeServerDir,
+		"SERVER_DIR":  cfxRuntimeServerDir,
 		"GAME_CONFIG": "server.cfg",
+		"HOME":        cfxRuntimeServerDir,
+		"DATA_PERM":   "777",
 	} {
 		if env[key] != value {
 			env[key] = value
@@ -5610,6 +5616,32 @@ func normalizeCfxRuntimeLayout(tpl string, runtimeObj map[string]any, serverDir 
 		}
 	}
 	runtimeObj["env"] = env
+	if runtimeObj["runAsRoot"] != true {
+		runtimeObj["runAsRoot"] = true
+		changed = true
+	}
+	if rawInstall, ok := runtimeObj["install"]; ok && rawInstall != nil {
+		switch install := rawInstall.(type) {
+		case map[string]any:
+			if normalizeContainerWorkdir(install["runtimePath"]) != cfxRuntimeServerDir {
+				install["runtimePath"] = cfxRuntimeServerDir
+				changed = true
+			}
+			if normalizeContainerWorkdir(install["mountPath"]) == "" && normalizeContainerWorkdir(install["containerPath"]) == "" {
+				install["mountPath"] = "/mnt/server"
+				changed = true
+			}
+		case *templateInstallConfig:
+			if normalizeContainerWorkdir(install.RuntimePath) != cfxRuntimeServerDir {
+				install.RuntimePath = cfxRuntimeServerDir
+				changed = true
+			}
+			if normalizeContainerWorkdir(install.MountPath) == "" && normalizeContainerWorkdir(install.ContainerPath) == "" {
+				install.MountPath = "/mnt/server"
+				changed = true
+			}
+		}
+	}
 	return changed
 }
 
@@ -8460,6 +8492,15 @@ func (a *Agent) startCustomDockerContainer(ctx context.Context, name, serverDir 
 	imgCfg := a.inspectRuntimeImageConfig(ctx, imageRef)
 
 	ensureVolumeWritable(serverDir)
+	tpl := strings.ToLower(fmt.Sprint(meta["type"]))
+	if tpl == "" || tpl == "<nil>" {
+		tpl = strings.ToLower(fmt.Sprint(runtimeObj["providerId"]))
+	}
+	if normalizeCfxRuntimeLayout(tpl, runtimeObj, serverDir) {
+		meta["runtime"] = runtimeObj
+		_ = a.saveMeta(serverDir, meta)
+	}
+
 	hasCustomVolumes := len(runtimeStringSlice(runtimeObj["volumes"])) > 0
 	explicitCommandTemplate := sanitizeRuntimeCommand(runtimeObj["command"])
 	adpanelStartup := startupTemplateFromRuntime(runtimeObj)
@@ -8470,15 +8511,6 @@ func (a *Agent) startCustomDockerContainer(ctx context.Context, name, serverDir 
 	}
 	if runtimeInstallPath == "" && adpanelStartup != "" {
 		runtimeInstallPath = "/home/container"
-	}
-
-	tpl := strings.ToLower(fmt.Sprint(meta["type"]))
-	if tpl == "" || tpl == "<nil>" {
-		tpl = strings.ToLower(fmt.Sprint(runtimeObj["providerId"]))
-	}
-	if normalizeCfxRuntimeLayout(tpl, runtimeObj, serverDir) {
-		meta["runtime"] = runtimeObj
-		_ = a.saveMeta(serverDir, meta)
 	}
 
 	binds, dataDir := a.resolveStructuredBinds(tpl, runtimeObj, serverDir)
@@ -15278,7 +15310,14 @@ func (a *Agent) handleFilesList(w http.ResponseWriter, r *http.Request, name str
 		jsonWrite(w, 400, map[string]any{"error": "symlink escape blocked"})
 		return
 	}
-	ents, _ := os.ReadDir(dir)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if a.debug {
+			fmt.Printf("[files] list error for %s: %v\n", dir, err)
+		}
+		jsonWrite(w, 500, map[string]any{"error": "failed to read directory"})
+		return
+	}
 	out := make([]map[string]any, 0, len(ents))
 	for _, e := range ents {
 		typ := "file"
@@ -16386,7 +16425,14 @@ func (a *Agent) handleFSList(w http.ResponseWriter, r *http.Request) {
 		jsonWrite(w, 400, map[string]any{"ok": false, "error": "symlink escape blocked"})
 		return
 	}
-	ents, _ := os.ReadDir(abs)
+	ents, err := os.ReadDir(abs)
+	if err != nil {
+		if a.debug {
+			fmt.Printf("[fs] list error for %s: %v\n", abs, err)
+		}
+		jsonWrite(w, 500, map[string]any{"ok": false, "error": "failed to read directory"})
+		return
+	}
 	out := make([]map[string]any, 0, len(ents))
 	for _, e := range ents {
 		entryPath := filepath.Join(abs, e.Name())
