@@ -1760,7 +1760,7 @@ func (d Docker) sendViaAttachedStdin(ctx context.Context, stdinMgr *stdinManager
 	return lastErr
 }
 
-func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, containerName, command string, isMinecraft bool, targetProcesses []string) error {
+func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, containerName, command string, targetProcesses []string) error {
 	name := dockerContainerName(containerName)
 	cmd := strings.TrimSpace(command)
 	if name == "" || cmd == "" {
@@ -1779,49 +1779,6 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 		return fmt.Errorf("container-not-running")
 	}
 
-	if isMinecraft {
-		if _, _, exitCode, err := d.runCollect(ctx, "exec", name, "sh", "-lc", "test -p /tmp/minecraft-console-in"); err == nil && exitCode == 0 {
-			pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, "sh", "-lc", "cat > /tmp/minecraft-console-in")
-			pipeCmd.Stdin = strings.NewReader(cmd + "\r")
-			if err := pipeCmd.Run(); err == nil {
-				if d.debug {
-					fmt.Printf("[docker] minecraft command sent via console-in pipe\n")
-				}
-				return nil
-			}
-		}
-
-		execCmd := exec.CommandContext(ctx, "docker", "exec", name, "mc-send-to-console", cmd)
-		if err := execCmd.Run(); err == nil {
-			if d.debug {
-				fmt.Printf("[docker] minecraft command sent via mc-send-to-console\n")
-			}
-			return nil
-		}
-
-		execCmd = exec.CommandContext(ctx, "docker", "exec", name, "rcon-cli", cmd)
-		if err := execCmd.Run(); err == nil {
-			if d.debug {
-				fmt.Printf("[docker] minecraft command sent via rcon-cli\n")
-			}
-			return nil
-		}
-		if stdinMgr != nil {
-			if err := d.sendViaAttachedStdin(ctx, stdinMgr, name, cmd); err == nil {
-				if d.debug {
-					fmt.Printf("[docker] minecraft command sent via attached stdin\n")
-				}
-				return nil
-			}
-		}
-		if err := d.writeToMinecraftProcessStdin(ctx, name, cmd); err == nil {
-			if d.debug {
-				fmt.Printf("[docker] minecraft command sent via /proc/<pid>/fd/0\n")
-			}
-			return nil
-		}
-	}
-
 	var targetErr error
 	if len(targetProcesses) > 0 {
 		if err := d.writeToTargetProcessStdin(ctx, name, cmd, targetProcesses); err == nil {
@@ -1831,7 +1788,6 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 			if d.debug {
 				fmt.Printf("[docker] target process stdin failed for %s: %v\n", name, err)
 			}
-			return fmt.Errorf("failed-to-send: target process stdin failed: %w", targetErr)
 		}
 	}
 
@@ -9718,7 +9674,7 @@ func (a *Agent) stopServerForPolicy(name, reason string) error {
 
 	if isMinecraft {
 		commandCtx, commandCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = a.docker.sendCommand(commandCtx, a.stdinMgr, name, "stop", true, nil)
+		_ = a.docker.sendCommand(commandCtx, a.stdinMgr, name, "stop", nil)
 		commandCancel()
 	}
 
@@ -14169,7 +14125,7 @@ func (a *Agent) handleStop(w http.ResponseWriter, r *http.Request, name string) 
 	isMinecraft := serverType == "" || serverType == "minecraft"
 
 	if isMinecraft {
-		_ = a.docker.sendCommand(ctx, a.stdinMgr, name, "stop", true, nil)
+		_ = a.docker.sendCommand(ctx, a.stdinMgr, name, "stop", nil)
 	}
 
 	if waitMode {
@@ -14488,14 +14444,8 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 
 	meta := a.loadMeta(serverDir)
 	serverType := strings.ToLower(fmt.Sprint(meta["type"]))
-	isMinecraft := serverType == "" || serverType == "minecraft"
 	consoleMode := inferredConsoleModeForServer(meta)
-	useExecShell := !isMinecraft
-	if consoleMode == "stdin" {
-		useExecShell = false
-	} else if consoleMode == "exec" || consoleMode == "exec-shell" || consoleMode == "shell" {
-		useExecShell = true
-	}
+	useExecShell := consoleMode == "exec" || consoleMode == "exec-shell" || consoleMode == "shell"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -14518,7 +14468,7 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 	}
 
 	targetProcesses := consoleProcessTargetsForServer(meta)
-	if err := a.docker.sendCommand(ctx, a.stdinMgr, name, cmd, isMinecraft, targetProcesses); err != nil {
+	if err := a.docker.sendCommand(ctx, a.stdinMgr, name, cmd, targetProcesses); err != nil {
 		jsonWrite(w, 200, map[string]any{
 			"ok":     false,
 			"error":  "failed-to-send",
@@ -14529,7 +14479,6 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 		return
 	}
 
-	a.broadcastConsoleChunk(name, "stdout:", "$ "+cmd+"\n")
 	jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "stdin", "targeted": len(targetProcesses) > 0})
 }
 
