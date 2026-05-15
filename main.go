@@ -41,6 +41,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/ulikunitz/xz"
 )
 
@@ -1285,13 +1286,14 @@ type recentConsoleCommand struct {
 }
 
 type stdinConn struct {
-	name     string
-	stdin    io.WriteCloser
-	cmd      *exec.Cmd
-	lastUsed time.Time
-	tty      bool
-	mu       sync.Mutex
-	closed   bool
+	name      string
+	stdin     io.WriteCloser
+	cmd       *exec.Cmd
+	lastUsed  time.Time
+	tty       bool
+	transport string
+	mu        sync.Mutex
+	closed    bool
 }
 
 type stdinManager struct {
@@ -1343,8 +1345,7 @@ func preferDockerCLIPTYStdinTransport() bool {
 	case "api", "docker-api", "hijack":
 		return false
 	}
-	raw, err := os.ReadFile("/etc/os-release")
-	return err == nil && isEnterpriseLinuxOSRelease(string(raw))
+	return true
 }
 
 func containerTTYForHost() bool {
@@ -1619,10 +1620,11 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 	}
 
 	conn := &stdinConn{
-		name:     name,
-		stdin:    stdin,
-		lastUsed: time.Now(),
-		tty:      tty,
+		name:      name,
+		stdin:     stdin,
+		lastUsed:  time.Now(),
+		tty:       tty,
+		transport: "docker-api",
 	}
 
 	if sm.debug {
@@ -1630,10 +1632,6 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 	}
 
 	return conn, nil
-}
-
-func shellSingleQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
 func (sm *stdinManager) createDockerCLIPTYStdinConn(ctx context.Context, name string) (*stdinConn, error) {
@@ -1644,26 +1642,23 @@ func (sm *stdinManager) createDockerCLIPTYStdinConn(ctx context.Context, name st
 		return nil, fmt.Errorf("empty container name")
 	}
 
-	attachCommand := "docker attach --sig-proxy=false --detach-keys=ctrl-@ " + shellSingleQuote(name)
-	cmd := exec.Command("script", "-q", "-f", "-e", "-c", attachCommand, "/dev/null")
-	stdin, err := cmd.StdinPipe()
+	cmd := exec.Command("docker", "attach", "--sig-proxy=false", "--detach-keys=ctrl-@", name)
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 30, Cols: 120})
 	if err != nil {
-		return nil, err
-	}
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		_ = stdin.Close()
 		return nil, err
 	}
 
 	conn := &stdinConn{
-		name:     name,
-		stdin:    stdin,
-		cmd:      cmd,
-		lastUsed: time.Now(),
-		tty:      true,
+		name:      name,
+		stdin:     ptmx,
+		cmd:       cmd,
+		lastUsed:  time.Now(),
+		tty:       true,
+		transport: "docker-cli-pty",
 	}
+	go func() {
+		_, _ = io.Copy(io.Discard, ptmx)
+	}()
 	go func() {
 		_ = cmd.Wait()
 		conn.mu.Lock()
@@ -1698,11 +1693,12 @@ func (sm *stdinManager) createDockerCLIStdinConn(ctx context.Context, name strin
 	}
 
 	conn := &stdinConn{
-		name:     name,
-		stdin:    stdin,
-		cmd:      cmd,
-		lastUsed: time.Now(),
-		tty:      sm.docker.containerTTY(ctx, name),
+		name:      name,
+		stdin:     stdin,
+		cmd:       cmd,
+		lastUsed:  time.Now(),
+		tty:       sm.docker.containerTTY(ctx, name),
+		transport: "docker-cli",
 	}
 	go func() {
 		_ = cmd.Wait()
@@ -11705,6 +11701,13 @@ func (a *Agent) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 
 	template := strings.ToLower(strings.TrimSpace(req.Template))
 	meta := map[string]any{}
+	if template != "minecraft" {
+		if req.Docker == nil || strings.TrimSpace(req.Docker.Image) == "" {
+			_ = os.RemoveAll(serverDir)
+			jsonWrite(w, 400, map[string]any{"error": "no docker image specified", "detail": "Template payload must include docker.image"})
+			return
+		}
+	}
 
 	resourcesMeta := map[string]any{}
 	if req.Resources != nil {
