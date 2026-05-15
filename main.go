@@ -1311,33 +1311,7 @@ func preferDockerCLIConsoleTransport() bool {
 	case "api", "docker-api", "hijack":
 		return false
 	}
-	if runtime.GOOS != "linux" {
-		return false
-	}
-	raw, err := os.ReadFile("/etc/os-release")
-	if err != nil {
-		return true
-	}
-	osInfo := strings.ToLower(string(raw))
-	id := ""
-	idLike := ""
-	for _, line := range strings.Split(osInfo, "\n") {
-		key, val, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		val = strings.Trim(strings.TrimSpace(val), `"'`)
-		switch strings.TrimSpace(key) {
-		case "id":
-			id = val
-		case "id_like":
-			idLike = val
-		}
-	}
-	if id == "ubuntu" || id == "debian" || strings.Contains(idLike, "debian") || strings.Contains(idLike, "ubuntu") {
-		return false
-	}
-	return true
+	return false
 }
 
 func containerTTYForHost() bool {
@@ -1670,11 +1644,7 @@ func (c *stdinConn) sendCommand(cmd string) error {
 		return fmt.Errorf("connection closed")
 	}
 	c.lastUsed = time.Now()
-	lineEnding := "\n"
-	if c.tty {
-		lineEnding = "\r"
-	}
-	line := strings.TrimRight(cmd, "\r\n") + lineEnding
+	line := strings.TrimRight(cmd, "\r\n") + "\n"
 	if deadlineWriter, ok := c.stdin.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		_ = deadlineWriter.SetWriteDeadline(time.Now().Add(stdinWriteTimeout))
 		defer deadlineWriter.SetWriteDeadline(time.Time{})
@@ -1723,7 +1693,7 @@ func (d Docker) writeToContainerProcessStdin(ctx context.Context, containerName,
 	for idx, shellPath := range shells {
 		script := "fd=$(readlink /proc/1/fd/0 2>/dev/null || true); case \"$fd\" in /dev/null*) exit 45 ;; esac; cat > /proc/1/fd/0"
 		pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, shellPath, "-lc", script)
-		pipeCmd.Stdin = strings.NewReader(cmd + "\r")
+		pipeCmd.Stdin = strings.NewReader(cmd + "\n")
 		pipeCmd.Stdout = io.Discard
 		var stderr bytes.Buffer
 		pipeCmd.Stderr = &stderr
@@ -1783,7 +1753,7 @@ func (d Docker) writeToMinecraftProcessStdin(ctx context.Context, containerName,
 	shells := []string{"sh", "/bin/sh", "bash", "/bin/bash"}
 	for idx, shellPath := range shells {
 		pipeCmd := exec.CommandContext(ctx, "docker", "exec", "-i", name, shellPath, "-lc", script)
-		pipeCmd.Stdin = strings.NewReader(cmd + "\r")
+		pipeCmd.Stdin = strings.NewReader(cmd + "\n")
 		pipeCmd.Stdout = io.Discard
 		var stderr bytes.Buffer
 		pipeCmd.Stderr = &stderr
@@ -1818,11 +1788,6 @@ func (d Docker) writeToTargetProcessStdin(ctx context.Context, containerName, co
 		return fmt.Errorf("no console target processes configured")
 	}
 
-	lineEnding := "\n"
-	if d.containerTTY(ctx, name) {
-		lineEnding = "\r"
-	}
-
 	script := strings.Join([]string{
 		"pid=''",
 		"self=$$",
@@ -1850,7 +1815,7 @@ func (d Docker) writeToTargetProcessStdin(ctx context.Context, containerName, co
 		args := []string{"exec", "-i", name, shellPath, "-c", script, "adpanel-console"}
 		args = append(args, targets...)
 		pipeCmd := exec.CommandContext(ctx, "docker", args...)
-		pipeCmd.Stdin = strings.NewReader(cmd + lineEnding)
+		pipeCmd.Stdin = strings.NewReader(cmd + "\n")
 		pipeCmd.Stdout = io.Discard
 		var stderr bytes.Buffer
 		pipeCmd.Stderr = &stderr
@@ -9031,13 +8996,14 @@ type logTail struct {
 	dockerSnapshotPrimed bool
 
 	mu      sync.Mutex
+	writeMu sync.Mutex
 	clients map[chan string]struct{}
 	recent  []string
 	recentN int
 
 	stopCh chan struct{}
 	cmd    *exec.Cmd
-	conn   io.Closer
+	conn   io.ReadWriteCloser
 }
 
 type logSnapshotCall struct {
@@ -9278,16 +9244,30 @@ func (lm *logManager) primeDockerLogSnapshot(t *logTail, tail int) {
 	stdout, stderr, _, _ := lm.d.runCollect(ctx, "logs", "--timestamps", "--tail", fmt.Sprint(tail), t.name)
 	cancel()
 
-	for _, entry := range parseDockerLogSnapshotEntries(stdout, tail) {
-		lm.sendToClients(t, "stdout:"+entry.line)
-	}
+	entries := parseDockerLogSnapshotEntries(stdout, tail)
 	for _, entry := range parseDockerLogSnapshotEntries(stderr, tail) {
 		lower := strings.ToLower(entry.line)
 		if strings.Contains(lower, "no such container") || strings.Contains(lower, "can not get logs from container which is dead") {
 			continue
 		}
-		lm.sendToClients(t, "stderr:"+entry.line)
+		entries = append(entries, entry)
 	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		left := entries[i].ts
+		right := entries[j].ts
+		if left == 0 || right == 0 {
+			return false
+		}
+		return left < right
+	})
+	if len(entries) > tail {
+		entries = entries[len(entries)-tail:]
+	}
+	lines := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		lines = append(lines, entry.line)
+	}
+	t.appendRecentBatch(lines)
 }
 
 func (lm *logManager) broadcastLiveLogLine(t *logTail, prefix, raw string) {
@@ -9427,8 +9407,12 @@ func (lm *logManager) followLoop(t *logTail) {
 			}
 		}
 
+		openStdinCtx, openStdinCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		openStdin := lm.d.containerOpenStdin(openStdinCtx, t.name)
+		openStdinCancel()
+
 		attachCtx, attachCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		stream, err := lm.d.attachContainerAPI(attachCtx, t.name, dockerAttachOptions{Stdout: true, Stderr: true})
+		stream, err := lm.d.attachContainerAPI(attachCtx, t.name, dockerAttachOptions{Stdin: openStdin, Stdout: true, Stderr: true})
 		attachCancel()
 		if err != nil {
 			fmt.Printf("[logs] failed to attach live stream for %s: %v\n", t.name, err)
@@ -9490,6 +9474,53 @@ func (lm *logManager) sendToClients(t *logTail, s string) {
 		}
 	}
 	t.mu.Unlock()
+}
+
+func (lm *logManager) writeCommand(name, command string) error {
+	if lm == nil {
+		return fmt.Errorf("log manager unavailable")
+	}
+	dockerName := dockerContainerName(name)
+	cmd := strings.TrimSpace(command)
+	if dockerName == "" || cmd == "" {
+		return fmt.Errorf("missing-params")
+	}
+
+	lm.mu.Lock()
+	t := lm.tails[dockerName]
+	if t == nil && dockerName != name {
+		t = lm.tails[name]
+	}
+	lm.mu.Unlock()
+	if t == nil {
+		return fmt.Errorf("live console stream unavailable")
+	}
+
+	t.mu.Lock()
+	conn := t.conn
+	closed := t.closed
+	t.mu.Unlock()
+	if closed || conn == nil {
+		return fmt.Errorf("live console stream unavailable")
+	}
+
+	line := strings.TrimRight(cmd, "\r\n") + "\n"
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	if deadlineWriter, ok := conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = deadlineWriter.SetWriteDeadline(time.Now().Add(stdinWriteTimeout))
+		defer deadlineWriter.SetWriteDeadline(time.Time{})
+	}
+	if _, err := io.WriteString(conn, line); err != nil {
+		_ = conn.Close()
+		t.mu.Lock()
+		if t.conn == conn {
+			t.conn = nil
+		}
+		t.mu.Unlock()
+		return fmt.Errorf("live console stdin write failed: %w", err)
+	}
+	return nil
 }
 
 func (lm *logManager) resetRecent(name string) {
@@ -14788,18 +14819,38 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 	}
 
 	targetProcesses := consoleProcessTargetsForServer(meta)
+	var liveAttachErr error
+	if a.logs != nil {
+		if err := a.logs.writeCommand(name, cmd); err == nil {
+			jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "stdin", "transport": "live-attach", "targeted": len(targetProcesses) > 0})
+			return
+		} else {
+			liveAttachErr = err
+			if a.debug {
+				fmt.Printf("[docker] live attach stdin failed for %s: %v\n", name, err)
+			}
+		}
+	}
 	if err := a.docker.sendCommand(ctx, a.stdinMgr, name, cmd, targetProcesses); err != nil {
+		detail := err.Error()
+		if liveAttachErr != nil {
+			detail = fmt.Sprintf("live attach failed: %v; %s", liveAttachErr, detail)
+		}
 		jsonWrite(w, 200, map[string]any{
 			"ok":     false,
 			"error":  "failed-to-send",
-			"detail": err.Error(),
+			"detail": detail,
 			"type":   serverType,
 			"mode":   "stdin",
 		})
 		return
 	}
 
-	jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "stdin", "targeted": len(targetProcesses) > 0})
+	transport := "attached-stdin"
+	if liveAttachErr != nil {
+		transport = "stdin-fallback"
+	}
+	jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "stdin", "transport": transport, "targeted": len(targetProcesses) > 0})
 }
 
 func (a *Agent) handleServerCommandBody(w http.ResponseWriter, r *http.Request) {
