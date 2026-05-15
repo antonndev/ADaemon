@@ -1314,6 +1314,39 @@ func preferDockerCLIConsoleTransport() bool {
 	return false
 }
 
+func isEnterpriseLinuxOSRelease(raw string) bool {
+	osInfo := strings.ToLower(raw)
+	for _, line := range strings.Split(osInfo, "\n") {
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		if key != "id" && key != "id_like" {
+			continue
+		}
+		for _, distro := range []string{"rocky", "rhel", "centos", "almalinux", "ol", "fedora"} {
+			if val == distro || strings.Contains(val, distro) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func preferDockerCLIPTYStdinTransport() bool {
+	override := strings.ToLower(strings.TrimSpace(os.Getenv("ADPANEL_DOCKER_STDIN_TRANSPORT")))
+	switch override {
+	case "pty", "cli-pty", "docker-pty", "script":
+		return true
+	case "api", "docker-api", "hijack":
+		return false
+	}
+	raw, err := os.ReadFile("/etc/os-release")
+	return err == nil && isEnterpriseLinuxOSRelease(string(raw))
+}
+
 func containerTTYForHost() bool {
 	return true
 }
@@ -1543,6 +1576,16 @@ func (sm *stdinManager) getOrCreate(ctx context.Context, containerName string) (
 func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdinConn, error) {
 	tty := sm.docker.containerTTY(ctx, name)
 	preferCLI := preferDockerCLIConsoleTransport() && !tty
+	preferCLIPTY := tty && preferDockerCLIPTYStdinTransport()
+	if preferCLIPTY {
+		conn, err := sm.createDockerCLIPTYStdinConn(ctx, name)
+		if err == nil {
+			return conn, nil
+		}
+		if sm.debug {
+			fmt.Printf("[stdin-manager] Docker CLI PTY stdin attach failed for %s: %v\n", name, err)
+		}
+	}
 	if preferCLI {
 		conn, err := sm.createDockerCLIStdinConn(ctx, name)
 		if err == nil {
@@ -1558,6 +1601,13 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 
 	stdin, err := sm.docker.attachContainerAPI(attachCtx, name, dockerAttachOptions{Stdin: true})
 	if err != nil {
+		if tty && !preferCLIPTY {
+			conn, ptyErr := sm.createDockerCLIPTYStdinConn(ctx, name)
+			if ptyErr == nil {
+				return conn, nil
+			}
+			return nil, fmt.Errorf("failed to attach container stdin: Docker API: %v; Docker CLI PTY: %w", err, ptyErr)
+		}
 		if !preferCLI && !tty {
 			conn, cliErr := sm.createDockerCLIStdinConn(ctx, name)
 			if cliErr == nil {
@@ -1579,6 +1629,51 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 		fmt.Printf("[stdin-manager] created Docker API stdin connection for %s (tty=%t)\n", name, conn.tty)
 	}
 
+	return conn, nil
+}
+
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+func (sm *stdinManager) createDockerCLIPTYStdinConn(ctx context.Context, name string) (*stdinConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("empty container name")
+	}
+
+	attachCommand := "docker attach --sig-proxy=false --detach-keys=ctrl-@ " + shellSingleQuote(name)
+	cmd := exec.Command("script", "-q", "-f", "-e", "-c", attachCommand, "/dev/null")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
+
+	conn := &stdinConn{
+		name:     name,
+		stdin:    stdin,
+		cmd:      cmd,
+		lastUsed: time.Now(),
+		tty:      true,
+	}
+	go func() {
+		_ = cmd.Wait()
+		conn.mu.Lock()
+		conn.closed = true
+		conn.mu.Unlock()
+	}()
+
+	if sm.debug {
+		fmt.Printf("[stdin-manager] created Docker CLI PTY stdin connection for %s\n", name)
+	}
 	return conn, nil
 }
 
@@ -1909,6 +2004,8 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 		return fmt.Errorf("container stdin is not open; restart the server so the container is recreated with interactive stdin")
 	}
 
+	tty := d.containerTTY(ctx, name)
+
 	var targetErr error
 	var attachedErr error
 	if stdinMgr != nil {
@@ -1920,6 +2017,13 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 				fmt.Printf("[docker] attached stdin failed for %s: %v\n", name, err)
 			}
 		}
+	}
+
+	if tty {
+		if attachedErr != nil {
+			return fmt.Errorf("failed-to-send: attached TTY stdin failed: %w", attachedErr)
+		}
+		return fmt.Errorf("failed-to-send: TTY stdin channel unavailable")
 	}
 
 	if len(targetProcesses) > 0 {
@@ -9407,9 +9511,12 @@ func (lm *logManager) followLoop(t *logTail) {
 			}
 		}
 
-		openStdinCtx, openStdinCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		openStdin := lm.d.containerOpenStdin(openStdinCtx, t.name)
-		openStdinCancel()
+		openStdin := false
+		if !preferDockerCLIPTYStdinTransport() {
+			openStdinCtx, openStdinCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			openStdin = lm.d.containerOpenStdin(openStdinCtx, t.name)
+			openStdinCancel()
+		}
 
 		attachCtx, attachCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		stream, err := lm.d.attachContainerAPI(attachCtx, t.name, dockerAttachOptions{Stdin: openStdin, Stdout: true, Stderr: true})
@@ -14820,7 +14927,7 @@ func (a *Agent) handleCommand(w http.ResponseWriter, r *http.Request, name strin
 
 	targetProcesses := consoleProcessTargetsForServer(meta)
 	var liveAttachErr error
-	if a.logs != nil {
+	if a.logs != nil && !preferDockerCLIPTYStdinTransport() {
 		if err := a.logs.writeCommand(name, cmd); err == nil {
 			jsonWrite(w, 200, map[string]any{"ok": true, "type": serverType, "mode": "stdin", "transport": "live-attach", "targeted": len(targetProcesses) > 0})
 			return
