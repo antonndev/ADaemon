@@ -1341,21 +1341,15 @@ func preferDockerCLIConsoleTransport() bool {
 }
 
 func containerTTYForHost() bool {
-	return !preferDockerCLIConsoleTransport()
+	return true
 }
 
 func dockerRunInteractiveArgs() []string {
-	if containerTTYForHost() {
-		return []string{"run", "-d", "-i", "-t"}
-	}
-	return []string{"run", "-d", "-i"}
+	return []string{"run", "-d", "-i", "-t"}
 }
 
 func dockerRunInteractivePrefix() string {
-	if containerTTYForHost() {
-		return "docker run -d -i -t"
-	}
-	return "docker run -d -i"
+	return "docker run -d -i -t"
 }
 
 func newStdinManager(docker *Docker, debug bool) *stdinManager {
@@ -1573,7 +1567,8 @@ func (sm *stdinManager) getOrCreate(ctx context.Context, containerName string) (
 }
 
 func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdinConn, error) {
-	preferCLI := preferDockerCLIConsoleTransport()
+	tty := sm.docker.containerTTY(ctx, name)
+	preferCLI := preferDockerCLIConsoleTransport() && !tty
 	if preferCLI {
 		conn, err := sm.createDockerCLIStdinConn(ctx, name)
 		if err == nil {
@@ -1589,7 +1584,7 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 
 	stdin, err := sm.docker.attachContainerAPI(attachCtx, name, dockerAttachOptions{Stdin: true})
 	if err != nil {
-		if !preferCLI {
+		if !preferCLI && !tty {
 			conn, cliErr := sm.createDockerCLIStdinConn(ctx, name)
 			if cliErr == nil {
 				return conn, nil
@@ -1603,7 +1598,7 @@ func (sm *stdinManager) createStdinConn(ctx context.Context, name string) (*stdi
 		name:     name,
 		stdin:    stdin,
 		lastUsed: time.Now(),
-		tty:      sm.docker.containerTTY(ctx, name),
+		tty:      tty,
 	}
 
 	if sm.debug {
@@ -1823,6 +1818,11 @@ func (d Docker) writeToTargetProcessStdin(ctx context.Context, containerName, co
 		return fmt.Errorf("no console target processes configured")
 	}
 
+	lineEnding := "\n"
+	if d.containerTTY(ctx, name) {
+		lineEnding = "\r"
+	}
+
 	script := strings.Join([]string{
 		"pid=''",
 		"self=$$",
@@ -1850,7 +1850,7 @@ func (d Docker) writeToTargetProcessStdin(ctx context.Context, containerName, co
 		args := []string{"exec", "-i", name, shellPath, "-c", script, "adpanel-console"}
 		args = append(args, targets...)
 		pipeCmd := exec.CommandContext(ctx, "docker", args...)
-		pipeCmd.Stdin = strings.NewReader(cmd + "\n")
+		pipeCmd.Stdin = strings.NewReader(cmd + lineEnding)
 		pipeCmd.Stdout = io.Discard
 		var stderr bytes.Buffer
 		pipeCmd.Stderr = &stderr
@@ -1936,15 +1936,6 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 		return fmt.Errorf("container-not-running")
 	}
 
-	tty := d.containerTTY(ctx, name)
-	portablePipeMode := preferDockerCLIConsoleTransport()
-	if portablePipeMode && tty {
-		if stdinMgr != nil {
-			stdinMgr.remove(name)
-		}
-		return fmt.Errorf("container console was created with TTY transport; restart the server so it is recreated with portable stdin pipes")
-	}
-
 	openStdin := d.containerOpenStdin(ctx, name)
 	if !openStdin {
 		if stdinMgr != nil {
@@ -1954,17 +1945,6 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 	}
 
 	var targetErr error
-	if portablePipeMode && len(targetProcesses) > 0 {
-		if err := d.writeToTargetProcessStdin(ctx, name, cmd, targetProcesses); err == nil {
-			return nil
-		} else {
-			targetErr = err
-			if d.debug {
-				fmt.Printf("[docker] target process stdin failed for %s: %v\n", name, err)
-			}
-		}
-	}
-
 	var attachedErr error
 	if stdinMgr != nil {
 		if err := d.sendViaAttachedStdin(ctx, stdinMgr, name, cmd); err == nil {
@@ -1977,7 +1957,7 @@ func (d Docker) sendCommand(ctx context.Context, stdinMgr *stdinManager, contain
 		}
 	}
 
-	if !portablePipeMode && len(targetProcesses) > 0 {
+	if len(targetProcesses) > 0 {
 		if err := d.writeToTargetProcessStdin(ctx, name, cmd, targetProcesses); err == nil {
 			return nil
 		} else {
@@ -14537,7 +14517,7 @@ func (a *Agent) handleRestart(w http.ResponseWriter, r *http.Request, name strin
 		_ = a.saveMeta(serverDir, meta)
 	}
 	consoleMode := inferredConsoleModeForServer(meta)
-	recreateForConsoleStdin := consoleMode == "stdin" && (!a.docker.containerOpenStdin(ctx, name) || (preferDockerCLIConsoleTransport() && a.docker.containerTTY(ctx, name)))
+	recreateForConsoleStdin := consoleMode == "stdin" && (!a.docker.containerOpenStdin(ctx, name) || !a.docker.containerTTY(ctx, name))
 	if shouldRecreateContainerOnRestart(meta) || recreateForConsoleStdin {
 		if a.stdinMgr != nil {
 			a.stdinMgr.remove(name)
@@ -14901,12 +14881,17 @@ func (a *Agent) handleLogsSSE(w http.ResponseWriter, r *http.Request, name strin
 	t := a.logs.getOrCreate(name)
 
 	if tailN > 0 {
-		recentSnapshot := t.snapshotRecent(tailN)
-		snapshot := make([]logSnapshotEntry, 0, len(recentSnapshot))
-		for _, line := range recentSnapshot {
-			snapshot = append(snapshot, logSnapshotEntry{line: line})
+		snapshot := []logSnapshotEntry{}
+		snapshotFromDockerLogs := false
+		if !preferDockerCLIConsoleTransport() {
+			recentSnapshot := t.snapshotRecent(tailN)
+			snapshot = make([]logSnapshotEntry, 0, len(recentSnapshot))
+			for _, line := range recentSnapshot {
+				snapshot = append(snapshot, logSnapshotEntry{line: line})
+			}
 		}
 		if len(snapshot) == 0 {
+			snapshotFromDockerLogs = true
 			snapshot = a.logs.fetchTailSnapshotSingleflight(name, tailN, func() []logSnapshotEntry {
 				ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 				out, errOut, _, _ := a.docker.runCollect(ctx, "logs", "--timestamps", "--tail", fmt.Sprint(tailN), name)
@@ -14925,14 +14910,14 @@ func (a *Agent) handleLogsSSE(w http.ResponseWriter, r *http.Request, name strin
 				}
 				return entries
 			})
-			if len(snapshot) > 0 {
-				lines := make([]string, 0, len(snapshot))
-				for _, entry := range snapshot {
-					lines = append(lines, entry.line)
-				}
-				t.appendRecentBatch(lines)
-				t.markDockerSnapshotPrimed()
+		}
+		if snapshotFromDockerLogs && len(snapshot) > 0 {
+			lines := make([]string, 0, len(snapshot))
+			for _, entry := range snapshot {
+				lines = append(lines, entry.line)
 			}
+			t.appendRecentBatch(lines)
+			t.markDockerSnapshotPrimed()
 		}
 		for _, entry := range snapshot {
 			sendLine(entry.line, entry.ts)
@@ -14956,10 +14941,11 @@ func (a *Agent) handleLogsSSE(w http.ResponseWriter, r *http.Request, name strin
 			t.mu.Unlock()
 			a.logs.removeIfEmpty(t)
 			return
+		case line := <-ch:
+			line = normalizeStreamedLogLine(line)
+			sendLine(line, time.Now().UnixMilli())
 		case <-hb.C:
 			sendEvent("keepalive", map[string]any{"ts": time.Now().UnixMilli()})
-		case s := <-ch:
-			sendLine(normalizeStreamedLogLine(s), time.Now().UnixMilli())
 		}
 	}
 }
